@@ -1,0 +1,9 @@
+G: 'x' W 'a' | 'x' V | 'y' W 'b' | 'y' V | 'z' W 'r' | 'z' V | 'u' U X 'd' | 'u' U Y E
+W: U X C
+V: U Y 'd'
+U: U 't' | 's'
+X: 't' U X P | 't'
+Y: 't' U Y 'u' | 't'
+E: 'a' | 'b' | 'c' | 'v'
+C: 'c' | 'w' |
+P: ()

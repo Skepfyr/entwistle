@@ -1,0 +1,543 @@
+@KwAs: "as"
+@KwBreak: "break"
+@KwConst: "const"
+@KwContinue: "continue"
+@KwCrate: "crate"
+@KwElse: "else"
+@KwEnum: "enum"
+@KwExtern: "extern"
+@KwFalse: "false"
+@KwFn: "fn"
+@KwFor: "for"
+@KwIf: "if"
+@KwImpl: "impl"
+@KwIn: "in"
+@KwLet: "let"
+@KwLoop: "loop"
+@KwMatch: "match"
+@KwMod: "mod"
+@KwMove: "move"
+@KwMut: "mut"
+@KwPub: "pub"
+@KwRef: "ref"
+@KwReturn: "return"
+@KwSelfValue: "self"
+@KwSelfType: "Self"
+@KwStatic: "static"
+@KwStruct: "struct"
+@KwSuper: "super"
+@KwTrait: "trait"
+@KwTrue: "true"
+@KwType: "type"
+@KwUnsafe: "unsafe"
+@KwUse: "use"
+@KwWhere: "where"
+@KwWhile: "while"
+@KwAsync: "async"
+@KwAwait: "await"
+@KwDyn: "dyn"
+
+@KwAbstract: "abstract"
+@KwBecome: "become"
+@KwBox: "box"
+@KwDo: "do"
+@KwFinal: "final"
+@KwMacro: "macro"
+@KwOverride: "override"
+@KwPriv: "priv"
+@KwTypeOf: "typeof"
+@KwUnsized: "unsized"
+@KwVirtual: "virtual"
+@KwYield: "yield"
+@KwTry: "try"
+
+@KwUnion: "union"
+@KwStaticLifetime: "'static"
+
+@StrictKeyword:
+  KwAs
+  KwBreak
+  KwConst
+  KwContinue
+  KwCrate
+  KwElse
+  KwEnum
+  KwExtern
+  KwFalse
+  KwFn
+  KwFor
+  KwIf
+  KwImpl
+  KwIn
+  KwLet
+  KwLoop
+  KwMatch
+  KwMod
+  KwMove
+  KwMut
+  KwPub
+  KwRef
+  KwReturn
+  KwSelfValue
+  KwSelfType
+  KwStatic
+  KwStruct
+  KwSuper
+  KwTrait
+  KwTrue
+  KwType
+  KwUnsafe
+  KwUse
+  KwWhere
+  KwWhile
+  KwAsync
+  KwAwait
+  KwDyn
+
+@ReservedKeyword:
+  KwAbstract
+  KwBecome
+  KwBox
+  KwDo
+  KwFinal
+  KwMacro
+  KwOverride
+  KwPriv
+  KwTypeOf
+  KwUnsized
+  KwVirtual
+  KwYield
+  KwTry
+
+@WeakKeyword:
+  KwUnion
+  KwStaticLifetime
+
+@IdentifierOrKeyword: /[a-zA-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+/
+
+@RawIdentifierName:
+  !KwCrate
+  !KwSelfValue
+  !KwSuper
+  !KwSelfType
+  IdentifierOrKeyword
+
+@RawIdentifier: "r#" RawIdentifierName
+
+@NonKeywordIdentifier:
+  !StrictKeyword
+  !ReservedKeyword
+  IdentifierOrKeyword
+
+@Identifier:
+  NonKeywordIdentifier
+  RawIdentifier
+
+// TODO: think about comments
+
+@Whitespace: /\s/
+
+@EscapedNewline: r"\n"
+@EscapedCarriageReturn: r"\r"
+@EscapedTab: r"\t"
+@EscapedBackslash: r"\\"
+@EscapedNull: r"\0"
+@EscapedSingleQuote: r"\'"
+@EscapedDoubleQuote: r#"\""#
+@EscapedAsciiChar: /\\x[0-7][0-9a-fA-F]/
+@EscapedByte: /\\x[0-9a-fA-F]{2}/
+@EscapedUnicodeChar: /\\u\{([0-9a-fA-F]_*){1,6}\}/
+
+_@AsciiEscape:
+  EscapedAsciiChar
+  EscapedNewline
+  EscapedCarriageReturn
+  EscapedTab
+  EscapedBackslash
+  EscapedNull
+
+_@ByteEscape:
+  EscapedByte
+  EscapedNewline
+  EscapedCarriageReturn
+  EscapedTab
+  EscapedBackslash
+  EscapedNull
+
+_@UnicodeEscape:
+  EscapedUnicodeChar
+
+_@QuoteEscape:
+  EscapedSingleQuote
+  EscapedDoubleQuote
+
+@Newline: "\n" | "\r\n"
+@StringContinue: "\\" Newline
+
+@StringChar:
+  QuoteEscape
+  AsciiEscape
+  UnicodeEscape
+  /\P{C}/
+@ByteChar:
+  QuoteEscape
+  ByteEscape
+  /[ -~]/
+
+_@NonSingleQuoteStringChar:
+  !"'"
+  StringChar
+Character: "'" NonSingleQuoteStringChar "'"
+
+_@NonDoubleQuoteStringChar:
+  !r#"""#
+  StringChar
+  StringContinue
+String: r#"""# NonDoubleQuoteStringChar* r#"""#
+
+@RawStringContents[Hashes]:
+  !Hashes
+  /\P{C}/
+RawString: /r#{N}"/ RawStringContents[/#{N}/] /"#{N}/
+
+
+_@NonSingleQuoteByteChar:
+  !"'"
+  ByteChar
+Byte: "b'" NonSingleQuoteByteChar "'"
+
+_@NonDoubleQuoteByteChar:
+  !r#"""#
+  ByteChar
+ByteString: r#"b""# NonDoubleQuoteByteChar* r#"""#
+
+@RawByteStringContents[@Hashes]:
+  !Hashes
+  /[ -~]/
+RawByteString: /br#{N}"/ RawStringContents[/#{N}/] /"#{N}/
+
+@Integer:
+  /[0-9_]+/
+  /0x[0-9a-fA-F_]+/
+  /0o[0-7_]+/
+  /0b[01_]+/
+
+@Float: /[0-9_]+(.[0-9_]+)?((e|E)(+|-)[0-9_]+)?/
+
+@Number: Integer | Float
+
+TupleIndex: Integer
+
+@Bool: "true" | "false"
+
+@LifetimeToken: "'_" | "'" IdentifierOrKeyword
+@Lifetime: "'" NonKeywordIdentifier
+@Label: "'" NonKeywordIdentifier
+
+// TODO: Macros?
+
+Crate: Utf8Bom? (Shebang Newline)? _ (InnerAttribute _)* (Item _)*
+
+@Utf8Bom: "\uFEFF"
+@Shebang: "#!" _ BlockComment? _ ((. !"[" !Newline) (. !Newline)+)?
+
+_CommaSeparated[Item]: Item (_ "," _ Item)? (_ ",")?
+
+ConfigurationPredicate:
+  ConfigurationOption
+  ConfigurationAll
+  ConfigurationAny
+  ConfigurationNot
+
+ConfigurationOption: Identifier ("=" (String | RawString))?
+ConfigurationAll: "all(" ConfigurationPredicateList? ")"
+ConfigurationAny: "any(" ConfigurationPredicateList? ")"
+ConfigurationNot: "not(" ConfigurationPredicateList? ")"
+ConfigurationPredicateList: CommaSeparated[ConfigurationPredicate]
+
+CfgAttribute: "cfg(" ConfigurationPredicate ")"
+CfgAttrAttribute: "cfg_attr(" ConfigurationPredicate, CfgAttrs? ")"
+CfgAttrs: CommaSeparated[Attr]
+
+Item: (OuterAttribute _)* (VisItem | MacroItem)
+VisItem: Visibility InnerItem
+_InnerItem:
+  Module
+  ExternCrate
+  UseDeclaration
+  Function
+  TypeAlias
+  Struct
+  Enumeration
+  Union
+  ConstantItem
+  StaticItem
+  Trait
+  Implementation
+  ExternBlock
+
+MacroItem: MacroInvocationSemi | MacroRulesDefinition
+
+Module:
+  KwUnsafe? __ KwMod __ Identifier _ ";"
+  KwUnsafe? __ KwMod __ Identifier "{" _ (InnerAttribute _)* (Item _)* "}"
+
+ExternCrate: KwExtern __ KwCrate __ CrateRef (__ AsClause)? _ ";"
+CrateRef: Identifier | KwSelfValue
+AsClause: KwAs __ (Identifier | "_")
+
+UseDeclaration: KwUse __ UseTree _ ";"
+UseTree:
+  ((SimplePath _)? "::" _)? "*"
+  ((SimplePath _)? "::" _)? "{" _ CommaSeparated[UseTree]? _ "}"
+  SimplePath (__ KwAs __ (Identifier | "_"))?
+
+Function: FunctionQualifiers __ KwFn __ Identifier _ GenericParams? "(" _ FunctionParameters? _ ")" _ (FunctionReturnType _)? WhereClause? (BlockExpression | ";")
+
+FunctionQualifiers: (KwConst __)? (KwAsync __)? (KwUnsafe __)? (KwExtern _ Abi? __)?
+Abi: String | RawString
+
+FunctionParameters:
+  SelfParam _ ","? _
+  (SelfParam _ "," _)? CommaSeparated[FunctionParam]
+
+SelfParam: (OuterAttribute _)* (ShorthandSelf | TypedSelf)
+ShorthandSelf: ("&" Lifetime?)? __ (KwMut __)? KwSelfValue
+TypedSelf: (KwMut __)? KwSelfValue _ ":" _ Type
+
+FunctionParam: (OuterAttribute _)* (FunctionParamPattern | "...")
+FunctionParamPattern: Pattern _ ":" _ (Type | "...")
+
+FunctionReturnType: "->" _ Type
+
+TypeAlias: KwType __ Identifier _ GenericParams? _ WhereClause? "=" _ Type _ ";"
+
+Struct: StructStruct | TupleStruct
+StructStruct: KwStruct __ Identifier _ GenericParams? WhereClause? ("{" _ (StructFields? _) "}" | ";")
+TupleStruct: KwStruct __ Identifier _ GenericParams? "(" _ TupleFields? ")" WhereClause? ";"
+
+StructFields: CommaSeparated[StructField]
+StructField: OuterAttribute* Visibility? Identifier ":" _ Type
+
+TupleFields: CommaSeparated[TupleField]
+TupleField: OuterAttribute* Visibility? Type
+
+Enumeration: KwEnum __ Identifier __ GenericParams? WhereClause? "{" EnumItems? "}"
+EnumItems: CommaSeparated[EnumItem]
+EnumItem: OuterAttribute* Visibility? __ Identifier __ (EnumItemTuple | EnumItemStruct | EnumItemDiscriminant)?
+EnumItemTuple: "(" TupleFields? ")"
+EnumItemStruct: "{" StructFields? "}"
+EnumItemDiscriminant: "=" Expression
+
+Union: KwUnion __ Identifier __ GenericParams? WhereClause? "{" _ StructFields _ "}"
+
+ConstantItem: KwConst __ (Identifier | "_") _ ":" _ Type _ ("=" _ Expression _)? ";"
+StaticItem: KwStatic __ (KwMut __)? Identifier _ ":" _ Type _ ("=" _ Expression _)? ";"
+
+Trait: (KwUnsafe __)? KwTrait __ Identifier _ GenericParams? (":" _ TypeParamBounds?)? WhereClause? "{" InnerAttribute* AssociatedItem* "}"
+Implementation: InherentImpl | TraitImpl
+InherentImpl: KwImpl _ GenericParams? Type __ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
+TraitImpl: (KwUnsafe __)? KwImpl _ GenericParams? "!"? _ TypePath __ KwFor __ Type __ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
+
+ExternBlock: (KwUnsafe __)? KwExtern __ Abi? _ "{" InnerAttribute* ExternalItem* "}"
+ExternalItem: OuterAttribute* (MacroInvocationSemi | ((Visibility __)? (StaticItem | Function)))
+
+GenericParams: "<" CommaSeparated[GenericParam]? ">"
+GenericParam: OuterAttribute* (LifetimeParam | TypeParam | ConstParam)
+LifetimeParam: Lifetime (_ ":" _ LifetimeBounds)?
+TypeParam: Identifier (_ ":" _ TypeParamBounds?)? (_ "=" _ Type)?
+ConstParam: KwConst __ Identifier _ ":" _ Type
+
+WhereClause: KwWhere __ CommaSeparated[WhereClauseItem]
+WhereClauseItem: LifetimeWhereClauseItem | TypeBoundWhereClauseItem
+LifetimeWhereClauseItem: Lifetime _ ":" _ LifetimeBounds
+TypeBoundWhereClauseItem: (ForLifetimes _)? Type _ ":" (_ TypeParamBounds)?
+ForLifetimes: KwFor __ GenericParams
+
+AssociatedItem: OuterAttribute* (MacroInvocationSemi | ((Visibility __)? (TypeAlias | ConstantItem | Function)))
+
+
+InnerAttribute: "#![" _ Attr _ "]"
+OuterAttribute: "#[" _ Attr _ "]"
+Attr: SimplePath (_ AttrInput)?
+AttrInput: DelimTokenTree | "=" _ LiteralExpression
+
+MetaItem:
+  SimplePath
+  SimplePath _ "=" _ LiteralExpression
+  SimplePath "(" MetaSeq? ")"
+MetaSeq: CommaSeparated[MetaItemInner]
+MetaItemInner: MetaItem | LiteralExpression
+
+MetaWord: Identifier
+MetaNameValueStr: Identifier _ "=" _ (String | RawString)
+MetaListPaths: Identifier _ "(" CommaSeparated[SimplePath] ")"
+MetaListIdents: Identifier _ "(" CommaSeparated[Identifier] ")"
+MetaListNameValueStr: Identifier _ "(" CommaSeparated[MetaNameValueStr] ")"
+
+
+
+Statement:
+  ";"
+  Item
+  LetStatement
+  ExpressionStatement
+  MacroInvocationSemi
+LetStatement: OuterAttribute* KwLet __ Pattern _ (":" _ Type _)? ("=" _ Expression)? ";"
+ExpressionStatement:
+  ExpressionWithoutBlock ";"
+  ExpressionWithBlock ";"?
+
+Expression: OuterAttribute* (ExpressionWithoutBlock | ExpressionWithBlock)
+ExpressionWithoutBlock:
+  (ReturnExpression | BreakExpression | ContinueExpression | ClosureExpression)
+  AssignmentExpression
+  RangeExpression
+  OperatorExpression
+  AwaitExpression
+  IndexExpression
+  TupleIndexingExpression
+  ArrayExpression
+  TupleExpression
+  StructExpression
+  EnumerationVariantExpression
+  FieldExpression
+  MethodCallExpression
+  CallExpression
+  PathExpression
+  GroupedExpression
+  LiteralExpression
+  MacroInvocation
+ExpressionWithBlock:
+  BlockExpression
+  AsyncBlockExpression
+  UnsafeBlockExpression
+  LoopExpression
+  IfExpression
+  IfLetExpression
+  MatchExpression
+
+LiteralExpression: Char | String | RawString | Byte | ByteString | Number | Bool
+PathExpression: PathInExpression | QualifiedPathInExpression
+BlockExpression: "{" _ (InnerAttribute _)* Statements _ "}"
+Statements:
+  (Statement _)+
+  (Statement _)+ ExpressionWithoutBlock
+  ExpressionWithoutBlock
+AsyncBlockExpression: KwAsync (__ KwMove)? _ BlockExpression
+UnsafeBlockExpression: KwUnsafe _ BlockExpression
+OperatorExpression:
+  LazyBooleanExpression
+  ComparisonExpression
+  ArithmeticOrLogicalExpression
+  TypeCastExpression
+  BorrowExpression
+  DereferenceExpression
+  NegationExpression
+  ErrorPropagationExpression
+
+AssignmentExpression: Expression _ ("=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=") _ Expression
+LazyBooleanExpression:
+  LazyBooleanExpression _ "||" _ LazyBooleanExpression
+  LazyBooleanExpression _ "&&" _ LazyBooleanExpression
+  Expression
+ComparisonExpression: Expression _ ("==" | "!=" | ">" | "<" | ">=" | "<=") _ Expression
+ArithmeticOrLogicalExpression:
+  ArithmeticOrLogicalExpression _ "|" _ ArithmeticOrLogicalExpression
+  ArithmeticOrLogicalExpression _ "^" _ ArithmeticOrLogicalExpression
+  ArithmeticOrLogicalExpression _ "&" _ ArithmeticOrLogicalExpression
+  ArithmeticOrLogicalExpression _ ("<<" | ">>") _ ArithmeticOrLogicalExpression
+  ArithmeticOrLogicalExpression _ ("*" | "/" | "%") _ ArithmeticOrLogicalExpression
+  ArithmeticOrLogicalExpression _ ("+" | "-") _ ArithmeticOrLogicalExpression
+  Expression
+TypeCastExpression: Expression __ KwAs __ TypeNoBounds
+BorrowExpression: "&" _ (KwMut __)? Expression
+DereferenceExpression: "*" _ Expression
+NegationExpression: ("-" | "!") _ Expression
+ErrorPropagationExpression: Expression _ "?"
+
+GroupedExpression: "(" _ (InnerAttribute _)* Expression _ ")"
+ArrayExpression: "[" _ (InnerAttribute _)* (ArrayElements _)? "]"
+ArrayElements:
+  CommaSeparated[Expression]
+  Expression _ ";" _ Expression
+IndexExpression:
+  Expression _ "[" _ Expression _ "]"
+TupleExpression: "(" _ (InnerAttribute _)* (ArrayElements _)? ")"
+TupleElements: CommaSeparated[Expression]
+TupleIndexingExpression: Expression _ "." _ TupleIndex
+
+StructExpression:
+  StructExprStruct
+  StructExprTuple
+  StructExprUnit
+StructExprStruct: PathInExpression _ "{" _ (InnerAttribute _)* StructExprFields _ "}"
+StructExprFields: (StructExprField _ "," _)* (StructField (_ ",")? | StructBase?)
+StructExprField:
+  Identifier
+  (Identifier | TupleIndex) _ ":" _ Expression
+StructBase: ".." _ Expression
+StructExprTuple: PathInExpression _ "(" _ (InnerAttribute _)* (CommaSeparated[Expression] _)? ")"
+StructExprUnit: PathInExpression
+
+EnumerationVariantExpression:
+  EnumExprStruct
+  EnumExprTuple
+
+
+  EnumExprUnit
+EnumExprStruct: PathInExpression _ "{" _ EnumExprFields _ "}"
+EnumExprFields: CommaSeparated[EnumExprField]
+EnumExprField:
+  Identifier
+  (Identifier | TupleIndex) _ ":" _ Expression
+EnumExprTuple: PathInExpression _ "(" _ (CommaSeparated[Expression] _)? ")"
+EnumExprUnit: PathInExpression
+
+CallExpression: Expression _ "(" _ (CallParams _)? ")"
+MethodCallExpression: Expression _ "." _ PathExprSegment _ "(" (CallParams _)? ")"
+CallParams: CommaSeparated[Expression]
+
+FieldExpression: Expression _ "." _ Identifier
+
+ClosureExpression: (KwMove _)? "|" _ ClosureParameters? _ "|" _ (Expression | "->" _ TypeNoBounds _ BlockExpression)
+ClosureParameters: CommaSeparated[ClosureParam]
+ClosureParam: (OuterAttribute _)* Pattern (_ ":" _ Type)?
+
+LoopExpression: (LoopLabel _)? (InfiniteLoopExpression | PredicateLoopExpression | PredicatePatternLoopExpression | IteratorLoopExpression)
+LoopLabel: Label _ ":"
+InfiniteLoopExpression: KwLoop _ BlockExpression
+PredicateLoopExpression: KwWhile _ Expression _ BlockExpression
+// TODO: This expression shouldn't be able to be a struct or lazy boolean
+PredicatePatternLoopExpression: KwWhile __ KwLet __ MatchArmPatterns "=" Expression _ BlockExpression
+IteratorLoopExpression: KwFor _ Pattern _ KwIn _ Expression _ BlockExpression
+
+BreakExpression: KwBreak (_ Label)? (_ Expression)?
+ContinueExpression: KwContinue (_ Label)?
+
+RangeExpression:
+  RangeExpr
+  RangeFromExpr
+  RangeToExpr
+  RangeFullExpr
+  RangeInclusiveExpr
+  RangeToInclusiveExpr
+RangeExpr: Expression _ ".." _ Expression
+RangeFromExpr: Expression _ ".."
+RangeToExpr: ".." _ Expression
+RangeFullExpr: ".."
+RangeInclusiveExpr: Expression _ "..=" _ Expression
+RangeToInclusiveExpr: "..=" _ Expression
+
+IfExpression: KwIf _ Expression _ BlockExpression (_ KwElse _ (BlockExpression | IfExpression | IfLetExpression))?
+// TODO: This expression shouldn't be able to be a struct or lazy boolean
+IfLetExpression: KwIf __ KwLet _ MatchArmPatterns "=" Expression _ BlockExpression (_ KwElse _ (BlockExpression | IfExpression | IfLetExpression))?
+
+MatchExpression: KwMatch _ Expression _ "{" _ (InnerAttribute _)* (MatchArms _)? "}"
+MatchArms: (MatchArm _ "=>" (ExpressionWithoutBlock _ "," | ExpressionWithBlock (_ ",")?) _)* MatchArm _ "=>" _ Expression (_ ",")?
+MatchArm: (OuterAttribute _)* MatchArmPatterns _ (MatchArmGuard _)?
+MatchArmPatterns: ("|" _)? Pattern (_ "|" _ Pattern)*
+MatchArmGuard: KwIf _ Expression
+
+ReturnExpression: KwReturn (_ Expression)?
+AwaitExpression: Expression _ "." _ KwAwait

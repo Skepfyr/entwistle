@@ -1,0 +1,9 @@
+G: G 'a' | 'a' Y 'd' | 'b' Y 'c' | 'c' V 'e' | 'd' W 'f' | 'e' W 'e'
+Y: X
+X: 'e' | 'e' 'g'
+W: P
+V: U
+U: 'a' Y Z
+Z: 'a' Q | P |
+P: 'b' U
+Q: 'c' |

@@ -1,0 +1,31 @@
+Module:
+  (_ Statement _ nl | _ nl)*
+
+Statement:
+  Variable _ '=' _ Expression
+  Expression
+
+Expression:
+  Expression _ ('+' | '-') _ ~Expression
+  Expression _ ('*' | '/') _ ~Expression
+  ('+' | '-') Expression
+  Expression '!'
+  '(' _ $Expression _ ')'
+  Number
+  Variable
+
+## Statement
+a = b
+##
+Statement:
+  Variable: "a"
+  "="
+  Expression:
+    Variable: "b"
+##
+
+@Number: /[0-9][0-9_]*(\.[0-9_]+)?/
+@Variable: /\w+/
+
+-@_: /\s*/
+-@nl: '\n' | '\r\n'
