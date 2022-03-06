@@ -557,6 +557,7 @@ impl<'a> Disambiguator<'a> {
         let mut next = HashMap::<Terminal, HashMap<ConflictedAction, Vec<Ambiguity>>>::new();
 
         for (action, mut ambiguities) in ambiguities {
+            let mut visited = HashSet::with_capacity(ambiguities.len());
             while let Some(Ambiguity {
                 location,
                 history,
@@ -616,12 +617,16 @@ impl<'a> Disambiguator<'a> {
                 ambiguities.extend(
                     item_lane_heads(self.db, self.start_symbol, location)
                         .into_iter()
+                        .filter(|&location| visited.insert(location))
                         .map(|location| {
                             trace!(?location, "Walking parse table");
                             let item = &parse_table[location].0;
-                            let history = history.clone().map(|mut history| {
-                                history.insert(location);
-                                history
+                            let history = history.clone().and_then(|mut history| {
+                                if history.insert(location) {
+                                    Some(history)
+                                } else {
+                                    None
+                                }
                             });
 
                             Ambiguity {

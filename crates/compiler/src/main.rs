@@ -5,7 +5,7 @@ use entwistle::{
     lower::{
         Lower, Name, NonTerminal, NonTerminalData, ResolvedTerm, Term, Terminal, TerminalData,
     },
-    parse_table::{LrkParseTable, ParseTable},
+    parse_table::{ConflictedAction, LrkParseTable, ParseTable},
     EntwistleDatabase,
 };
 use tracing::Level;
@@ -92,21 +92,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (item, _backlinks) in &state.item_set {
             print!("    ");
             print_nt(&db, item.non_terminal);
-            print!(" -> ");
+            print!(" ->");
             for term in &item.production[..item.index] {
-                match term.resolve_this(item.non_terminal) {
-                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
-                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
-                }
-                print!(" ")
-            }
-            print!(". ");
-            for term in &item.production[item.index..] {
-                match term.resolve_this(item.non_terminal) {
-                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
-                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
-                }
                 print!(" ");
+                match term.resolve_this(item.non_terminal) {
+                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
+                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
+                }
+            }
+            print!(" .");
+            for term in &item.production[item.index..] {
+                print!(" ");
+                match term.resolve_this(item.non_terminal) {
+                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
+                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
+                }
             }
             println!();
         }
@@ -125,7 +125,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("--------------");
 
-    println!("{:#?}", db.lane_table(non_terminal));
+    for (source_state, conflicts) in &*db.lane_table(non_terminal) {
+        println!("Source state {}:", source_state);
+        for ((state, conflict), disambiguators) in conflicts {
+            print!("  State {}: ", state);
+            match *conflict {
+                ConflictedAction::Shift(terminal) => {
+                    print!("Shift(");
+                    print_terminal(&db, terminal);
+                    println!(")")
+                }
+                ConflictedAction::Reduce(nt, ref terms) => {
+                    print!("Reduce(");
+                    print_nt(&db, nt);
+                    print!(" ->");
+                    for term in &**terms {
+                        print!(" ");
+                        match term.resolve_this(nt) {
+                            ResolvedTerm::Terminal(t) => print_terminal(&db, t),
+                            ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
+                        }
+                    }
+                    println!(")")
+                }
+            }
+            for disambiguator in disambiguators {
+                print!("   ");
+                for &terminal in disambiguator {
+                    print!(" ");
+                    print_terminal(&db, terminal);
+                }
+                println!();
+            }
+        }
+    }
 
     println!("--------------");
 
