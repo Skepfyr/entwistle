@@ -2,10 +2,9 @@ use std::{collections::HashSet, convert::TryInto, error::Error};
 
 use entwistle::{
     language::Language,
-    lower::{
-        Lower, Name, NonTerminal, NonTerminalData, ResolvedTerm, Term, Terminal, TerminalData,
-    },
-    parse_table::{ConflictedAction, LrkParseTable, ParseTable},
+    lower::{Lower, NonTerminalData, Term},
+    parse_table::ParseTable,
+    util::DbDisplay,
     EntwistleDatabase,
 };
 use tracing::Level;
@@ -31,31 +30,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     while let Some(nt) = to_print.pop() {
         let production = db.production(nt);
-        print_nt(&db, nt);
-        print!(" -> ");
-        for (i, alt) in production.into_iter().enumerate() {
-            if i != 0 {
-                print!("| ");
-            }
-            if alt.is_empty() {
-                print!("() ");
-            }
-            for &term in &*alt {
-                match term {
-                    Term::NonTerminal(next_nt) => {
-                        if !visited.contains(&next_nt) {
-                            to_print.push(next_nt);
-                            visited.insert(next_nt);
-                        }
-                        print_nt(&db, next_nt);
+        println!("{}", production.display(&db));
+        for terms in production {
+            for term in &*terms {
+                if let &Term::NonTerminal(next_nt) = term {
+                    if !visited.contains(&next_nt) {
+                        to_print.push(next_nt);
+                        visited.insert(next_nt);
                     }
-                    Term::Terminal(term) => print_terminal(&db, term),
-                    Term::This => print_nt(&db, nt),
                 }
-                print!(" ")
             }
         }
-        println!();
     }
 
     println!("--------------");
@@ -84,120 +69,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("--------------");
 
-    let lr0_parse_table = db.lr0_parse_table(non_terminal);
-    println!("Start state: {}", lr0_parse_table.start_state);
-    for (i, state) in lr0_parse_table.states.iter().enumerate() {
-        println!("State {}:", i);
-        println!("  Items:");
-        for (item, _backlinks) in &state.item_set {
-            print!("    ");
-            print_nt(&db, item.non_terminal);
-            print!(" ->");
-            for term in &item.production[..item.index] {
-                print!(" ");
-                match term.resolve_this(item.non_terminal) {
-                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
-                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
-                }
-            }
-            print!(" .");
-            for term in &item.production[item.index..] {
-                print!(" ");
-                match term.resolve_this(item.non_terminal) {
-                    ResolvedTerm::Terminal(t) => print_terminal(&db, t),
-                    ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
-                }
-            }
-            println!();
-        }
-        println!("  Actions:");
-        for (&t, &state) in &state.actions {
-            print!("    ");
-            print_terminal(&db, t);
-            println!(" -> {}", state);
-        }
-        for (&nt, &state) in &state.goto {
-            print!("    ");
-            print_nt(&db, nt);
-            println!(" -> {}", state);
-        }
-    }
+    println!("{}", db.lr0_parse_table(non_terminal).display(&db));
 
     println!("--------------");
 
-    for (source_state, conflicts) in &*db.lane_table(non_terminal) {
-        println!("Source state {}:", source_state);
-        for ((state, conflict), disambiguators) in conflicts {
-            print!("  State {}: ", state);
-            match *conflict {
-                ConflictedAction::Shift(terminal) => {
-                    print!("Shift(");
-                    print_terminal(&db, terminal);
-                    println!(")")
-                }
-                ConflictedAction::Reduce(nt, ref terms) => {
-                    print!("Reduce(");
-                    print_nt(&db, nt);
-                    print!(" ->");
-                    for term in &**terms {
-                        print!(" ");
-                        match term.resolve_this(nt) {
-                            ResolvedTerm::Terminal(t) => print_terminal(&db, t),
-                            ResolvedTerm::NonTerminal(nt) => print_nt(&db, nt),
-                        }
-                    }
-                    println!(")")
-                }
-            }
-            for disambiguator in disambiguators {
-                print!("   ");
-                for &terminal in disambiguator {
-                    print!(" ");
-                    print_terminal(&db, terminal);
-                }
-                println!();
-            }
-        }
-    }
+    println!("{}", db.lane_table(non_terminal).display(&db));
 
     println!("--------------");
 
     Ok(())
-}
-
-fn print_nt(db: &EntwistleDatabase, nt: NonTerminal) {
-    match db.lookup_intern_non_terminal(nt) {
-        NonTerminalData::Goal { non_terminal } => {
-            print!("Goal(");
-            print_nt(db, non_terminal);
-            print!(")");
-        }
-        NonTerminalData::Named { name, scope } => {
-            print!("{}#{}{{", db.lookup_intern_ident(name.ident), name.index,);
-            for (key, Name { ident, index }) in scope.ident_map {
-                print!(
-                    "{}: {}#{}, ",
-                    db.lookup_intern_ident(key),
-                    db.lookup_intern_ident(ident),
-                    index
-                )
-            }
-            print!("}}");
-        }
-        NonTerminalData::Anonymous { .. } => print!("#{}", nt.0),
-    }
-}
-
-fn print_terminal(db: &EntwistleDatabase, term: Terminal) {
-    match db.lookup_intern_terminal(term) {
-        TerminalData::Real { name, data } => {
-            if let Some(name) = name {
-                print!("{}#{}(", db.lookup_intern_ident(name), term.0);
-            } else {
-                print!("#{}(", term.0);
-            }
-            print!("{:?})", data);
-        }
-        TerminalData::EndOfInput => print!("EoI"),
-    }
 }

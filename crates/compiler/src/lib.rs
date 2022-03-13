@@ -31,6 +31,7 @@ pub mod file;
 pub mod language;
 pub mod lower;
 pub mod parse_table;
+pub mod util;
 
 #[salsa::database(FileStorage, LanguageStorage, LowerStorage, ParseTableStorage)]
 pub struct EntwistleDatabase {

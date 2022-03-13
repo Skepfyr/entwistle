@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Index,
-    sync::Arc,
+    sync::Arc, fmt,
 };
 
 use im::OrdSet;
 use tracing::{debug, instrument, trace};
 
-use crate::lower::{Lower, NonTerminal, NonTerminalData, ResolvedTerm, Term, Terminal};
+use crate::{
+    lower::{Lower, NonTerminal, NonTerminalData, Term, Terminal},
+    util::DbDisplay,
+};
 
 #[salsa::query_group(ParseTableStorage)]
 pub trait ParseTable: Lower {
@@ -63,11 +66,8 @@ impl Item {
         }
     }
 
-    fn next(&self) -> Option<ResolvedTerm> {
-        self.production
-            .get(self.index)
-            .copied()
-            .map(|term| term.resolve_this(self.non_terminal))
+    fn next(&self) -> Option<Term> {
+        self.production.get(self.index).copied()
     }
 
     fn is_nucleus(&self) -> bool {
@@ -98,7 +98,7 @@ pub fn first_set(db: &dyn ParseTable, non_terminal: NonTerminal) -> (bool, OrdSe
                     let other = db.first_set(nt);
                     (contains_null | other.0, set.union(other.1))
                 }
-                Some(Term::This | Term::NonTerminal(_)) => (contains_null, set),
+                Some(Term::NonTerminal(_)) => (contains_null, set),
                 None => (true, set),
             },
         )
@@ -108,6 +108,35 @@ pub fn first_set(db: &dyn ParseTable, non_terminal: NonTerminal) -> (bool, OrdSe
 pub struct Lr0ParseTable {
     pub start_state: StateId,
     pub states: Arc<[Lr0State]>,
+}
+
+impl<Db: ParseTable> DbDisplay<Db> for Lr0ParseTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        writeln!(f, "Start state: {}", self.start_state)?;
+        for (i, state) in self.states.iter().enumerate() {
+            writeln!(f, "State {}:", i)?;
+            writeln!(f, "  Items:")?;
+            for (item, _backlinks) in &state.item_set {
+                write!(f, "    {} ->", item.non_terminal.display(db))?;
+                for term in &item.production[..item.index] {
+                    write!(f, " {}", term.display(db))?;
+                }
+                print!(" .");
+                for term in &item.production[item.index..] {
+                    write!(f, " {}", term.display(db))?;
+                }
+                writeln!(f)?;
+            }
+            writeln!(f, "  Actions:")?;
+            for (&t, &state) in &state.actions {
+                writeln!(f, "    {} -> {}", t.display(db), state)?;
+            }
+            for (&nt, &state) in &state.goto {
+                writeln!(f, "    {} -> {}", nt.display(db), state)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Index<StateId> for Lr0ParseTable {
@@ -210,10 +239,10 @@ pub fn lr0_parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Lr0Par
                 }
             }
             match term {
-                ResolvedTerm::NonTerminal(nt) => {
+                Term::NonTerminal(nt) => {
                     states[state_id].goto.insert(nt, next_state_id);
                 }
-                ResolvedTerm::Terminal(t) => {
+                Term::Terminal(t) => {
                     states[state_id].actions.insert(t, next_state_id);
                 }
             }
@@ -257,7 +286,7 @@ fn closure(
         i += 1;
 
         let non_terminal = match item.next() {
-            Some(ResolvedTerm::NonTerminal(nt)) => nt,
+            Some(Term::NonTerminal(nt)) => nt,
             _ => continue,
         };
 
@@ -433,6 +462,25 @@ fn sorted_condensation(parse_table: &Lr0ParseTable) -> Vec<Vec<usize>> {
 
 type LaneTable = BTreeMap<StateId, BTreeMap<(StateId, ConflictedAction), BTreeSet<Vec<Terminal>>>>;
 
+impl<Db: ParseTable> DbDisplay<Db> for LaneTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        for (source_state, conflicts) in self {
+            writeln!(f, "Source state {}:", source_state)?;
+            for ((state, conflict), disambiguators) in conflicts {
+                write!(f, "  State {}: {}", state, conflict.display(db))?;
+                for disambiguator in disambiguators {
+                    write!(f, "   ")?;
+                    for &terminal in disambiguator {
+                        write!(f, " {}", terminal.display(db))?;
+                    }
+                    writeln!(f)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> {
     let parse_table = db.lr0_parse_table(start_symbol);
     let mut disambiguator = Disambiguator::new(db, start_symbol);
@@ -444,8 +492,8 @@ fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> 
                 .enumerate()
                 .flat_map(|(i, (item, _))| {
                     let action = match item.next() {
-                        Some(ResolvedTerm::Terminal(terminal)) => ConflictedAction::Shift(terminal),
-                        Some(ResolvedTerm::NonTerminal(_)) => return None, // The goto table can't cause conflicts
+                        Some(Term::Terminal(terminal)) => ConflictedAction::Shift(terminal),
+                        Some(Term::NonTerminal(_)) => return None, // The goto table can't cause conflicts
                         None => {
                             ConflictedAction::Reduce(item.non_terminal, item.production.clone())
                         }
@@ -465,7 +513,7 @@ fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> 
                             terms: item
                                 .production
                                 .iter()
-                                .map(|term| term.resolve_this(item.non_terminal).into())
+                                .map(|&term| term.into())
                                 .collect::<Vec<_>>()
                                 .into(),
                             next_term: item.index,
@@ -486,6 +534,25 @@ fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> 
 pub enum ConflictedAction {
     Shift(Terminal),
     Reduce(NonTerminal, Arc<[Term]>),
+}
+
+
+impl<Db: ParseTable> DbDisplay<Db> for ConflictedAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        match self {
+            ConflictedAction::Shift(terminal) => {
+                writeln!(f, "Shift({})", terminal.display(db))?;
+            }
+            ConflictedAction::Reduce(nt, ref terms) => {
+                write!(f, "Reduce({} ->", nt.display(db))?;
+                for term in &**terms {
+                    write!(f, " {}", term.display(db))?;
+                }
+                writeln!(f, ")")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -637,7 +704,7 @@ impl<'a> Disambiguator<'a> {
                                     terms: item
                                         .production
                                         .iter()
-                                        .map(|term| term.resolve_this(item.non_terminal).into())
+                                        .map(|&term| term.into())
                                         .collect::<Vec<_>>()
                                         .into(),
                                     next_term: item.index + 1,
@@ -668,7 +735,7 @@ impl<'a> Disambiguator<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalNonTerminal {
     Original(NonTerminal),
-    Minus(NonTerminal, ResolvedTerm),
+    Minus(NonTerminal, Term),
 }
 
 impl From<NonTerminal> for NormalNonTerminal {
@@ -692,11 +759,11 @@ pub enum NormalTerm {
     NonTerminal(NormalNonTerminal),
 }
 
-impl From<ResolvedTerm> for NormalTerm {
-    fn from(t: ResolvedTerm) -> Self {
+impl From<Term> for NormalTerm {
+    fn from(t: Term) -> Self {
         match t {
-            ResolvedTerm::Terminal(t) => Self::Terminal(t),
-            ResolvedTerm::NonTerminal(nt) => Self::NonTerminal(nt.into()),
+            Term::Terminal(t) => Self::Terminal(t),
+            Term::NonTerminal(nt) => Self::NonTerminal(nt.into()),
         }
     }
 }
@@ -712,7 +779,7 @@ fn normal_production(
                 // 1 - Moor00 5
                 proper_left_corners(db, non_terminal)
                     .into_iter()
-                    .filter(|term| !matches!(term, ResolvedTerm::NonTerminal(nt) if db.left_recursive(*nt)))
+                    .filter(|term| !matches!(term, Term::NonTerminal(nt) if db.left_recursive(*nt)))
                     .map(|term| -> Arc<[_]> {
                         vec![
                             term.into(),
@@ -727,7 +794,7 @@ fn normal_production(
                     .into_iter()
                     .map(|rule| -> Arc<[_]> {
                         rule.iter()
-                            .map(|term| term.resolve_this(non_terminal).into())
+                            .map(|&term| term.into())
                             .collect::<Vec<_>>()
                             .into()
                     })
@@ -741,13 +808,11 @@ fn normal_production(
             rules.extend(
                 db.production(non_terminal)
                     .into_iter()
-                    .filter(|rule| {
-                        rule.first().map(|term| term.resolve_this(non_terminal)) == Some(symbol)
-                    })
+                    .filter(|rule| rule.first() == Some(&symbol))
                     .map(|rule| -> Arc<[_]> {
                         rule.iter()
                             .skip(1)
-                            .map(|term| term.resolve_this(non_terminal).into())
+                            .map(|&term| term.into())
                             .collect::<Vec<_>>()
                             .into()
                     }),
@@ -757,23 +822,21 @@ fn normal_production(
                 proper_left_corners(db, non_terminal)
                     .into_iter()
                     .filter_map(|term| match term {
-                        ResolvedTerm::NonTerminal(nt) if db.left_recursive(nt) => Some(nt),
+                        Term::NonTerminal(nt) if db.left_recursive(nt) => Some(nt),
                         _ => None,
                     })
                     .flat_map(|nt| {
                         db.production(nt)
                             .into_iter()
-                            .filter(move |rule| {
-                                rule.first().map(|term| term.resolve_this(nt)) == Some(symbol)
-                            })
+                            .filter(move |rule| rule.first() == Some(&symbol))
                             .map(move |rule| -> Arc<[_]> {
                                 rule.iter()
                                     .skip(1)
-                                    .map(|term| term.resolve_this(nt).into())
+                                    .map(|&term| term.into())
                                     .chain(std::iter::once(NormalTerm::NonTerminal(
                                         NormalNonTerminal::Minus(
                                             non_terminal,
-                                            ResolvedTerm::NonTerminal(nt),
+                                            Term::NonTerminal(nt),
                                         ),
                                     )))
                                     .collect::<Vec<_>>()
@@ -786,7 +849,7 @@ fn normal_production(
     }
 }
 
-fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSet<ResolvedTerm> {
+fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSet<Term> {
     let mut left_corners = HashSet::new();
     let mut todo = vec![non_terminal];
 
@@ -794,11 +857,10 @@ fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSe
         db.production(nt)
             .into_iter()
             .flat_map(|rule| rule.first().copied())
-            .map(|term| term.resolve_this(nt))
             .for_each(|term| {
                 let new_term = left_corners.insert(term);
                 match term {
-                    ResolvedTerm::NonTerminal(next) if new_term && next != non_terminal => {
+                    Term::NonTerminal(next) if new_term && next != non_terminal => {
                         todo.push(next);
                     }
                     _ => {}
@@ -810,5 +872,5 @@ fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSe
 }
 
 fn left_recursive(db: &dyn ParseTable, non_terminal: NonTerminal) -> bool {
-    proper_left_corners(db, non_terminal).contains(&ResolvedTerm::NonTerminal(non_terminal))
+    proper_left_corners(db, non_terminal).contains(&Term::NonTerminal(non_terminal))
 }

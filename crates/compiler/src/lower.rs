@@ -1,8 +1,16 @@
-use std::{fmt::Write, hash::Hash, str, sync::Arc};
+use std::{
+    fmt::{self, Write},
+    hash::Hash,
+    str,
+    sync::Arc,
+};
 
 use im::{OrdMap, OrdSet};
 
-use crate::language::{self, Ident, Language, Mark, Quantifier};
+use crate::{
+    language::{self, Ident, Language, Mark, Quantifier},
+    util::DbDisplay,
+};
 
 #[salsa::query_group(LowerStorage)]
 pub trait Lower: Language {
@@ -18,7 +26,7 @@ pub trait Lower: Language {
         term: language::Production,
         current_name: Name,
         scope: Scope,
-    ) -> Production;
+    ) -> OrdSet<Arc<[UnresolvedTerm]>>;
     fn lower_atomic_ident(&self, ident: Ident) -> Arc<str>;
     fn lower_term(
         &self,
@@ -26,7 +34,7 @@ pub trait Lower: Language {
         quantifier: language::Quantifier,
         current_name: Name,
         scope: Scope,
-    ) -> Term;
+    ) -> UnresolvedTerm;
 }
 
 pub fn production(db: &dyn Lower, non_terminal: NonTerminal) -> Production {
@@ -40,15 +48,33 @@ pub fn production(db: &dyn Lower, non_terminal: NonTerminal) -> Production {
             .collect()
         }
         NonTerminalData::Named { name, scope } => (name, scope),
-        NonTerminalData::Anonymous { production } => return production,
+        NonTerminalData::Anonymous { production } => {
+            return production
+                .into_iter()
+                .map(|terms| {
+                    terms
+                        .iter()
+                        .map(|term| term.resolve_this(non_terminal))
+                        .collect::<Arc<[_]>>()
+                })
+                .collect()
+        }
     };
     let rules = db.rules(name.ident);
     let rule = match &*rules {
         [rule] => rule,
-        _ => return Production::default(),
+        _ => panic!("Should have exactly one rule"),
     };
-    let mut production =
-        db.lower_production(rule.productions[name.index].clone(), name, scope.clone());
+    let mut production = db
+        .lower_production(rule.productions[name.index].clone(), name, scope.clone())
+        .into_iter()
+        .map(|terms| {
+            terms
+                .iter()
+                .map(|term| term.resolve_this(non_terminal))
+                .collect::<Arc<[_]>>()
+        })
+        .collect::<Production>();
     if name.index < rule.productions.len() - 1 {
         production.insert(Arc::new([Term::NonTerminal(db.intern_non_terminal(
             NonTerminalData::Named {
@@ -102,7 +128,7 @@ fn lower_production(
     production: language::Production,
     current_name: Name,
     scope: Scope,
-) -> Production {
+) -> OrdSet<Arc<[UnresolvedTerm]>> {
     production
         .alternatives
         .into_iter()
@@ -113,7 +139,7 @@ fn lower_production(
                 .map(|(term, quantifier)| {
                     db.lower_term(term, quantifier, current_name, scope.clone())
                 })
-                .collect::<Arc<[Term]>>()
+                .collect::<Arc<[UnresolvedTerm]>>()
         })
         .collect()
 }
@@ -124,10 +150,10 @@ fn lower_term(
     quantifier: language::Quantifier,
     current_name: Name,
     scope: Scope,
-) -> Term {
+) -> UnresolvedTerm {
     if quantifier != Quantifier::Once {
         let term = db.lower_term(term, Quantifier::Once, current_name, scope);
-        let mut production: OrdSet<Arc<[Term]>> = OrdSet::new();
+        let mut production: OrdSet<Arc<[UnresolvedTerm]>> = OrdSet::new();
         // Zero times
         if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
             production.insert(Arc::new([]));
@@ -138,9 +164,9 @@ fn lower_term(
         }
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            production.insert(Arc::new([term, Term::This]));
+            production.insert(Arc::new([term, UnresolvedTerm::This]));
         }
-        return Term::NonTerminal(
+        return UnresolvedTerm::NonTerminal(
             db.intern_non_terminal(NonTerminalData::Anonymous { production }),
         );
     }
@@ -148,7 +174,7 @@ fn lower_term(
     match term {
         language::Term::Ident { mark, ident } => {
             if db.is_atomic(ident) {
-                Term::Terminal(db.terminal(ident))
+                UnresolvedTerm::Terminal(db.terminal(ident))
             } else {
                 let marked_name = Name {
                     ident: current_name.ident,
@@ -171,19 +197,23 @@ fn lower_term(
                         scope: scope.sub_scope(marked_name, minimizer),
                     }
                 };
-                Term::NonTerminal(db.intern_non_terminal(non_terminal))
+                UnresolvedTerm::NonTerminal(db.intern_non_terminal(non_terminal))
             }
         }
-        language::Term::String(string) => Term::Terminal(db.intern_terminal(TerminalData::Real {
-            name: None,
-            data: string.into(),
-        })),
-        language::Term::Regex(regex) => Term::Terminal(db.intern_terminal(TerminalData::Real {
-            name: None,
-            data: regex.to_string().into(),
-        })),
+        language::Term::String(string) => {
+            UnresolvedTerm::Terminal(db.intern_terminal(TerminalData::Real {
+                name: None,
+                data: string.into(),
+            }))
+        }
+        language::Term::Regex(regex) => {
+            UnresolvedTerm::Terminal(db.intern_terminal(TerminalData::Real {
+                name: None,
+                data: regex.to_string().into(),
+            }))
+        }
         language::Term::Group(production) => {
-            Term::NonTerminal(db.intern_non_terminal(NonTerminalData::Anonymous {
+            UnresolvedTerm::NonTerminal(db.intern_non_terminal(NonTerminalData::Anonymous {
                 production: db.lower_production(production, current_name, scope),
             }))
         }
@@ -255,11 +285,43 @@ fn write_production_regex(db: &dyn Lower, regex: &mut String, production: &langu
 
 intern_key!(NonTerminal);
 
+impl<Db: Lower> DbDisplay<Db> for NonTerminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        match db.lookup_intern_non_terminal(*self) {
+            NonTerminalData::Goal { non_terminal } => {
+                write!(f, "Goal({})", non_terminal.display(db))?;
+            }
+            NonTerminalData::Named { name, scope } => {
+                write!(f, "{}#{}{{", db.lookup_intern_ident(name.ident), name.index)?;
+                for (key, Name { ident, index }) in scope.ident_map {
+                    write!(
+                        f,
+                        "{}: {}#{}, ",
+                        db.lookup_intern_ident(key),
+                        db.lookup_intern_ident(ident),
+                        index
+                    )?;
+                }
+                write!(f, "}}")?;
+            }
+            NonTerminalData::Anonymous { .. } => write!(f, "#{}", self.0)?,
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NonTerminalData {
-    Goal { non_terminal: NonTerminal },
-    Named { name: Name, scope: Scope },
-    Anonymous { production: Production },
+    Goal {
+        non_terminal: NonTerminal,
+    },
+    Named {
+        name: Name,
+        scope: Scope,
+    },
+    Anonymous {
+        production: OrdSet<Arc<[UnresolvedTerm]>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -297,6 +359,23 @@ impl Scope {
 
 intern_key!(Terminal);
 
+impl<Db: Lower> DbDisplay<Db> for Terminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        match db.lookup_intern_terminal(*self) {
+            TerminalData::Real { name, data } => {
+                if let Some(name) = name {
+                    write!(f, "{}#{}(", db.lookup_intern_ident(name), self.0)?;
+                } else {
+                    write!(f, "#{}(", self.0)?;
+                }
+                write!(f, "{:?})", data)?;
+            }
+            TerminalData::EndOfInput => write!(f, "EoI")?,
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TerminalData {
     Real { name: Option<Ident>, data: Arc<str> },
@@ -305,25 +384,51 @@ pub enum TerminalData {
 
 pub type Production = OrdSet<Arc<[Term]>>;
 
+impl<Db: Lower> DbDisplay<Db> for Production {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        for (i, alt) in self.iter().enumerate() {
+            if i != 0 {
+                write!(f, "| ")?;
+            }
+            if alt.is_empty() {
+                write!(f, "() ")?;
+            }
+            for &term in &**alt {
+                write!(f, "{} ", term.display(db))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Term {
     Terminal(Terminal),
     NonTerminal(NonTerminal),
-    This,
 }
 
-impl Term {
-    pub fn resolve_this(self, this: NonTerminal) -> ResolvedTerm {
-        match self {
-            Term::Terminal(t) => ResolvedTerm::Terminal(t),
-            Term::NonTerminal(nt) => ResolvedTerm::NonTerminal(nt),
-            Term::This => ResolvedTerm::NonTerminal(this),
+impl<Db: Lower> DbDisplay<Db> for Term {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        match *self {
+            Term::Terminal(t) => t.fmt(f, db),
+            Term::NonTerminal(nt) => nt.fmt(f, db),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ResolvedTerm {
+pub enum UnresolvedTerm {
     Terminal(Terminal),
     NonTerminal(NonTerminal),
+    This,
+}
+
+impl UnresolvedTerm {
+    pub fn resolve_this(self, this: NonTerminal) -> Term {
+        match self {
+            UnresolvedTerm::Terminal(t) => Term::Terminal(t),
+            UnresolvedTerm::NonTerminal(nt) => Term::NonTerminal(nt),
+            UnresolvedTerm::This => Term::NonTerminal(this),
+        }
+    }
 }
