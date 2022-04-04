@@ -364,7 +364,7 @@ impl<Db: Lower> DbDisplay<Db> for Terminal {
         match db.lookup_intern_terminal(*self) {
             TerminalData::Real { name, data } => {
                 if let Some(name) = name {
-                    write!(f, "{}#{}(", db.lookup_intern_ident(name), self.0)?;
+                    write!(f, "{}(", db.lookup_intern_ident(name))?;
                 } else {
                     write!(f, "#{}(", self.0)?;
                 }

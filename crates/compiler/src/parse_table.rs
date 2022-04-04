@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     ops::Index,
-    sync::Arc, fmt,
+    sync::Arc,
 };
 
 use im::OrdSet;
@@ -75,7 +76,14 @@ impl Item {
     }
 }
 
-type StateId = usize;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct StateId(usize);
+
+impl fmt::Display for StateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemIndex {
@@ -143,7 +151,7 @@ impl Index<StateId> for Lr0ParseTable {
     type Output = Lr0State;
 
     fn index(&self, index: StateId) -> &Self::Output {
-        &self.states[index]
+        &self.states[index.0]
     }
 }
 
@@ -151,7 +159,7 @@ impl Index<ItemIndex> for Lr0ParseTable {
     type Output = (Item, BTreeSet<ItemIndex>);
 
     fn index(&self, index: ItemIndex) -> &Self::Output {
-        &self.states[index.state].item_set[index.item]
+        &self[index.state].item_set[index.item]
     }
 }
 
@@ -224,7 +232,7 @@ pub fn lr0_parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Lr0Par
                     })
                     .or_default()
                     .insert(ItemIndex {
-                        state: state_id,
+                        state: StateId(state_id),
                         item: id,
                     });
             }
@@ -232,7 +240,7 @@ pub fn lr0_parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Lr0Par
             let next_state_id = *state_lookup
                 .entry(new_item_set)
                 .or_insert_with_key(|new_item_set| add_state(db, &mut states, new_item_set));
-            let next_state = &mut states[next_state_id];
+            let next_state = &mut states[next_state_id.0];
             for (item, back_refs) in &mut next_state.item_set {
                 if let Some(new_back_refs) = new_state.get(item) {
                     back_refs.extend(new_back_refs.iter().copied());
@@ -252,13 +260,13 @@ pub fn lr0_parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Lr0Par
     }
 
     Lr0ParseTable {
-        start_state: 0,
+        start_state: StateId(0),
         states: states.into(),
     }
 }
 
 fn add_state(db: &dyn ParseTable, states: &mut Vec<Lr0State>, state: &BTreeSet<Item>) -> StateId {
-    let new_id = states.len();
+    let new_id = StateId(states.len());
     states.push(Lr0State {
         item_set: closure(db, state, new_id),
         actions: HashMap::new(),
@@ -485,6 +493,7 @@ fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> 
     let parse_table = db.lr0_parse_table(start_symbol);
     let mut disambiguator = Disambiguator::new(db, start_symbol);
     for (state_id, state) in parse_table.states.iter().enumerate() {
+        let state_id = StateId(state_id);
         if state.is_ambiguous() {
             let ambiguities = state
                 .item_set
@@ -535,7 +544,6 @@ pub enum ConflictedAction {
     Shift(Terminal),
     Reduce(NonTerminal, Arc<[Term]>),
 }
-
 
 impl<Db: ParseTable> DbDisplay<Db> for ConflictedAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
@@ -612,9 +620,9 @@ impl<'a> Disambiguator<'a> {
             let (action, ambiguities) = ambiguities.into_iter().next().unwrap();
             for ambiguity in ambiguities {
                 self.lane_table
-                    .entry(state)
+                    .entry(ambiguity.location.state)
                     .or_default()
-                    .entry((ambiguity.location.state, action.clone()))
+                    .entry((state, action.clone()))
                     .or_default()
                     .insert(prefix.clone());
             }
