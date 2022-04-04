@@ -13,11 +13,16 @@ pub trait Language: Files {
     fn intern_ident(&self, name: String) -> Ident;
     #[salsa::invoke(parser::parse_grammar)]
     fn parse_grammar(&self) -> Grammar;
+    fn idents(&self) -> Arc<[Ident]>;
     fn rules(&self, ident: Ident) -> Arc<[Rule]>;
     fn tests(&self, ident: Ident) -> Arc<[Test]>;
     fn is_atomic(&self, ident: Ident) -> bool;
     fn dependencies(&self, ident: Ident) -> OrdSet<Ident>;
     fn direct_dependencies(&self, ident: Ident) -> OrdSet<Ident>;
+}
+
+fn idents(db: &dyn Language) -> Arc<[Ident]> {
+    db.parse_grammar().rules.keys().copied().collect()
 }
 
 fn rules(db: &dyn Language, ident: Ident) -> Arc<[Rule]> {

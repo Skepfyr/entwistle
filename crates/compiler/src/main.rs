@@ -18,15 +18,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let file = std::env::args().nth(1).unwrap();
 
     let db = EntwistleDatabase::oneshot(file.try_into().unwrap());
-    let ident = db.intern_ident(std::env::args().nth(2).unwrap());
-    let non_terminal = match db.term(ident) {
-        Term::NonTerminal(nt) => nt,
-        _ => panic!(),
-    };
 
     let mut visited = HashSet::new();
-    let mut to_print = vec![non_terminal];
-    visited.insert(non_terminal);
+    let mut to_print: Vec<_> = db
+        .idents()
+        .iter()
+        .filter_map(|&ident| match db.term(ident) {
+            Term::Terminal(_) => None,
+            Term::NonTerminal(nt) => Some(nt),
+        })
+        .collect();
+    visited.extend(to_print.iter().copied());
 
     while let Some(nt) = to_print.pop() {
         let production = db.production(nt);
@@ -69,11 +71,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("--------------");
 
-    println!("{}", db.lr0_parse_table(non_terminal).display(&db));
+    println!("{}", db.lr0_parse_table().display(&db));
 
     println!("--------------");
 
-    println!("{}", db.lane_table(non_terminal).display(&db));
+    println!("{}", db.lane_table().display(&db));
 
     println!("--------------");
 

@@ -18,16 +18,12 @@ pub trait ParseTable: Lower {
     #[salsa::interned]
     fn intern_item_set(&self, data: ItemSetData) -> ItemSet;
     fn first_set(&self, non_terminal: NonTerminal) -> (bool, OrdSet<Terminal>);
-    fn lr0_parse_table(&self, start_symbol: NonTerminal) -> Lr0ParseTable;
+    fn lr0_parse_table(&self) -> Lr0ParseTable;
     #[salsa::cycle(resolve_lane_cycle)]
-    fn item_lane_heads(&self, start_symbol: NonTerminal, item: ItemIndex) -> BTreeSet<ItemIndex>;
-    fn item_set_lane_heads(
-        &self,
-        start_symbol: NonTerminal,
-        cycle: Arc<BTreeSet<ItemIndex>>,
-    ) -> BTreeSet<ItemIndex>;
-    fn parse_table(&self, start_symbol: NonTerminal) -> LrkParseTable;
-    fn lane_table(&self, start_symbol: NonTerminal) -> Arc<LaneTable>;
+    fn item_lane_heads(&self, item: ItemIndex) -> BTreeSet<ItemIndex>;
+    fn item_set_lane_heads(&self, cycle: Arc<BTreeSet<ItemIndex>>) -> BTreeSet<ItemIndex>;
+    fn parse_table(&self) -> LrkParseTable;
+    fn lane_table(&self) -> Arc<LaneTable>;
     fn normal_production(&self, non_terminal: NormalNonTerminal) -> OrdSet<Arc<[NormalTerm]>>;
     fn left_recursive(&self, non_terminal: NonTerminal) -> bool;
 }
@@ -77,7 +73,7 @@ impl Item {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct StateId(usize);
+pub struct StateId(usize);
 
 impl fmt::Display for StateId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -188,24 +184,28 @@ pub struct ItemSetData {
     items: Vec<(Item, BTreeSet<ItemIndex>)>,
 }
 
-pub fn lr0_parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Lr0ParseTable {
+pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, StateId> = HashMap::new();
 
-    let goal = db.intern_non_terminal(NonTerminalData::Goal {
-        non_terminal: start_symbol,
-    });
+    for &ident in db.idents().iter() {
+        let non_terminal = match db.term(ident) {
+            Term::Terminal(_) => continue,
+            Term::NonTerminal(nt) => nt,
+        };
+        let goal = db.intern_non_terminal(NonTerminalData::Goal { non_terminal });
 
-    let mut root_item_set = BTreeSet::new();
-    for production in db.production(goal) {
-        // There should only be one but doesn't hurt to add them "all"
-        root_item_set.insert(Item {
-            non_terminal: goal,
-            production,
-            index: 0,
-        });
+        let mut root_item_set = BTreeSet::new();
+        for production in db.production(goal) {
+            // There should only be one but doesn't hurt to add them "all"
+            root_item_set.insert(Item {
+                non_terminal: goal,
+                production,
+                index: 0,
+            });
+        }
+        add_state(db, &mut states, &root_item_set);
     }
-    add_state(db, &mut states, &root_item_set);
 
     let mut state_id = 0;
     while state_id < states.len() {
@@ -322,23 +322,18 @@ fn closure(
     state
 }
 
-pub fn item_lane_heads(
-    db: &dyn ParseTable,
-    start_symbol: NonTerminal,
-    item: ItemIndex,
-) -> BTreeSet<ItemIndex> {
+pub fn item_lane_heads(db: &dyn ParseTable, item: ItemIndex) -> BTreeSet<ItemIndex> {
     let mut set = BTreeSet::new();
     set.insert(item);
-    lane_heads(db, start_symbol, Arc::new(set))
+    lane_heads(db, Arc::new(set))
 }
 
 fn resolve_lane_cycle(
     db: &dyn ParseTable,
     _cycle: &[String],
-    start_symbol: &NonTerminal,
     root_item_id: &ItemIndex,
 ) -> BTreeSet<ItemIndex> {
-    let parse_table = db.lr0_parse_table(*start_symbol);
+    let parse_table = db.lr0_parse_table();
     let mut visited = HashSet::new();
     let mut cycle = BTreeSet::new();
 
@@ -346,7 +341,7 @@ fn resolve_lane_cycle(
     cycle.insert(*root_item_id);
     find_cycle(&parse_table, &mut visited, &mut cycle, *root_item_id);
 
-    db.item_set_lane_heads(*start_symbol, Arc::new(cycle))
+    db.item_set_lane_heads(Arc::new(cycle))
 }
 
 fn find_cycle(
@@ -372,18 +367,13 @@ fn find_cycle(
 
 fn item_set_lane_heads(
     db: &dyn ParseTable,
-    start_symbol: NonTerminal,
     cycle: Arc<BTreeSet<ItemIndex>>,
 ) -> BTreeSet<ItemIndex> {
-    lane_heads(db, start_symbol, cycle)
+    lane_heads(db, cycle)
 }
 
-fn lane_heads(
-    db: &dyn ParseTable,
-    start_symbol: NonTerminal,
-    cycle: Arc<BTreeSet<ItemIndex>>,
-) -> BTreeSet<ItemIndex> {
-    let parse_table = db.lr0_parse_table(start_symbol);
+fn lane_heads(db: &dyn ParseTable, cycle: Arc<BTreeSet<ItemIndex>>) -> BTreeSet<ItemIndex> {
+    let parse_table = db.lr0_parse_table();
 
     cycle.iter().fold(BTreeSet::new(), |mut context, &item_id| {
         let (item, back_refs) = &parse_table[item_id];
@@ -392,7 +382,7 @@ fn lane_heads(
             back_refs
                 .difference(&cycle)
                 .fold(context, |mut context, &prev_item| {
-                    context.extend(&db.item_lane_heads(start_symbol, prev_item));
+                    context.extend(&db.item_lane_heads(prev_item));
                     context
                 })
         } else {
@@ -402,10 +392,10 @@ fn lane_heads(
     })
 }
 
-fn parse_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> LrkParseTable {
+fn parse_table(db: &dyn ParseTable) -> LrkParseTable {
     todo!()
-    // let lr0_parse_table = db.lr0_parse_table(start_symbol);
-    // let lane_table = db.lane_table(start_symbol);
+    // let lr0_parse_table = db.lr0_parse_table();
+    // let lane_table = db.lane_table();
     // let sorted = sorted_condensation(&lr0_parse_table);
     // let mut states = Vec::with_capacity(lr0_parse_table.states.len());
     // let mut state_map: HashMap<StateId, Vec<usize>> =
@@ -489,9 +479,9 @@ impl<Db: ParseTable> DbDisplay<Db> for LaneTable {
     }
 }
 
-fn lane_table(db: &dyn ParseTable, start_symbol: NonTerminal) -> Arc<LaneTable> {
-    let parse_table = db.lr0_parse_table(start_symbol);
-    let mut disambiguator = Disambiguator::new(db, start_symbol);
+fn lane_table(db: &dyn ParseTable) -> Arc<LaneTable> {
+    let parse_table = db.lr0_parse_table();
+    let mut disambiguator = Disambiguator::new(db);
     for (state_id, state) in parse_table.states.iter().enumerate() {
         let state_id = StateId(state_id);
         if state.is_ambiguous() {
@@ -594,15 +584,13 @@ impl TermString {
 
 struct Disambiguator<'a> {
     db: &'a dyn ParseTable,
-    start_symbol: NonTerminal,
     lane_table: LaneTable,
 }
 
 impl<'a> Disambiguator<'a> {
-    fn new(db: &'a dyn ParseTable, start_symbol: NonTerminal) -> Self {
+    fn new(db: &'a dyn ParseTable) -> Self {
         Self {
             db,
-            start_symbol,
             lane_table: LaneTable::new(),
         }
     }
@@ -628,7 +616,7 @@ impl<'a> Disambiguator<'a> {
             }
             return;
         }
-        let parse_table = self.db.lr0_parse_table(self.start_symbol);
+        let parse_table = self.db.lr0_parse_table();
         let mut next = HashMap::<Terminal, HashMap<ConflictedAction, Vec<Ambiguity>>>::new();
 
         for (action, mut ambiguities) in ambiguities {
@@ -690,7 +678,8 @@ impl<'a> Disambiguator<'a> {
                 }
                 // term_string is empty, so we must now walk the parse table.
                 ambiguities.extend(
-                    item_lane_heads(self.db, self.start_symbol, location)
+                    self.db
+                        .item_lane_heads(location)
                         .into_iter()
                         .filter(|&location| visited.insert(location))
                         .map(|location| {

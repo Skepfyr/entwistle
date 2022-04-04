@@ -42,7 +42,7 @@ pub fn production(db: &dyn Lower, non_terminal: NonTerminal) -> Production {
         NonTerminalData::Goal { non_terminal } => {
             return [Arc::new([
                 Term::NonTerminal(non_terminal),
-                Term::Terminal(db.intern_terminal(TerminalData::EndOfInput)),
+                Term::Terminal(db.intern_terminal(TerminalData::EndOfInput { goal: non_terminal })),
             ]) as Arc<[_]>]
             .into_iter()
             .collect()
@@ -370,7 +370,7 @@ impl<Db: Lower> DbDisplay<Db> for Terminal {
                 }
                 write!(f, "{:?})", data)?;
             }
-            TerminalData::EndOfInput => write!(f, "EoI")?,
+            TerminalData::EndOfInput { goal } => write!(f, "EoI({})", goal.display(db))?,
         }
         Ok(())
     }
@@ -379,7 +379,7 @@ impl<Db: Lower> DbDisplay<Db> for Terminal {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TerminalData {
     Real { name: Option<Ident>, data: Arc<str> },
-    EndOfInput,
+    EndOfInput { goal: NonTerminal },
 }
 
 pub type Production = OrdSet<Arc<[Term]>>;
