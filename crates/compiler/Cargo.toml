@@ -1,7 +1,6 @@
 [package]
 name = "entwistle"
 version = "0.1.0"
-authors = ["Jack Rickard <jack.rickard@outlook.com>"]
 edition = "2021"
 
 [dependencies]

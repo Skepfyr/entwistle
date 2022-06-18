@@ -9,6 +9,7 @@ use im::OrdSet;
 use tracing::{debug, instrument, trace};
 
 use crate::{
+    language::Ident,
     lower::{Lower, NonTerminal, NonTerminalData, Term, Terminal},
     util::DbDisplay,
 };
@@ -110,13 +111,16 @@ pub fn first_set(db: &dyn ParseTable, non_terminal: NonTerminal) -> (bool, OrdSe
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lr0ParseTable {
-    pub start_state: StateId,
+    pub start_states: HashMap<Ident, StateId>,
     pub states: Arc<[Lr0State]>,
 }
 
 impl<Db: ParseTable> DbDisplay<Db> for Lr0ParseTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
-        writeln!(f, "Start state: {}", self.start_state)?;
+        writeln!(f, "Start states:")?;
+        for (ident, state) in &self.start_states {
+            writeln!(f, "  {} => {}", ident.display(db), state)?;
+        }
         for (i, state) in self.states.iter().enumerate() {
             writeln!(f, "State {}:", i)?;
             writeln!(f, "  Items:")?;
@@ -188,7 +192,9 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, StateId> = HashMap::new();
 
-    for &ident in db.idents().iter() {
+    let idents = db.idents();
+    let mut start_states = HashMap::with_capacity(idents.len());
+    for &ident in idents.iter() {
         let non_terminal = match db.term(ident) {
             Term::Terminal(_) => continue,
             Term::NonTerminal(nt) => nt,
@@ -204,7 +210,8 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
                 index: 0,
             });
         }
-        add_state(db, &mut states, &root_item_set);
+        let new_state = add_state(db, &mut states, &root_item_set);
+        start_states.insert(ident, new_state);
     }
 
     let mut state_id = 0;
@@ -260,7 +267,7 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
     }
 
     Lr0ParseTable {
-        start_state: StateId(0),
+        start_states,
         states: states.into(),
     }
 }
@@ -393,49 +400,15 @@ fn lane_heads(db: &dyn ParseTable, cycle: Arc<BTreeSet<ItemIndex>>) -> BTreeSet<
 }
 
 fn parse_table(db: &dyn ParseTable) -> LrkParseTable {
-    todo!()
     // let lr0_parse_table = db.lr0_parse_table();
     // let lane_table = db.lane_table();
     // let sorted = sorted_condensation(&lr0_parse_table);
     // let mut states = Vec::with_capacity(lr0_parse_table.states.len());
     // let mut state_map: HashMap<StateId, Vec<usize>> =
     //     HashMap::with_capacity(lr0_parse_table.states.len());
-    // pub enum TempAction {
-    //     Ambiguous(Arc<[(Terminal, Action)]>),
-    //     Shift(Terminal, (StateId, usize)),
-    //     Reduce(NonTerminal, Arc<[Term]>),
-    // }
-    // struct TempState {
-    //     action: TempAction,
-    //     goto: BTreeMap<NonTerminal, (StateId, usize)>,
-    //     accepting: bool,
-    // }
 
-    // for states in sorted.into_iter().rev() {
-    //     let state_to_add = &lr0_parse_table[state_id_to_add];
-    //     let shifts = &state_to_add.actions;
-    //     let reductions: Vec<_> = state_to_add
-    //         .item_set
-    //         .iter()
-    //         .map(|(item, _)| item)
-    //         .filter(|item| item.next().is_none())
-    //         .collect();
-    //     let action = match (shifts.len(), reductions.len()) {
-    //         (0, 0) => panic!("All states must have an action?"),
-    //         (1, 0) => {
-    //             let (terminal, state_id) = shifts.iter().next().unwrap();
-    //             TempAction::Shift(terminal, (state_id, ))
-    //         }
-    //         (_, 0) => {}
-    //         (0, 1) => {}
-    //         (_, _) => {}
-    //     };
+    // for (component, states) in sorted.iter().enumerate() {
 
-    //     states.push(TempState {
-    //         action,
-    //         goto,
-    //         accepting: state_to_add.accepting,
-    //     });
     // }
 
     // LrkParseTable {
@@ -452,10 +425,93 @@ fn parse_table(db: &dyn ParseTable) -> LrkParseTable {
     //         })
     //         .collect(),
     // }
+    todo!()
 }
 
-fn sorted_condensation(parse_table: &Lr0ParseTable) -> Vec<Vec<usize>> {
-    todo!()
+/// Returns the strongly connected components of the parse table in reverse
+/// topological order.
+fn sorted_condensation(parse_table: &Lr0ParseTable) -> Vec<HashSet<StateId>> {
+    // Tarjan's strongly connected components algorithm
+    let mut components = Vec::new();
+
+    struct Vertex {
+        index: Option<usize>,
+        low_link: usize,
+        on_stack: bool,
+    }
+
+    let mut next_index = 0;
+    let mut vertices: Vec<_> = parse_table
+        .states
+        .iter()
+        .map(|_| Vertex {
+            index: None,
+            low_link: 0,
+            on_stack: false,
+        })
+        .collect();
+    let mut stack = Vec::new();
+
+    // Go backwards to reduce recursion
+    for v in (0..vertices.len()).rev() {
+        if vertices[v].index.is_none() {
+            strong_connect(
+                &mut components,
+                &parse_table.states,
+                &mut next_index,
+                &mut vertices,
+                &mut stack,
+                v,
+            );
+        }
+    }
+
+    fn strong_connect(
+        components: &mut Vec<HashSet<StateId>>,
+        states: &[Lr0State],
+        next_index: &mut usize,
+        vertices: &mut [Vertex],
+        stack: &mut Vec<usize>,
+        vertex: usize,
+    ) {
+        let index = *next_index;
+        *next_index += 1;
+        vertices[vertex].index = Some(index);
+        vertices[vertex].low_link = index;
+        stack.push(vertex);
+        vertices[vertex].on_stack = true;
+
+        for &StateId(next) in Iterator::chain(
+            states[vertex].actions.values(),
+            states[vertex].goto.values(),
+        ) {
+            match vertices[next].index {
+                None => {
+                    strong_connect(components, states, next_index, vertices, stack, next);
+                    vertices[vertex].low_link =
+                        usize::min(vertices[vertex].low_link, vertices[next].low_link);
+                }
+                Some(next_index) if vertices[next].on_stack => {
+                    vertices[vertex].low_link = usize::min(vertices[vertex].low_link, next_index);
+                }
+                Some(_) => {}
+            }
+        }
+
+        if vertices[vertex].low_link == index {
+            let mut component = HashSet::new();
+            while let Some(w) = stack.pop() {
+                vertices[w].on_stack = false;
+                component.insert(StateId(w));
+                if w == index {
+                    break;
+                }
+            }
+            components.push(component);
+        }
+    }
+
+    components
 }
 
 type LaneTable = BTreeMap<StateId, BTreeMap<(StateId, ConflictedAction), BTreeSet<Vec<Terminal>>>>;

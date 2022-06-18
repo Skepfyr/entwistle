@@ -1,9 +1,9 @@
-use std::{collections::HashSet, hash, sync::Arc};
+use std::{collections::HashSet, hash, sync::Arc, fmt};
 
 use im::{OrdMap, OrdSet};
 use regex::Regex;
 
-use crate::file::Files;
+use crate::{file::Files, util::DbDisplay};
 
 mod parser;
 
@@ -85,6 +85,12 @@ fn direct_dependencies(db: &dyn Language, ident: Ident) -> OrdSet<Ident> {
 }
 
 intern_key!(Ident);
+
+impl<Db: Language> DbDisplay<Db> for Ident {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+        f.write_str(&db.lookup_intern_ident(*self))
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Grammar {
