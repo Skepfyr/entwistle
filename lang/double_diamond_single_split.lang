@@ -1,0 +1,7 @@
+S: 'a' I 'a' | 'b' I 'b' | 'a' N 'b' | 'b' N 'a'
+I: 'c' P
+N: 'c' Q
+P: 'a' A | 'b' A
+Q: 'a' B | 'b' B
+A: 'c'
+B: 'c'

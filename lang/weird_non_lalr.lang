@@ -1,0 +1,5 @@
+S: C 'a' | D 'b'
+C: 'a' A | 'b' B
+D: 'a' B | 'b' A
+A: 'c'
+B: 'c'

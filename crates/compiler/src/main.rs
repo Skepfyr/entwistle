@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("--------------");
 
-    println!("{}", db.lane_table().display(&db));
+    println!("{}", db.parse_table().display(&db));
 
     println!("--------------");
 

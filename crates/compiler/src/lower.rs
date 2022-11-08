@@ -285,7 +285,7 @@ fn write_production_regex(db: &dyn Lower, regex: &mut String, production: &langu
 
 intern_key!(NonTerminal);
 
-impl<Db: Lower> DbDisplay<Db> for NonTerminal {
+impl<Db: Lower + ?Sized> DbDisplay<Db> for NonTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
         match db.lookup_intern_non_terminal(*self) {
             NonTerminalData::Goal { non_terminal } => {
@@ -359,7 +359,7 @@ impl Scope {
 
 intern_key!(Terminal);
 
-impl<Db: Lower> DbDisplay<Db> for Terminal {
+impl<Db: Lower + ?Sized> DbDisplay<Db> for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
         match db.lookup_intern_terminal(*self) {
             TerminalData::Real { name, data } => {
@@ -384,7 +384,7 @@ pub enum TerminalData {
 
 pub type Production = OrdSet<Arc<[Term]>>;
 
-impl<Db: Lower> DbDisplay<Db> for Production {
+impl<Db: Lower + ?Sized> DbDisplay<Db> for Production {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
         for (i, alt) in self.iter().enumerate() {
             if i != 0 {
@@ -407,7 +407,7 @@ pub enum Term {
     NonTerminal(NonTerminal),
 }
 
-impl<Db: Lower> DbDisplay<Db> for Term {
+impl<Db: Lower + ?Sized> DbDisplay<Db> for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
         match *self {
             Term::Terminal(t) => t.fmt(f, db),
