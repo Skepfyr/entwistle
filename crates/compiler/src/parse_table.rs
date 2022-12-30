@@ -503,6 +503,7 @@ impl<'a> LrkParseTableBuilder<'a> {
 
         // Extend ambiguities to next lookahead item
         for (action, mut ambiguities) in conflicts {
+            let mut lane_members = HashMap::new();
             while let Some(Ambiguity {
                 location,
                 transition,
@@ -568,7 +569,6 @@ impl<'a> LrkParseTableBuilder<'a> {
                 }
                 // term_string is empty, so we must now walk the parse table.
                 let mut lane_heads = HashMap::new();
-                let mut lane_members = HashMap::new();
                 potential_ambiguity |= self.item_lane_heads(
                     action.clone(),
                     location,
@@ -577,7 +577,6 @@ impl<'a> LrkParseTableBuilder<'a> {
                     &mut lane_members,
                     &mut lane_heads,
                 );
-                visited.extend(lane_members.into_keys().map(|idx| idx.state));
                 ambiguities.extend(lane_heads.into_iter().map(
                     |((location, transition), successors)| {
                         trace!(%location, "Walking parse table");
@@ -604,6 +603,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                     },
                 ));
             }
+            visited.extend(lane_members.into_keys().map(|idx| idx.state));
         }
 
         let mut splitting_occurred = false;
@@ -778,7 +778,6 @@ impl<'a> LrkParseTableBuilder<'a> {
         visited: &mut HashMap<ItemIndex, u32>,
         output: &mut HashMap<(ItemIndex, Option<Term>), HashSet<ItemIndex>>,
     ) -> bool {
-        let mut ret = false;
         trace!(
             action = %action.display(self.db),
             %location,
@@ -787,6 +786,13 @@ impl<'a> LrkParseTableBuilder<'a> {
         );
         let (item, back_refs) = &self.lr0_parse_table[location];
 
+        let num_visits = visited.entry(location).or_default();
+        // Allow the search to pass through nodes twice so that cycles get counted properly.
+        if *num_visits >= 2 {
+            return false;
+        }
+
+        let mut ret = false;
         if let Some(next_state) = transition {
             let existing_action = split_info
                 .entry(location.state)
@@ -806,26 +812,22 @@ impl<'a> LrkParseTableBuilder<'a> {
             }
         }
 
-        let num_visits = visited.entry(location).or_default();
         *num_visits += 1;
         if item.index != 0 {
-            // Allow the search to pass through nodes twice so that cycles get counted properly.
-            if *num_visits <= 2 {
-                for item_index in back_refs.clone() {
-                    let transition = if item_index.state == location.state {
-                        transition
-                    } else {
-                        self.lr0_parse_table[item_index].0.next()
-                    };
-                    ret |= self.item_lane_heads(
-                        action.clone(),
-                        item_index,
-                        transition,
-                        split_info,
-                        visited,
-                        output,
-                    );
-                }
+            for item_index in back_refs.clone() {
+                let transition = if item_index.state == location.state {
+                    transition
+                } else {
+                    self.lr0_parse_table[item_index].0.next()
+                };
+                ret |= self.item_lane_heads(
+                    action.clone(),
+                    item_index,
+                    transition,
+                    split_info,
+                    visited,
+                    output,
+                );
             }
         } else {
             for &back_ref in back_refs {
@@ -839,10 +841,8 @@ impl<'a> LrkParseTableBuilder<'a> {
                     .entry((back_ref, transition))
                     .or_default()
                     .extend(visited.iter().filter(|(_, &v)| v > 0).map(|(&k, _)| k));
-                *visited.entry(back_ref).or_default() -= 1;
             }
         }
-        *visited.entry(location).or_default() -= 1;
         ret
     }
 }
