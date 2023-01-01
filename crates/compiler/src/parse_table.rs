@@ -6,46 +6,33 @@ use std::{
     sync::Arc,
 };
 
-use im::OrdSet;
 use indenter::indented;
 use tracing::{debug, instrument, trace};
 
 use crate::{
     language::Ident,
-    lower::{self, Lower, NonTerminal, NonTerminalData, Term, Terminal},
-    util::DbDisplay,
+    lower::{Grammar, NonTerminal, Term, Terminal},
 };
-
-#[salsa::query_group(ParseTableStorage)]
-pub trait ParseTable: Lower {
-    #[salsa::interned]
-    fn intern_item_set(&self, data: ItemSetData) -> ItemSet;
-    fn first_set(&self, non_terminal: NonTerminal) -> (bool, OrdSet<Terminal>);
-    fn lr0_parse_table(&self) -> Lr0ParseTable;
-    fn parse_table(&self) -> LrkParseTable;
-    fn normal_production(&self, non_terminal: NormalNonTerminal) -> OrdSet<Arc<[NormalTerm]>>;
-    fn left_recursive(&self, non_terminal: NonTerminal) -> bool;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LrkParseTable {
     start_states: HashMap<Ident, StateId>,
-    states: Arc<[State]>,
+    states: Vec<State>,
 }
 
-impl<Db: ParseTable + ?Sized> DbDisplay<Db> for LrkParseTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+impl fmt::Display for LrkParseTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Start states:")?;
         for (ident, state) in &self.start_states {
-            writeln!(f, "  {} => {}", ident.display(db), state)?;
+            writeln!(f, "  {ident} => {state}")?;
         }
         for (i, state) in self.states.iter().enumerate() {
-            writeln!(f, "State {}:", i)?;
+            writeln!(f, "State {i}:")?;
             writeln!(f, "  Actions:")?;
-            write!(indented(f).with_str("    "), "{}", state.action.display(db))?;
+            write!(indented(f).with_str("    "), "{}", state.action)?;
             writeln!(f, "  Goto:")?;
-            for (&nt, &state) in &state.goto {
-                writeln!(f, "    {} -> {}", nt.display(db), state)?;
+            for (nt, state) in &state.goto {
+                writeln!(f, "    {nt} -> {state}")?;
             }
         }
         Ok(())
@@ -69,15 +56,14 @@ pub struct State {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
-    Ambiguous(Arc<[(Terminal, Action)]>),
+    Ambiguous(Vec<(Terminal, Action)>),
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Arc<[Term]>),
+    Reduce(NonTerminal, Vec<Term>),
 }
 
-impl<Db: ParseTable + ?Sized> DbDisplay<Db> for Action {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
-        fn display<Db: ParseTable + ?Sized>(
-            db: &Db,
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn display(
             action: &Action,
             f: &mut fmt::Formatter<'_>,
             lookahead: &mut Vec<Terminal>,
@@ -85,43 +71,43 @@ impl<Db: ParseTable + ?Sized> DbDisplay<Db> for Action {
             match action {
                 Action::Ambiguous(ambiguities) => {
                     for (terminal, action) in &**ambiguities {
-                        lookahead.push(*terminal);
-                        display(db, action, f, lookahead)?;
+                        lookahead.push(terminal.clone());
+                        display(action, f, lookahead)?;
                         lookahead.pop();
                     }
                     Ok(())
                 }
                 Action::Shift(terminal, state) => {
                     for terminal in lookahead {
-                        write!(f, "{} ", terminal.display(db))?;
+                        write!(f, "{terminal} ")?;
                     }
-                    writeln!(f, ": {} -> {}", terminal.display(db), state)
+                    writeln!(f, ": {terminal} -> {state}")
                 }
                 Action::Reduce(non_terminal, production) => {
                     for terminal in lookahead {
-                        write!(f, "{} ", terminal.display(db))?;
+                        write!(f, "{terminal} ")?;
                     }
-                    write!(f, ": {} ->", non_terminal.display(db))?;
+                    write!(f, ": {non_terminal} ->")?;
                     for term in &**production {
-                        write!(f, " {}", term.display(db))?;
+                        write!(f, " {term}")?;
                     }
                     writeln!(f)
                 }
             }
         }
-        display(db, self, f, &mut Vec::new())
+        display(self, f, &mut Vec::new())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Item {
     pub non_terminal: NonTerminal,
-    pub production: Arc<[Term]>,
+    pub production: Vec<Term>,
     pub index: usize,
 }
 
 impl Item {
-    fn new(non_terminal: NonTerminal, production: Arc<[Term]>) -> Self {
+    fn new(non_terminal: NonTerminal, production: Vec<Term>) -> Self {
         Self {
             non_terminal,
             production,
@@ -130,7 +116,7 @@ impl Item {
     }
 
     fn next(&self) -> Option<Term> {
-        self.production.get(self.index).copied()
+        self.production.get(self.index).cloned()
     }
 }
 
@@ -155,20 +141,22 @@ impl fmt::Display for ItemIndex {
     }
 }
 
-pub fn first_set(db: &dyn ParseTable, non_terminal: NonTerminal) -> (bool, OrdSet<Terminal>) {
-    db.production(non_terminal)
-        .into_iter()
-        .map(|terms| terms.get(0).copied())
+pub fn first_set(grammar: &Grammar, non_terminal: &NonTerminal) -> (bool, HashSet<Terminal>) {
+    grammar.productions[non_terminal]
+        .0
+        .iter()
+        .map(|terms| terms.get(0))
         .fold(
-            (false, OrdSet::new()),
+            (false, HashSet::new()),
             |(contains_null, mut set), term| match term {
                 Some(Term::Terminal(terminal)) => {
-                    set.insert(terminal);
+                    set.insert(terminal.clone());
                     (contains_null, set)
                 }
                 Some(Term::NonTerminal(nt)) if nt != non_terminal => {
-                    let other = db.first_set(nt);
-                    (contains_null | other.0, set.union(other.1))
+                    let other = first_set(grammar, nt);
+                    set.extend(other.1);
+                    (contains_null | other.0, set)
                 }
                 Some(Term::NonTerminal(_)) => (contains_null, set),
                 None => (true, set),
@@ -182,33 +170,15 @@ pub struct Lr0ParseTable {
     pub states: Vec<Lr0State>,
 }
 
-impl<Db: ParseTable + ?Sized> DbDisplay<Db> for Lr0ParseTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+impl fmt::Display for Lr0ParseTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Start states:")?;
         for (ident, state) in &self.start_states {
-            writeln!(f, "  {} => {}", ident.display(db), state)?;
+            writeln!(f, "  {ident} => {state}")?;
         }
         for (i, state) in self.states.iter().enumerate() {
-            writeln!(f, "State {}:", i)?;
-            writeln!(f, "  Items:")?;
-            for (item, _backlinks) in &state.item_set {
-                write!(f, "    {} ->", item.non_terminal.display(db))?;
-                for term in &item.production[..item.index] {
-                    write!(f, " {}", term.display(db))?;
-                }
-                print!(" .");
-                for term in &item.production[item.index..] {
-                    write!(f, " {}", term.display(db))?;
-                }
-                writeln!(f)?;
-            }
-            writeln!(f, "  Actions:")?;
-            for (&t, &state) in &state.actions {
-                writeln!(f, "    {} -> {}", t.display(db), state)?;
-            }
-            for (&nt, &state) in &state.goto {
-                writeln!(f, "    {} -> {}", nt.display(db), state)?;
-            }
+            writeln!(f, "State {i}:")?;
+            writeln!(indented(f).with_str("  "), "{state}")?;
         }
         Ok(())
     }
@@ -237,36 +207,57 @@ pub struct Lr0State {
     pub goto: HashMap<NonTerminal, Lr0StateId>,
 }
 
-intern_key!(ItemSet);
+impl fmt::Display for Lr0State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Items:")?;
+        for (item, _backlinks) in &self.item_set {
+            write!(f, "    {} ->", item.non_terminal)?;
+            for term in &item.production[..item.index] {
+                write!(f, " {term}")?;
+            }
+            write!(f, " .")?;
+            for term in &item.production[item.index..] {
+                write!(f, " {term}")?;
+            }
+            writeln!(f)?;
+        }
+        writeln!(f, "Actions:")?;
+        for (t, state) in &self.actions {
+            writeln!(f, "  {t} -> {state}")?;
+        }
+        for (nt, state) in &self.goto {
+            writeln!(f, "  {nt} -> {state}")?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ItemSetData {
+pub struct ItemSet {
     items: Vec<(Item, BTreeSet<ItemIndex>)>,
 }
 
-pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
+pub fn lr0_parse_table(grammar: &Grammar) -> Lr0ParseTable {
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
-    let idents = db.idents();
-    let mut start_states = HashMap::with_capacity(idents.len());
-    for &ident in idents.iter() {
-        let non_terminal = match db.term(ident) {
-            Term::Terminal(_) => continue,
-            Term::NonTerminal(nt) => nt,
+    let mut start_states = HashMap::new();
+    for (goal, production) in &grammar.productions {
+        let ident = match goal {
+            NonTerminal::Goal { ident } => ident.clone(),
+            _ => continue,
         };
-        let goal = db.intern_non_terminal(NonTerminalData::Goal { non_terminal });
 
         let mut root_item_set = BTreeSet::new();
-        for production in db.production(goal) {
+        for production in &production.0 {
             // There should only be one but doesn't hurt to add them "all"
             root_item_set.insert(Item {
-                non_terminal: goal,
-                production,
+                non_terminal: goal.clone(),
+                production: production.clone(),
                 index: 0,
             });
         }
-        let new_state = add_state(db, &mut states, &root_item_set);
+        let new_state = add_state(grammar, &mut states, &root_item_set);
         start_states.insert(ident, new_state);
     }
 
@@ -284,12 +275,12 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
         for term in terms {
             let mut new_state: HashMap<_, HashSet<_>> = HashMap::new();
             for (id, (item, _)) in states[state_id].item_set.iter().enumerate() {
-                if item.next() != Some(term) {
+                if item.next().as_ref() != Some(&term) {
                     continue;
                 }
                 new_state
                     .entry(Item {
-                        non_terminal: item.non_terminal,
+                        non_terminal: item.non_terminal.clone(),
                         production: item.production.clone(),
                         index: item.index + 1,
                     })
@@ -302,7 +293,7 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
             let new_item_set = new_state.keys().cloned().collect();
             let next_state_id = *state_lookup
                 .entry(new_item_set)
-                .or_insert_with_key(|new_item_set| add_state(db, &mut states, new_item_set));
+                .or_insert_with_key(|new_item_set| add_state(grammar, &mut states, new_item_set));
             let next_state = &mut states[next_state_id.0];
             for (item, back_refs) in &mut next_state.item_set {
                 if let Some(new_back_refs) = new_state.get(item) {
@@ -328,14 +319,10 @@ pub fn lr0_parse_table(db: &dyn ParseTable) -> Lr0ParseTable {
     }
 }
 
-fn add_state(
-    db: &dyn ParseTable,
-    states: &mut Vec<Lr0State>,
-    state: &BTreeSet<Item>,
-) -> Lr0StateId {
+fn add_state(grammar: &Grammar, states: &mut Vec<Lr0State>, state: &BTreeSet<Item>) -> Lr0StateId {
     let new_id = Lr0StateId(states.len());
     states.push(Lr0State {
-        item_set: closure(db, state, new_id),
+        item_set: closure(grammar, state, new_id),
         actions: HashMap::new(),
         goto: HashMap::new(),
     });
@@ -343,7 +330,7 @@ fn add_state(
 }
 
 fn closure(
-    db: &dyn ParseTable,
+    grammar: &Grammar,
     state: &BTreeSet<Item>,
     state_id: Lr0StateId,
 ) -> Vec<(Item, BTreeSet<ItemIndex>)> {
@@ -366,13 +353,14 @@ fn closure(
         };
 
         let start = *added
-            .entry(non_terminal)
-            .or_insert_with_key(|&non_terminal| {
+            .entry(non_terminal.clone())
+            .or_insert_with_key(|non_terminal| {
                 let start = state.len();
                 state.extend(
-                    db.production(non_terminal)
-                        .into_iter()
-                        .map(|p| (Item::new(non_terminal, p), BTreeSet::new())),
+                    grammar.productions[non_terminal]
+                        .0
+                        .iter()
+                        .map(|p| (Item::new(non_terminal.clone(), p.clone()), BTreeSet::new())),
                 );
                 start
             });
@@ -389,32 +377,34 @@ fn closure(
     state
 }
 
-fn parse_table(db: &dyn ParseTable) -> LrkParseTable {
-    LrkParseTableBuilder::build(db)
+pub fn parse_table(grammar: &Grammar) -> LrkParseTable {
+    let lr0_parse_table = lr0_parse_table(grammar);
+    println!("{lr0_parse_table}");
+    LrkParseTableBuilder {
+        grammar,
+        lr0_parse_table,
+    }
+    .build()
 }
 
 struct LrkParseTableBuilder<'a> {
-    db: &'a dyn ParseTable,
+    grammar: &'a Grammar,
     lr0_parse_table: Lr0ParseTable,
 }
 
 impl<'a> LrkParseTableBuilder<'a> {
-    fn build(db: &'a dyn ParseTable) -> LrkParseTable {
+    fn build(mut self) -> LrkParseTable {
         let mut states = Vec::new();
-        let mut builder = Self {
-            db,
-            lr0_parse_table: db.lr0_parse_table(),
-        };
 
         let mut invalidated = Vec::new();
         let mut lr0_state_id = 0;
-        while lr0_state_id < builder.lr0_parse_table.states.len() {
-            let next_state = &builder.lr0_parse_table[Lr0StateId(lr0_state_id)];
+        while lr0_state_id < self.lr0_parse_table.states.len() {
+            let next_state = &self.lr0_parse_table[Lr0StateId(lr0_state_id)];
             let conflicts = conflicts(next_state, lr0_state_id);
             let goto = next_state
                 .goto
                 .iter()
-                .map(|(&nt, &id)| (nt, StateId(id.0)))
+                .map(|(nt, id)| (nt.clone(), StateId(id.0)))
                 .collect();
 
             let mut invalidate_state = |id: Lr0StateId| {
@@ -429,8 +419,9 @@ impl<'a> LrkParseTableBuilder<'a> {
             // it returns, so at worst it will convert the entire graph into a
             // tree and then exit.
             let action = loop {
+                debug!(state = %self.lr0_parse_table[Lr0StateId(lr0_state_id)], "Making top-level action");
                 let make_action =
-                    builder.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
+                    self.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
                 if let Some(action) = make_action {
                     break action;
                 }
@@ -439,12 +430,12 @@ impl<'a> LrkParseTableBuilder<'a> {
             lr0_state_id += 1
         }
         while let Some(lr0_state_id) = invalidated.pop() {
-            let next_state = &builder.lr0_parse_table[Lr0StateId(lr0_state_id)];
+            let next_state = &self.lr0_parse_table[Lr0StateId(lr0_state_id)];
             let conflicts = conflicts(next_state, lr0_state_id);
             let goto = next_state
                 .goto
                 .iter()
-                .map(|(&nt, &id)| (nt, StateId(id.0)))
+                .map(|(nt, id)| (nt.clone(), StateId(id.0)))
                 .collect();
 
             let mut invalidate_state = |id: Lr0StateId| {
@@ -459,8 +450,9 @@ impl<'a> LrkParseTableBuilder<'a> {
             // it returns, so at worst it will convert the entire graph into a
             // tree and then exit.
             let action = loop {
+                debug!(state = %self.lr0_parse_table[Lr0StateId(lr0_state_id)], "Making top-level action");
                 let make_action =
-                    builder.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
+                    self.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
                 if let Some(action) = make_action {
                     break action;
                 }
@@ -468,13 +460,13 @@ impl<'a> LrkParseTableBuilder<'a> {
             states[lr0_state_id] = State { action, goto };
         }
         LrkParseTable {
-            start_states: builder
+            start_states: self
                 .lr0_parse_table
                 .start_states
                 .into_iter()
                 .map(|(k, v)| (k, StateId(v.0)))
                 .collect(),
-            states: states.into(),
+            states,
         }
     }
 
@@ -511,12 +503,21 @@ impl<'a> LrkParseTableBuilder<'a> {
                 mut term_string,
             }) = ambiguities.pop()
             {
-                trace!(%location, ?history, ?term_string, "Investigating ambiguity");
+                trace!(%location, ?history, %term_string, "Investigating ambiguity");
                 if let Some(term) = term_string.terms.get(term_string.next_term).cloned() {
                     Arc::make_mut(&mut term_string).next_term += 1;
                     match term {
                         NormalTerm::Terminal(terminal) => {
-                            trace!(terminal = %terminal.display(self.db), "Found terminal");
+                            trace!(%terminal, "Found terminal");
+                            let mut history = history.clone();
+                            history.push((
+                                location,
+                                TermString {
+                                    terms: term_string.terms.clone(),
+                                    next_term: term_string.next_term,
+                                    parent: None,
+                                },
+                            ));
                             next.entry(terminal)
                                 .or_default()
                                 .entry(action.clone())
@@ -524,34 +525,24 @@ impl<'a> LrkParseTableBuilder<'a> {
                                 .push(Ambiguity {
                                     location,
                                     transition,
-                                    history: history.clone(),
+                                    history,
                                     term_string,
                                 });
                         }
                         NormalTerm::NonTerminal(non_terminal) => {
-                            trace!(non_terminal = %non_terminal.display(self.db), "Walking down into non-terminal");
+                            trace!(%non_terminal, "Walking down into non-terminal");
                             ambiguities.extend(
-                                self.db
-                                    .normal_production(non_terminal)
+                                normal_production(self.grammar, &non_terminal)
                                     .into_iter()
-                                    .map(|terms| {
-                                        // This ambiguity already contains a loop or the new nonterminal has been seen before.
-                                        let contains_loop = term_string.contains_loop
-                                            || term_string
-                                                .self_and_parents()
-                                                .any(|p| p.non_terminal == Some(non_terminal));
-                                        Ambiguity {
-                                            location,
-                                            transition,
-                                            history: history.clone(),
-                                            term_string: Arc::new(TermString {
-                                                non_terminal: Some(non_terminal),
-                                                terms,
-                                                next_term: 0,
-                                                parent: Some(term_string.clone()),
-                                                contains_loop,
-                                            }),
-                                        }
+                                    .map(|terms| Ambiguity {
+                                        location,
+                                        transition: transition.clone(),
+                                        history: history.clone(),
+                                        term_string: Arc::new(TermString {
+                                            terms,
+                                            next_term: 0,
+                                            parent: Some(term_string.clone()),
+                                        }),
                                     }),
                             )
                         }
@@ -568,7 +559,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                     continue;
                 }
                 // term_string is empty, so we must now walk the parse table.
-                let mut lane_heads = HashMap::new();
+                let mut lane_heads = HashSet::new();
                 potential_ambiguity |= self.item_lane_heads(
                     action.clone(),
                     location,
@@ -577,31 +568,24 @@ impl<'a> LrkParseTableBuilder<'a> {
                     &mut lane_members,
                     &mut lane_heads,
                 );
-                ambiguities.extend(lane_heads.into_iter().map(
-                    |((location, transition), successors)| {
-                        trace!(%location, "Walking parse table");
-                        let item = &self.lr0_parse_table[location].0;
-                        let mut history = history.clone();
-                        history.extend(successors);
-                        Ambiguity {
-                            location,
-                            transition,
-                            history,
-                            term_string: Arc::new(TermString {
-                                non_terminal: None,
-                                terms: item
-                                    .production
-                                    .iter()
-                                    .map(|&term| term.into())
-                                    .collect::<Vec<_>>()
-                                    .into(),
-                                next_term: item.index + 1,
-                                parent: None,
-                                contains_loop: false,
-                            }),
-                        }
-                    },
-                ));
+                ambiguities.extend(lane_heads.into_iter().map(|(location, transition)| {
+                    trace!(%location, "Walking parse table");
+                    let item = &self.lr0_parse_table[location].0;
+                    Ambiguity {
+                        location,
+                        transition,
+                        history: history.clone(),
+                        term_string: Arc::new(TermString {
+                            terms: item
+                                .production
+                                .iter()
+                                .map(|term| term.clone().into())
+                                .collect::<Vec<_>>(),
+                            next_term: item.index + 1,
+                            parent: None,
+                        }),
+                    }
+                }));
             }
             visited.extend(lane_members.into_keys().map(|idx| idx.state));
         }
@@ -750,23 +734,46 @@ impl<'a> LrkParseTableBuilder<'a> {
         // of lookahead by increasing the number of states.
 
         if splitting_occurred {
-            println!("{}", self.lr0_parse_table.display(self.db));
-            None
-        } else {
-            if potential_ambiguity {
-                panic!("Ambiguity!");
-            }
-            Some(Action::Ambiguous(
-                next.into_iter()
-                    .map(|(terminal, conflicts)| {
-                        Some((
-                            terminal,
-                            self.make_action(visited.clone(), conflicts, invalidate_state)?,
-                        ))
-                    })
-                    .collect::<Option<_>>()?,
-            ))
+            println!("{}", self.lr0_parse_table);
+            return None;
         }
+
+        if potential_ambiguity {
+            panic!("Ambiguity!");
+        }
+
+        Some(Action::Ambiguous(
+            next.into_iter()
+                .map(|(terminal, conflicts)| {
+                    let loops = conflicts
+                        .values()
+                        .map(|v| {
+                            v.iter()
+                                .flat_map(|ambiguity| {
+                                    let mut history = ambiguity.history.iter().rev();
+                                    let first = history.next().unwrap();
+                                    history
+                                        .enumerate()
+                                        .filter(move |&(_, entry)| entry == first)
+                                        .map(|(i, _)| i)
+                                })
+                                .collect::<HashSet<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let contains_common_loops = loops
+                        .iter()
+                        .enumerate()
+                        .any(|(i, set1)| loops[i + 1..].iter().any(|set2| !set1.is_disjoint(set2)));
+                    if contains_common_loops {
+                        panic!("Ambiguity!");
+                    }
+                    Some((
+                        terminal,
+                        self.make_action(visited.clone(), conflicts, invalidate_state)?,
+                    ))
+                })
+                .collect::<Option<_>>()?,
+        ))
     }
 
     fn item_lane_heads(
@@ -776,12 +783,12 @@ impl<'a> LrkParseTableBuilder<'a> {
         transition: Option<Term>,
         split_info: &mut HashMap<Lr0StateId, HashMap<Term, HashMap<NonTerminal, ConflictedAction>>>,
         visited: &mut HashMap<ItemIndex, u32>,
-        output: &mut HashMap<(ItemIndex, Option<Term>), HashSet<ItemIndex>>,
+        output: &mut HashSet<(ItemIndex, Option<Term>)>,
     ) -> bool {
         trace!(
-            action = %action.display(self.db),
+            %action,
             %location,
-            transition = %transition.display(self.db),
+            ?transition,
             "Computing lane heads"
         );
         let (item, back_refs) = &self.lr0_parse_table[location];
@@ -793,13 +800,13 @@ impl<'a> LrkParseTableBuilder<'a> {
         }
 
         let mut ret = false;
-        if let Some(next_state) = transition {
+        if let Some(next_state) = &transition {
             let existing_action = split_info
                 .entry(location.state)
                 .or_default()
-                .entry(next_state)
+                .entry(next_state.clone())
                 .or_default()
-                .entry(item.non_terminal);
+                .entry(item.non_terminal.clone());
             match existing_action {
                 Entry::Occupied(entry) => {
                     if *entry.get() != action {
@@ -816,7 +823,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         if item.index != 0 {
             for item_index in back_refs.clone() {
                 let transition = if item_index.state == location.state {
-                    transition
+                    transition.clone()
                 } else {
                     self.lr0_parse_table[item_index].0.next()
                 };
@@ -832,15 +839,12 @@ impl<'a> LrkParseTableBuilder<'a> {
         } else {
             for &back_ref in back_refs {
                 let transition = if back_ref.state == location.state {
-                    transition
+                    transition.clone()
                 } else {
                     self.lr0_parse_table[back_ref].0.next()
                 };
                 *visited.entry(back_ref).or_default() += 1;
-                output
-                    .entry((back_ref, transition))
-                    .or_default()
-                    .extend(visited.iter().filter(|(_, &v)| v > 0).map(|(&k, _)| k));
+                output.insert((back_ref, transition));
             }
         }
         ret
@@ -859,33 +863,32 @@ fn conflicts(
             let conflict = match item.next() {
                 Some(Term::NonTerminal(_)) => return None,
                 Some(Term::Terminal(terminal)) => {
-                    ConflictedAction::Shift(terminal, StateId(next_state.actions[&terminal].0))
+                    let next_state = StateId(next_state.actions[&terminal].0);
+                    ConflictedAction::Shift(terminal, next_state)
                 }
-                None => ConflictedAction::Reduce(item.non_terminal, item.production.clone()),
+                None => {
+                    ConflictedAction::Reduce(item.non_terminal.clone(), item.production.clone())
+                }
             };
             let location = ItemIndex {
                 state: Lr0StateId(lr0_state_id),
                 item: item_idx,
             };
-            let mut history = HashSet::new();
-            history.insert(location);
             Some((
                 conflict,
                 vec![Ambiguity {
                     location,
                     transition: None,
-                    history,
+                    history: vec![],
                     term_string: Arc::new(TermString {
-                        non_terminal: None,
                         terms: item
                             .production
                             .iter()
-                            .copied()
+                            .cloned()
                             .map(NormalTerm::from)
                             .collect(),
                         next_term: item.index,
                         parent: None,
-                        contains_loop: false,
                     }),
                 }],
             ))
@@ -897,21 +900,21 @@ fn conflicts(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Arc<[Term]>),
+    Reduce(NonTerminal, Vec<Term>),
 }
 
-impl<Db: ParseTable + ?Sized> DbDisplay<Db> for ConflictedAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+impl fmt::Display for ConflictedAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConflictedAction::Shift(terminal, id) => {
-                writeln!(f, "Shift({}) -> {}", terminal.display(db), id)?;
+                write!(f, "Shift({terminal}) -> {id}")?;
             }
             ConflictedAction::Reduce(nt, ref terms) => {
-                write!(f, "Reduce({} ->", nt.display(db))?;
+                write!(f, "Reduce({nt} ->")?;
                 for term in &**terms {
-                    write!(f, " {}", term.display(db))?;
+                    write!(f, " {term}")?;
                 }
-                writeln!(f, ")")?;
+                write!(f, ")")?;
             }
         }
         Ok(())
@@ -933,57 +936,68 @@ impl From<ConflictedAction> for Action {
 struct Ambiguity {
     location: ItemIndex,
     transition: Option<Term>,
-    history: HashSet<ItemIndex>,
+    history: Vec<(ItemIndex, TermString)>,
     term_string: Arc<TermString>,
 }
 
-#[derive(Debug, Clone)]
-struct TermString {
-    // Can be none at first as shifts may start halfway through the production
-    non_terminal: Option<NormalNonTerminal>,
-    terms: Arc<[NormalTerm]>,
-    next_term: usize,
-    parent: Option<Arc<TermString>>,
-    contains_loop: bool,
-}
-
-impl TermString {
-    fn self_and_parents(&self) -> impl Iterator<Item = &TermString> {
-        std::iter::successors(Some(self), |s| s.parent.as_deref())
+impl fmt::Display for Ambiguity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Ambiguity @ {} ({})", self.location, self.term_string)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TermString {
+    terms: Vec<NormalTerm>,
+    next_term: usize,
+    parent: Option<Arc<TermString>>,
+}
+
+impl fmt::Display for TermString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn display(
+            this: &TermString,
+            f: &mut fmt::Formatter<'_>,
+            child: &mut dyn FnMut(&mut fmt::Formatter) -> fmt::Result,
+        ) -> fmt::Result {
+            let mut fmt_this = move |f: &mut fmt::Formatter<'_>| {
+                for (i, term) in this.terms[..this.next_term].iter().enumerate() {
+                    if i != 0 {
+                        f.write_char(' ')?;
+                    }
+                    write!(f, "{term}")?;
+                }
+                f.write_char('(')?;
+                child(f)?;
+                f.write_char(')')?;
+                for term in &this.terms[this.next_term..] {
+                    write!(f, " {term}")?;
+                }
+                Ok(())
+            };
+            if let Some(parent) = &this.parent {
+                display(parent, f, &mut fmt_this)
+            } else {
+                fmt_this(f)
+            }
+        }
+        display(self, f, &mut |_| Ok(()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalNonTerminal {
     Original(NonTerminal),
     Minus(NonTerminal, Term),
 }
 
-impl<Db: ParseTable + ?Sized> DbDisplay<Db> for NormalNonTerminal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
+impl fmt::Display for NormalNonTerminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (NormalNonTerminal::Original(non_terminal) | NormalNonTerminal::Minus(non_terminal, _)) =
             self;
-        match db.lookup_intern_non_terminal(*non_terminal) {
-            NonTerminalData::Goal { non_terminal } => {
-                write!(f, "Goal({})", non_terminal.display(db))?;
-            }
-            NonTerminalData::Named { name, scope } => {
-                write!(f, "{}#{}{{", db.lookup_intern_ident(name.ident), name.index)?;
-                for (key, lower::Name { ident, index }) in scope.ident_map {
-                    write!(
-                        f,
-                        "{}: {}#{}, ",
-                        db.lookup_intern_ident(key),
-                        db.lookup_intern_ident(ident),
-                        index
-                    )?;
-                }
-                write!(f, "}}")?;
-            }
-            NonTerminalData::Anonymous { .. } => write!(f, "#{}", non_terminal.0)?,
-        }
+        write!(f, "{non_terminal}")?;
         if let NormalNonTerminal::Minus(_, minus) = self {
-            write!(f, "-{}", minus.display(db))?;
+            write!(f, "-{minus}")?;
         }
         Ok(())
     }
@@ -996,8 +1010,8 @@ impl From<NonTerminal> for NormalNonTerminal {
 }
 
 impl NormalNonTerminal {
-    fn base(&self) -> NonTerminal {
-        match *self {
+    fn base(&self) -> &NonTerminal {
+        match self {
             NormalNonTerminal::Original(nt) => nt,
             NormalNonTerminal::Minus(nt, _) => nt,
         }
@@ -1010,6 +1024,15 @@ pub enum NormalTerm {
     NonTerminal(NormalNonTerminal),
 }
 
+impl fmt::Display for NormalTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NormalTerm::Terminal(terminal) => write!(f, "{terminal}"),
+            NormalTerm::NonTerminal(non_terminal) => write!(f, "{non_terminal}"),
+        }
+    }
+}
+
 impl From<Term> for NormalTerm {
     fn from(t: Term) -> Self {
         match t {
@@ -1020,78 +1043,77 @@ impl From<Term> for NormalTerm {
 }
 
 fn normal_production(
-    db: &dyn ParseTable,
-    non_terminal: NormalNonTerminal,
-) -> OrdSet<Arc<[NormalTerm]>> {
-    let original_production = db.production(non_terminal.base());
+    grammar: &Grammar,
+    non_terminal: &NormalNonTerminal,
+) -> HashSet<Vec<NormalTerm>> {
+    let original_production = &grammar.productions[non_terminal.base()];
     match non_terminal {
         NormalNonTerminal::Original(non_terminal) => {
-            if db.left_recursive(non_terminal) {
+            if left_recursive(grammar, non_terminal.clone()) {
                 // 1 - Moor00 5
-                proper_left_corners(db, non_terminal)
+                proper_left_corners(grammar, non_terminal)
                     .into_iter()
-                    .filter(|term| !matches!(term, Term::NonTerminal(nt) if db.left_recursive(*nt)))
-                    .map(|term| -> Arc<[_]> {
+                    .filter(|term| !matches!(term, Term::NonTerminal(nt) if left_recursive(grammar, nt.clone())))
+                    .map(|term| {
                         vec![
-                            term.into(),
-                            NormalTerm::NonTerminal(NormalNonTerminal::Minus(non_terminal, term)),
+                            term.clone().into(),
+                            NormalTerm::NonTerminal(NormalNonTerminal::Minus(non_terminal.clone(), term)),
                         ]
-                        .into()
                     })
                     .collect()
             } else {
                 // 4 - Moor00 5
                 original_production
-                    .into_iter()
-                    .map(|rule| -> Arc<[_]> {
+                    .0
+                    .iter()
+                    .map(|rule| {
                         rule.iter()
-                            .map(|&term| term.into())
+                            .map(|term| term.clone().into())
                             .collect::<Vec<_>>()
-                            .into()
                     })
                     .collect()
             }
         }
         NormalNonTerminal::Minus(non_terminal, symbol) => {
-            assert!(db.left_recursive(non_terminal));
-            let mut rules = OrdSet::new();
+            assert!(left_recursive(grammar, non_terminal.clone()));
+            let mut rules = HashSet::new();
             // 3 - Moor00 5
             rules.extend(
-                db.production(non_terminal)
-                    .into_iter()
-                    .filter(|rule| rule.first() == Some(&symbol))
-                    .map(|rule| -> Arc<[_]> {
+                grammar.productions[non_terminal]
+                    .0
+                    .iter()
+                    .filter(|rule| rule.first() == Some(symbol))
+                    .map(|rule| {
                         rule.iter()
                             .skip(1)
-                            .map(|&term| term.into())
+                            .map(|term| term.clone().into())
                             .collect::<Vec<_>>()
-                            .into()
                     }),
             );
             // 2 - Moor00 5
             rules.extend(
-                proper_left_corners(db, non_terminal)
+                proper_left_corners(grammar, non_terminal)
                     .into_iter()
                     .filter_map(|term| match term {
-                        Term::NonTerminal(nt) if db.left_recursive(nt) => Some(nt),
+                        Term::NonTerminal(nt) if left_recursive(grammar, nt.clone()) => Some(nt),
                         _ => None,
                     })
                     .flat_map(|nt| {
-                        db.production(nt)
-                            .into_iter()
-                            .filter(move |rule| rule.first() == Some(&symbol))
-                            .map(move |rule| -> Arc<[_]> {
+                        grammar.productions[&nt]
+                            .0
+                            .iter()
+                            .filter(move |rule| rule.first() == Some(symbol))
+                            .map(move |rule| {
                                 rule.iter()
                                     .skip(1)
-                                    .map(|&term| term.into())
+                                    .map(|term| term.clone().into())
                                     .chain(std::iter::once(NormalTerm::NonTerminal(
                                         NormalNonTerminal::Minus(
-                                            non_terminal,
-                                            Term::NonTerminal(nt),
+                                            non_terminal.clone(),
+                                            Term::NonTerminal(nt.clone()),
                                         ),
                                     )))
                                     .collect::<Vec<_>>()
-                                    .into()
                             })
                     }),
             );
@@ -1100,18 +1122,19 @@ fn normal_production(
     }
 }
 
-fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSet<Term> {
+fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet<Term> {
     let mut left_corners = HashSet::new();
-    let mut todo = vec![non_terminal];
+    let mut todo = vec![non_terminal.clone()];
 
     while let Some(nt) = todo.pop() {
-        db.production(nt)
-            .into_iter()
-            .flat_map(|rule| rule.first().copied())
+        grammar.productions[&nt]
+            .0
+            .iter()
+            .flat_map(|rule| rule.first().cloned())
             .for_each(|term| {
-                let new_term = left_corners.insert(term);
+                let new_term = left_corners.insert(term.clone());
                 match term {
-                    Term::NonTerminal(next) if new_term && next != non_terminal => {
+                    Term::NonTerminal(next) if new_term && &next != non_terminal => {
                         todo.push(next);
                     }
                     _ => {}
@@ -1122,6 +1145,6 @@ fn proper_left_corners(db: &dyn ParseTable, non_terminal: NonTerminal) -> HashSe
     left_corners
 }
 
-fn left_recursive(db: &dyn ParseTable, non_terminal: NonTerminal) -> bool {
-    proper_left_corners(db, non_terminal).contains(&Term::NonTerminal(non_terminal))
+fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
+    proper_left_corners(grammar, &non_terminal).contains(&Term::NonTerminal(non_terminal))
 }

@@ -1,32 +1,29 @@
-use std::fmt;
+use std::{collections::HashSet, sync::Arc};
 
-pub trait DbDisplay<Db: ?Sized> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result;
-    fn display<'a>(&'a self, db: &'a Db) -> DbDisplayWrapper<'a, Self, Db> {
-        DbDisplayWrapper(self, db)
-    }
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+#[derive(Debug)]
+pub struct Interner {
+    data: Lazy<Mutex<HashSet<Arc<str>>>>,
 }
 
-impl<Db: ?Sized, T: DbDisplay<Db>> DbDisplay<Db> for Option<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &Db) -> fmt::Result {
-        match self {
-            Some(item) => {
-                write!(f, "Some({})", item.display(db))
-            }
-            None => f.write_str("None"),
+impl Interner {
+    pub const fn new() -> Self {
+        Self {
+            data: Lazy::new(Mutex::default),
         }
     }
-}
 
-#[derive(Clone, Copy)]
-pub struct DbDisplayWrapper<'a, T: ?Sized, Db: ?Sized>(&'a T, &'a Db);
-
-impl<'a, T, Db> fmt::Display for DbDisplayWrapper<'a, T, Db>
-where
-    T: DbDisplay<Db>,
-    Db: ?Sized,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f, self.1)
+    pub fn intern(&self, value: &str) -> Arc<str> {
+        let mut data = self.data.lock();
+        match data.get(value) {
+            Some(value) => value.clone(),
+            None => {
+                let value: Arc<str> = value.into();
+                data.insert(value.clone());
+                value
+            }
+        }
     }
 }

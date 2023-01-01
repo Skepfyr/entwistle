@@ -1,49 +1,50 @@
-use im::OrdMap;
+use std::collections::HashMap;
+
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until},
     character::complete::{alphanumeric1, char, space0, space1},
     combinator::{eof, map, opt, recognize, success, value},
-    error::{Error, ErrorKind},
     multi::{count, fold_many0, many0, many1, many1_count, many_m_n, separated_list0},
     sequence::{delimited, preceded, terminated, tuple},
 };
-use regex::Regex;
+
+use crate::util::Interner;
 
 use super::{
-    Expression, Grammar, Ident, Language, Mark, ParseTree, Production, Quantifier, Rule, Term, Test,
+    Definition, Expression, Ident, Item, Language, Mark, ParseTree, Quantifier, Rule, Test,
 };
 
 type Result<'a, T> = nom::IResult<&'a str, T>;
 
-pub(super) fn parse_grammar(db: &dyn Language) -> Grammar {
-    let input = match db.file(db.main()) {
-        Ok(input) => input,
-        Err(_) => return Grammar::default(),
-    };
-    let mut parser = file(db);
-    match parser(&input) {
+pub(super) fn parse_grammar(input: &str) -> Language {
+    let mut parser = file();
+    match parser(input) {
         Ok(("", grammar)) => grammar,
-        _ => Grammar::default(),
+        _ => Language::default(),
     }
 }
 
-fn file<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Grammar> + 'a {
+fn file<'a>() -> impl FnMut(&'a str) -> Result<'a, Language> + 'a {
     enum RuleOrTest {
-        Rule(Rule),
+        Rule(Definition),
         Test(Test),
     }
     let file = terminated(
         fold_many0(
             alt((
-                map(rule(db), RuleOrTest::Rule),
-                map(test(db), RuleOrTest::Test),
+                map(definition(), RuleOrTest::Rule),
+                map(test(), RuleOrTest::Test),
             )),
-            || (OrdMap::<_, Vec<_>>::new(), OrdMap::<_, Vec<_>>::new()),
+            || (HashMap::<_, Vec<_>>::new(), HashMap::<_, Vec<_>>::new()),
             |(mut rules, mut tests), rule_or_test| {
                 match rule_or_test {
-                    RuleOrTest::Rule(rule) => rules.entry(rule.ident).or_default().push(rule),
-                    RuleOrTest::Test(test) => tests.entry(test.ident).or_default().push(test),
+                    RuleOrTest::Rule(rule) => {
+                        rules.entry(rule.ident.clone()).or_default().push(rule)
+                    }
+                    RuleOrTest::Test(test) => {
+                        tests.entry(test.ident.clone()).or_default().push(test)
+                    }
                 }
                 (rules, tests)
             },
@@ -54,63 +55,59 @@ fn file<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Grammar> 
     map(file, |(rules, tests)| {
         let rules = rules.into_iter().collect();
         let tests = tests.into_iter().collect();
-        Grammar { rules, tests }
+        Language {
+            definitions: rules,
+            tests,
+        }
     })
 }
 
-fn rule<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Rule> + 'a {
+fn definition<'a>() -> impl FnMut(&'a str) -> Result<'a, Definition> + 'a {
     map(
         tuple((
             ws(silent),
-            ws(atomic),
-            terminated(ws(ident(db)), tuple((ws(char(':')), opt(empty_lines)))),
-            many0(terminated(ws(production(db)), empty_lines)),
+            terminated(ws(ident()), tuple((ws(char(':')), opt(empty_lines)))),
+            many0(terminated(ws(rule()), empty_lines)),
         )),
-        |(silent, atomic, ident, productions)| Rule {
+        |(silent, ident, productions)| Definition {
             ident,
             silent,
-            atomic,
-            productions,
+            rules: productions,
         },
     )
 }
 
-fn production<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Production> + 'a {
+fn rule<'a>() -> impl FnMut(&'a str) -> Result<'a, Rule> + 'a {
     map(
-        separated_list0(ws(char('|')), expression(db)),
-        |expressions| Production {
+        separated_list0(ws(char('|')), expression()),
+        |expressions| Rule {
             alternatives: expressions.into_iter().collect(),
         },
     )
 }
 
-fn expression<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Expression> + 'a {
-    map(many0(tuple((ws(term(db)), ws(quantifier)))), |sequence| {
+fn expression<'a>() -> impl FnMut(&'a str) -> Result<'a, Expression> + 'a {
+    map(many0(tuple((ws(term()), ws(quantifier)))), |sequence| {
         Expression { sequence }
     })
 }
 
-fn term<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Term> + 'a {
+fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
     alt((
-        map(tuple((mark, ident(db))), |(mark, ident)| Term::Ident {
+        map(tuple((mark, ident())), |(mark, ident)| Item::Ident {
             mark,
             ident,
         }),
-        map(quoted_string, Term::String),
-        map(regex, Term::Regex),
+        map(quoted_string, Item::String),
         map(
-            delimited(char('('), move |input| production(db)(input), char(')')),
-            Term::Group,
+            delimited(char('('), move |input| rule()(input), char(')')),
+            Item::Group,
         ),
     ))
 }
 
 fn silent(input: &str) -> Result<bool> {
     map(ws(opt(char('-'))), |opt| opt.is_some())(input)
-}
-
-fn atomic(input: &str) -> Result<bool> {
-    map(ws(opt(char('@'))), |opt| opt.is_some())(input)
 }
 
 fn mark(input: &str) -> Result<Mark> {
@@ -130,15 +127,15 @@ fn quantifier(input: &str) -> Result<Quantifier> {
     )))(input)
 }
 
-fn test<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
+fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
     move |input| {
         let (input, hashes) = preceded(space0, many1_count(char('#')))(input)?;
-        let (input, ident) = terminated(ws(ident(db)), nl)(input)?;
+        let (input, ident) = terminated(ws(ident()), nl)(input)?;
         let (input, test) = test_body(hashes)(input)?;
         let (input, _) = ws(count(char('#'), hashes))(input)?;
         let (input, _) = empty_lines(input)?;
         let (input, indent) = space0(input)?;
-        let (input, parse_tree) = parse_tree(db, indent)(input)?;
+        let (input, parse_tree) = parse_tree(indent)(input)?;
         let (input, _) = ws(count(char('#'), hashes))(input)?;
         let (input, _) = empty_lines(input)?;
         Ok((
@@ -166,17 +163,14 @@ fn test_body<'a>(hashes: usize) -> impl FnMut(&'a str) -> Result<&'a str> {
     )
 }
 
-fn parse_tree<'a>(
-    db: &'a dyn Language,
-    indent: &'a str,
-) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
-    alt((parse_tree_leaf(db), parse_tree_node(db, indent)))
+fn parse_tree<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
+    alt((parse_tree_leaf(), parse_tree_node(indent)))
 }
 
-fn parse_tree_leaf<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
+fn parse_tree_leaf<'a>() -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
     map(
         terminated(
-            tuple((opt(terminated(ident(db), ws(char(':')))), quoted_string)),
+            tuple((opt(terminated(ident(), ws(char(':')))), quoted_string)),
             empty_lines,
         ),
         |(ident, data)| ParseTree::Leaf {
@@ -186,16 +180,13 @@ fn parse_tree_leaf<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a
     )
 }
 
-fn parse_tree_node<'a>(
-    db: &'a dyn Language,
-    indent: &'a str,
-) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
+fn parse_tree_node<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
     let nodes = move |input| {
         let (input, new_indent) = recognize(tuple((tag(indent), space1)))(input)?;
-        let (input, node) = parse_tree(db, new_indent)(input)?;
+        let (input, node) = parse_tree(new_indent)(input)?;
         let nodes = vec![node];
         fold_many0(
-            preceded(tag(new_indent), parse_tree(db, new_indent)),
+            preceded(tag(new_indent), parse_tree(new_indent)),
             move || nodes.clone(),
             |mut nodes, node| {
                 nodes.push(node);
@@ -205,20 +196,18 @@ fn parse_tree_node<'a>(
     };
     map(
         tuple((
-            terminated(ws(ident(db)), tuple((char(':'), empty_lines))),
+            terminated(ws(ident()), tuple((char(':'), empty_lines))),
             nodes,
         )),
-        |(ident, nodes)| ParseTree::Node {
-            ident,
-            nodes: nodes.into(),
-        },
+        |(ident, nodes)| ParseTree::Node { ident, nodes },
     )
 }
 
-fn ident<'a>(db: &'a dyn Language) -> impl FnMut(&'a str) -> Result<'a, Ident> + 'a {
+fn ident<'a>() -> impl FnMut(&'a str) -> Result<'a, Ident> + 'a {
+    static IDENT_INTERNER: Interner = Interner::new();
     map(
         recognize(many1(alt((alphanumeric1, tag("_"))))),
-        move |ident: &str| db.intern_ident(ident.to_owned()),
+        move |ident: &str| Ident(IDENT_INTERNER.intern(ident)),
     )
 }
 
@@ -234,21 +223,6 @@ fn quoted_string(input: &str) -> Result<String> {
         )
     };
     alt((string("'"), string("\"")))(input)
-}
-
-fn regex(first_input: &str) -> Result<Regex> {
-    let (input, delimiter) = recognize(many1(char('/')))(first_input)?;
-    let (input, regex) = recognize(take_until(delimiter))(input)?;
-    let (input, _) = tag(delimiter)(input)?;
-    Ok((
-        input,
-        Regex::new(regex).map_err(|_| {
-            nom::Err::Error(Error {
-                input: first_input,
-                code: ErrorKind::MapRes,
-            })
-        })?,
-    ))
 }
 
 fn ws<'a, F, O>(f: F) -> impl FnMut(&'a str) -> Result<'a, O>

@@ -24,8 +24,9 @@ Statement:
     Variable: "b"
 ##
 
-@Number: /[0-9][0-9_]*(\.[0-9_]+)?/
-@Variable: /\w+/
+Number: Digit (Digit | '_')* ('.' Digit+)?
+Digit: '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+Variable: ('a' | 'b')+
 
--@_: /\s*/
--@nl: '\n' | '\r\n'
+-_: ' '
+-nl: '\n'
