@@ -9,12 +9,10 @@ Statement:
 a = b
 ##
 Statement:
-  Variable:
-    "a"
+  Variable: "a"
   "="
   Expression:
-    Variable:
-      "b"
+    Variable: "b"
 ##
 
 Expression:
@@ -27,18 +25,38 @@ Expression:
   Variable
 
 ## Expression
-1.5 + 2.3 * 1.7 + -0.2
+1 + 2 * 3 + -4.0
 ##
 Expression:
-  "a"
+  Expression:
+    Expression:
+      Number: "1"
+    "+"
+    Expression:
+      Expression:
+        Number: "2"
+      "*"
+      Expression:
+        Number: "3"
+  "+"
+  Expression:
+    "-"
+    Expression:
+      Number: "4.0"
 ##
 
-Number: Digit (Digit | '_')* ('.' Digit+)?
+@Number: Digit (Digit | '_')* ('.' Digit+)?
 Digit: '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
-Variable: Letter (Letter | Digit | '_')*
+@Variable: Letter (Letter | Digit | '_')*
 Letter: LowerLetter | UpperLetter
 LowerLetter: 'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'h' | 'i' | 'j' | 'k' | 'l' | 'm' | 'n' | 'o' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'w' | 'x' | 'y' | 'z'
 UpperLetter: 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'P' | 'Q' | 'R' | 'S' | 'T' | 'U' | 'V' | 'W' | 'X' | 'Y' | 'Z'
 
--_: ' '?
--nl: '\n'
+## Number
+3.14159265
+##
+Number: "3.14159265"
+##
+
+-@_: ' '?
+-@nl: '\n'

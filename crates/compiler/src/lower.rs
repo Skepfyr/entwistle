@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
+    fmt::{self, Write as _},
     hash::Hash,
 };
 
@@ -47,8 +47,16 @@ pub fn lower(language: &Language) -> Grammar {
             },
             Production(
                 [vec![
-                    Term::NonTerminal(non_terminal.clone()),
-                    Term::Terminal(Terminal::EndOfInput(ident.clone())),
+                    Term {
+                        kind: TermKind::NonTerminal(non_terminal.clone()),
+                        silent: definition.silent,
+                        atomic: definition.atomic,
+                    },
+                    Term {
+                        kind: TermKind::Terminal(Terminal::EndOfInput(ident.clone())),
+                        silent: true,
+                        atomic: true,
+                    },
                 ]]
                 .into_iter()
                 .collect(),
@@ -59,16 +67,19 @@ pub fn lower(language: &Language) -> Grammar {
                 ident: ident.clone(),
                 index,
             };
-            let mut production = lower_rule(&mut productions, &mut next_anon, rule, &name);
+            let mut production =
+                lower_rule(language, &mut productions, &mut next_anon, rule, &name);
             if name.index < definition.rules.len() - 1 {
-                production
-                    .0
-                    .insert(vec![Term::NonTerminal(NonTerminal::Named {
+                production.0.insert(vec![Term {
+                    kind: TermKind::NonTerminal(NonTerminal::Named {
                         name: Name {
                             ident: ident.clone(),
                             index: index + 1,
                         },
-                    })]);
+                    }),
+                    silent: true,
+                    atomic: false,
+                }]);
             }
             productions.insert(NonTerminal::Named { name }, production);
         }
@@ -77,6 +88,7 @@ pub fn lower(language: &Language) -> Grammar {
 }
 
 fn lower_rule(
+    language: &Language,
     productions: &mut HashMap<NonTerminal, Production>,
     next_anon: &mut impl FnMut() -> NonTerminal,
     rule: &Rule,
@@ -90,7 +102,14 @@ fn lower_rule(
                     .sequence
                     .iter()
                     .map(|(term, quantifier)| {
-                        lower_term(productions, next_anon, term, *quantifier, current_name)
+                        lower_term(
+                            language,
+                            productions,
+                            next_anon,
+                            term,
+                            *quantifier,
+                            current_name,
+                        )
                     })
                     .collect::<Vec<Term>>()
             })
@@ -99,6 +118,7 @@ fn lower_rule(
 }
 
 fn lower_term(
+    language: &Language,
     productions: &mut HashMap<NonTerminal, Production>,
     next_anon: &mut impl FnMut() -> NonTerminal,
     item: &Item,
@@ -107,7 +127,14 @@ fn lower_term(
 ) -> Term {
     if quantifier != Quantifier::Once {
         let non_terminal = next_anon();
-        let term = lower_term(productions, next_anon, item, Quantifier::Once, current_name);
+        let term = lower_term(
+            language,
+            productions,
+            next_anon,
+            item,
+            Quantifier::Once,
+            current_name,
+        );
         let mut production: HashSet<Vec<Term>> = HashSet::new();
         // Zero times
         if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
@@ -119,10 +146,21 @@ fn lower_term(
         }
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            production.insert(vec![term, Term::NonTerminal(non_terminal.clone())]);
+            production.insert(vec![
+                term,
+                Term {
+                    kind: TermKind::NonTerminal(non_terminal.clone()),
+                    silent: true,
+                    atomic: false,
+                },
+            ]);
         }
         productions.insert(non_terminal.clone(), Production(production));
-        return Term::NonTerminal(non_terminal);
+        return Term {
+            kind: TermKind::NonTerminal(non_terminal),
+            silent: true,
+            atomic: false,
+        };
     }
 
     match item {
@@ -142,14 +180,27 @@ fn lower_term(
                     index: 0,
                 }
             };
-            Term::NonTerminal(NonTerminal::Named { name })
+            let definition = &language.definitions[ident][0];
+            Term {
+                kind: TermKind::NonTerminal(NonTerminal::Named { name }),
+                silent: definition.silent,
+                atomic: definition.atomic,
+            }
         }
-        &Item::Char(data) => Term::Terminal(Terminal::Real(data)),
+        &Item::Char(data) => Term {
+            kind: TermKind::Terminal(Terminal::Real(data)),
+            silent: false,
+            atomic: true,
+        },
         Item::Group(rule) => {
             let non_terminal = next_anon();
-            let production = lower_rule(productions, next_anon, rule, current_name);
+            let production = lower_rule(language, productions, next_anon, rule, current_name);
             productions.insert(non_terminal.clone(), production);
-            Term::NonTerminal(non_terminal)
+            Term {
+                kind: TermKind::NonTerminal(non_terminal),
+                silent: true,
+                atomic: false,
+            }
         }
     }
 }
@@ -220,16 +271,35 @@ impl fmt::Display for Production {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Term {
-    Terminal(Terminal),
-    NonTerminal(NonTerminal),
+pub struct Term {
+    pub kind: TermKind,
+    pub silent: bool,
+    pub atomic: bool,
 }
 
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.silent {
+            f.write_char('-')?;
+        }
+        if self.atomic {
+            f.write_char('@')?;
+        }
+        <TermKind as fmt::Display>::fmt(&self.kind, f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TermKind {
+    Terminal(Terminal),
+    NonTerminal(NonTerminal),
+}
+
+impl fmt::Display for TermKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Term::Terminal(terminal) => write!(f, "{terminal}"),
-            Term::NonTerminal(non_terminal) => write!(f, "{non_terminal}"),
+            TermKind::Terminal(terminal) => write!(f, "{terminal}"),
+            TermKind::NonTerminal(non_terminal) => write!(f, "{non_terminal}"),
         }
     }
 }

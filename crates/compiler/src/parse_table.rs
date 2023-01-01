@@ -11,7 +11,7 @@ use tracing::{debug, instrument, trace};
 
 use crate::{
     language::Ident,
-    lower::{Grammar, NonTerminal, Term, Terminal},
+    lower::{Grammar, NonTerminal, Term, TermKind, Terminal},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,17 +89,17 @@ impl fmt::Display for Action {
                     for terminal in lookahead {
                         write!(f, "{terminal} ")?;
                     }
-                    writeln!(f, ": {terminal} -> {state}")
+                    writeln!(f, ": Shift({terminal}) -> {state}")
                 }
                 Action::Reduce(non_terminal, production) => {
                     for terminal in lookahead {
                         write!(f, "{terminal} ")?;
                     }
-                    write!(f, ": {non_terminal} ->")?;
+                    write!(f, ": Reduce({non_terminal} ->")?;
                     for term in &**production {
                         write!(f, " {term}")?;
                     }
-                    writeln!(f)
+                    writeln!(f, ")")
                 }
             }
         }
@@ -157,16 +157,25 @@ pub fn first_set(grammar: &Grammar, non_terminal: &NonTerminal) -> (bool, HashSe
         .fold(
             (false, HashSet::new()),
             |(contains_null, mut set), term| match term {
-                Some(Term::Terminal(terminal)) => {
+                Some(Term {
+                    kind: TermKind::Terminal(terminal),
+                    ..
+                }) => {
                     set.insert(terminal.clone());
                     (contains_null, set)
                 }
-                Some(Term::NonTerminal(nt)) if nt != non_terminal => {
+                Some(Term {
+                    kind: TermKind::NonTerminal(nt),
+                    ..
+                }) if nt != non_terminal => {
                     let other = first_set(grammar, nt);
                     set.extend(other.1);
                     (contains_null | other.0, set)
                 }
-                Some(Term::NonTerminal(_)) => (contains_null, set),
+                Some(Term {
+                    kind: TermKind::NonTerminal(_),
+                    ..
+                }) => (contains_null, set),
                 None => (true, set),
             },
         )
@@ -308,11 +317,11 @@ pub fn lr0_parse_table(grammar: &Grammar) -> Lr0ParseTable {
                     back_refs.extend(new_back_refs.iter().copied());
                 }
             }
-            match term {
-                Term::NonTerminal(nt) => {
+            match term.kind {
+                TermKind::NonTerminal(nt) => {
                     states[state_id].goto.insert(nt, next_state_id);
                 }
-                Term::Terminal(t) => {
+                TermKind::Terminal(t) => {
                     states[state_id].actions.insert(t, next_state_id);
                 }
             }
@@ -356,7 +365,10 @@ fn closure(
         i += 1;
 
         let non_terminal = match item.next() {
-            Some(Term::NonTerminal(nt)) => nt,
+            Some(Term {
+                kind: TermKind::NonTerminal(nt),
+                ..
+            }) => nt,
             _ => continue,
         };
 
@@ -387,7 +399,7 @@ fn closure(
 
 pub fn parse_table(grammar: &Grammar) -> LrkParseTable {
     let lr0_parse_table = lr0_parse_table(grammar);
-    println!("{lr0_parse_table}");
+    debug!(%lr0_parse_table, "Generated LR(0) parse table");
     LrkParseTableBuilder {
         grammar,
         lr0_parse_table,
@@ -587,7 +599,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                             terms: item
                                 .production
                                 .iter()
-                                .map(|term| term.clone().into())
+                                .map(|term| term.kind.clone().into())
                                 .collect::<Vec<_>>(),
                             next_term: item.index + 1,
                             parent: None,
@@ -653,9 +665,9 @@ impl<'a> LrkParseTableBuilder<'a> {
             }
             for (mark, (terms, _)) in splits.iter().enumerate() {
                 for next in terms {
-                    let next_state = match next {
-                        Term::Terminal(t) => self.lr0_parse_table[state].actions[t],
-                        Term::NonTerminal(nt) => self.lr0_parse_table[state].goto[nt],
+                    let next_state = match &next.kind {
+                        TermKind::Terminal(t) => self.lr0_parse_table[state].actions[t],
+                        TermKind::NonTerminal(nt) => self.lr0_parse_table[state].goto[nt],
                     };
                     visit(
                         &self.lr0_parse_table,
@@ -806,6 +818,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         if *num_visits >= 2 {
             return false;
         }
+        *num_visits += 1;
 
         let mut ret = false;
         if let Some(next_state) = &transition {
@@ -827,7 +840,6 @@ impl<'a> LrkParseTableBuilder<'a> {
             }
         }
 
-        *num_visits += 1;
         if item.index != 0 {
             for item_index in back_refs.clone() {
                 let transition = if item_index.state == location.state {
@@ -851,7 +863,6 @@ impl<'a> LrkParseTableBuilder<'a> {
                 } else {
                     self.lr0_parse_table[back_ref].0.next()
                 };
-                *visited.entry(back_ref).or_default() += 1;
                 output.insert((back_ref, transition));
             }
         }
@@ -869,8 +880,14 @@ fn conflicts(
         .enumerate()
         .filter_map(|(item_idx, (item, _))| {
             let conflict = match item.next() {
-                Some(Term::NonTerminal(_)) => return None,
-                Some(Term::Terminal(terminal)) => {
+                Some(Term {
+                    kind: TermKind::NonTerminal(_),
+                    ..
+                }) => return None,
+                Some(Term {
+                    kind: TermKind::Terminal(terminal),
+                    ..
+                }) => {
                     let next_state = StateId(next_state.actions[&terminal].0);
                     ConflictedAction::Shift(terminal, next_state)
                 }
@@ -893,7 +910,7 @@ fn conflicts(
                             .production
                             .iter()
                             .cloned()
-                            .map(NormalTerm::from)
+                            .map(|term| term.kind.into())
                             .collect(),
                         next_term: item.index,
                         parent: None,
@@ -996,7 +1013,7 @@ impl fmt::Display for TermString {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalNonTerminal {
     Original(NonTerminal),
-    Minus(NonTerminal, Term),
+    Minus(NonTerminal, TermKind),
 }
 
 impl fmt::Display for NormalNonTerminal {
@@ -1041,11 +1058,11 @@ impl fmt::Display for NormalTerm {
     }
 }
 
-impl From<Term> for NormalTerm {
-    fn from(t: Term) -> Self {
+impl From<TermKind> for NormalTerm {
+    fn from(t: TermKind) -> Self {
         match t {
-            Term::Terminal(t) => Self::Terminal(t),
-            Term::NonTerminal(nt) => Self::NonTerminal(nt.into()),
+            TermKind::Terminal(t) => Self::Terminal(t),
+            TermKind::NonTerminal(nt) => Self::NonTerminal(nt.into()),
         }
     }
 }
@@ -1061,7 +1078,9 @@ fn normal_production(
                 // 1 - Moor00 5
                 proper_left_corners(grammar, non_terminal)
                     .into_iter()
-                    .filter(|term| !matches!(term, Term::NonTerminal(nt) if left_recursive(grammar, nt.clone())))
+                    .filter(|term| {
+                        !matches!(term, TermKind::NonTerminal(nt) if left_recursive(grammar, nt.clone()))
+                    })
                     .map(|term| {
                         vec![
                             term.clone().into(),
@@ -1076,7 +1095,7 @@ fn normal_production(
                     .iter()
                     .map(|rule| {
                         rule.iter()
-                            .map(|term| term.clone().into())
+                            .map(|term| term.kind.clone().into())
                             .collect::<Vec<_>>()
                     })
                     .collect()
@@ -1090,11 +1109,11 @@ fn normal_production(
                 grammar.productions[non_terminal]
                     .0
                     .iter()
-                    .filter(|rule| rule.first() == Some(symbol))
+                    .filter(|rule| rule.first().filter(|rule| &rule.kind == symbol).is_some())
                     .map(|rule| {
                         rule.iter()
                             .skip(1)
-                            .map(|term| term.clone().into())
+                            .map(|term| term.kind.clone().into())
                             .collect::<Vec<_>>()
                     }),
             );
@@ -1103,22 +1122,26 @@ fn normal_production(
                 proper_left_corners(grammar, non_terminal)
                     .into_iter()
                     .filter_map(|term| match term {
-                        Term::NonTerminal(nt) if left_recursive(grammar, nt.clone()) => Some(nt),
+                        TermKind::NonTerminal(nt) if left_recursive(grammar, nt.clone()) => {
+                            Some(nt)
+                        }
                         _ => None,
                     })
                     .flat_map(|nt| {
                         grammar.productions[&nt]
                             .0
                             .iter()
-                            .filter(move |rule| rule.first() == Some(symbol))
+                            .filter(move |rule| {
+                                rule.first().filter(|rule| &rule.kind == symbol).is_some()
+                            })
                             .map(move |rule| {
                                 rule.iter()
                                     .skip(1)
-                                    .map(|term| term.clone().into())
+                                    .map(|term| term.kind.clone().into())
                                     .chain(std::iter::once(NormalTerm::NonTerminal(
                                         NormalNonTerminal::Minus(
                                             non_terminal.clone(),
-                                            Term::NonTerminal(nt.clone()),
+                                            TermKind::NonTerminal(nt.clone()),
                                         ),
                                     )))
                                     .collect::<Vec<_>>()
@@ -1130,7 +1153,7 @@ fn normal_production(
     }
 }
 
-fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet<Term> {
+fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet<TermKind> {
     let mut left_corners = HashSet::new();
     let mut todo = vec![non_terminal.clone()];
 
@@ -1140,9 +1163,9 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
             .iter()
             .flat_map(|rule| rule.first().cloned())
             .for_each(|term| {
-                let new_term = left_corners.insert(term.clone());
-                match term {
-                    Term::NonTerminal(next) if new_term && &next != non_terminal => {
+                let new_term = left_corners.insert(term.kind.clone());
+                match term.kind {
+                    TermKind::NonTerminal(next) if new_term && &next != non_terminal => {
                         todo.push(next);
                     }
                     _ => {}
@@ -1154,5 +1177,5 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
 }
 
 fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
-    proper_left_corners(grammar, &non_terminal).contains(&Term::NonTerminal(non_terminal))
+    proper_left_corners(grammar, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
 }

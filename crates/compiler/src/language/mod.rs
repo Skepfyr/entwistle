@@ -70,6 +70,7 @@ impl Language {
 pub struct Definition {
     pub ident: Ident,
     pub silent: bool,
+    pub atomic: bool,
     pub rules: Vec<Rule>,
 }
 
@@ -114,14 +115,17 @@ pub struct Test {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ParseTree {
-    Leaf { data: char },
+    Leaf { ident: Option<Ident>, data: String },
     Node { ident: Ident, nodes: Vec<ParseTree> },
 }
 
 impl fmt::Display for ParseTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseTree::Leaf { data } => {
+            ParseTree::Leaf { ident, data } => {
+                if let Some(ident) = ident {
+                    write!(f, "{ident}: ")?;
+                }
                 writeln!(f, "{data:?}")?;
             }
             ParseTree::Node { ident, nodes } => {
@@ -133,5 +137,21 @@ impl fmt::Display for ParseTree {
             }
         }
         Ok(())
+    }
+}
+
+impl ParseTree {
+    pub fn ident(&self) -> Option<&Ident> {
+        match self {
+            ParseTree::Leaf { ident, .. } => ident.as_ref(),
+            ParseTree::Node { ident, .. } => Some(ident),
+        }
+    }
+
+    pub fn data(&self) -> String {
+        match self {
+            ParseTree::Leaf { data, .. } => data.clone(),
+            ParseTree::Node { nodes, .. } => nodes.iter().map(ParseTree::data).collect(),
+        }
     }
 }

@@ -2,7 +2,7 @@ use tracing::instrument;
 
 use crate::{
     language::{Ident, ParseTree, Test},
-    lower::{Name, NonTerminal, Terminal},
+    lower::{Name, NonTerminal, Term, Terminal},
     parse_table::{Action, LrkParseTable},
 };
 
@@ -17,7 +17,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
         .chain(std::iter::once(Terminal::EndOfInput(test.ident.clone())))
         .collect::<Vec<_>>();
     let mut i = 0;
-    loop {
+    let tree = loop {
         let state = &parse_table[*states.last().unwrap()];
         let action = {
             let mut action = &state.action;
@@ -35,32 +35,74 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                 let terminal = &input[i];
                 i += 1;
                 assert_eq!(terminal, _terminal);
-                match terminal {
-                    &Terminal::Real(data) => {
-                        forest.push(ParseTree::Leaf { data });
-                        states.push(*new_state);
-                    }
-                    _ => break,
-                }
+                forest.push(ParseTree::Leaf {
+                    ident: None,
+                    data: match terminal {
+                        Terminal::Real(data) => String::from(*data),
+                        Terminal::EndOfInput(_) => String::new(),
+                    },
+                });
+                states.push(*new_state);
             }
             Action::Reduce(non_terminal, terms) => {
                 let nodes = forest.split_off(forest.len().checked_sub(terms.len()).unwrap());
                 states.truncate(states.len().checked_sub(terms.len()).unwrap());
                 let ident = match non_terminal {
-                    NonTerminal::Goal { .. } => unreachable!(),
+                    NonTerminal::Goal { .. } => {
+                        if terms[0].atomic {
+                            break ParseTree::Leaf {
+                                ident: nodes[0].ident().cloned(),
+                                data: nodes[0].data(),
+                            };
+                        } else {
+                            break nodes.into_iter().next().unwrap();
+                        }
+                    }
                     NonTerminal::Named {
                         name: Name { ident, .. },
                     } => ident.clone(),
                     NonTerminal::Anonymous { index } => Ident(format!("#{index}").into()),
                 };
+
+                let nodes = nodes
+                    .into_iter()
+                    .zip(terms)
+                    .flat_map(|(node, term)| match term {
+                        Term {
+                            kind: _,
+                            silent: true,
+                            atomic: true,
+                        } => vec![],
+                        Term {
+                            kind: _,
+                            silent: true,
+                            atomic: false,
+                        } => match node {
+                            ParseTree::Leaf { .. } => vec![],
+                            ParseTree::Node { nodes, .. } => nodes,
+                        },
+                        Term {
+                            kind: _,
+                            silent: false,
+                            atomic: true,
+                        } => vec![ParseTree::Leaf {
+                            ident: node.ident().cloned(),
+                            data: node.data(),
+                        }],
+                        Term {
+                            kind: _,
+                            silent: false,
+                            atomic: false,
+                        } => vec![node],
+                    })
+                    .collect();
+
                 forest.push(ParseTree::Node { ident, nodes });
                 let state = &parse_table[*states.last().unwrap()];
                 states.push(state.goto[non_terminal]);
             }
         }
-    }
-    assert!(forest.len() == 1);
-    let tree = forest.into_iter().next().unwrap();
+    };
     if tree == test.parse_tree {
         None
     } else {

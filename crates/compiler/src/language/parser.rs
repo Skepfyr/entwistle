@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag},
+    bytes::complete::{is_not, tag, take_until},
     character::complete::{alphanumeric1, anychar, char, space0, space1},
     combinator::{eof, map, opt, recognize, success, value},
     multi::{count, fold_many0, many0, many1, many1_count, many_m_n, separated_list0},
@@ -70,12 +70,14 @@ fn definition<'a>() -> impl FnMut(&'a str) -> Result<'a, Definition> + 'a {
     map(
         tuple((
             ws(silent),
+            ws(atomic),
             terminated(ws(ident()), tuple((ws(char(':')), opt(empty_lines)))),
             many0(terminated(ws(rule()), empty_lines)),
         )),
-        |(silent, ident, productions)| Definition {
+        |(silent, atomic, ident, productions)| Definition {
             ident,
             silent,
+            atomic,
             rules: productions,
         },
     )
@@ -112,6 +114,10 @@ fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
 
 fn silent(input: &str) -> Result<bool> {
     map(ws(opt(char('-'))), |opt| opt.is_some())(input)
+}
+
+fn atomic(input: &str) -> Result<bool> {
+    map(ws(opt(char('@'))), |opt| opt.is_some())(input)
 }
 
 fn mark(input: &str) -> Result<Mark> {
@@ -172,9 +178,13 @@ fn parse_tree<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTre
 }
 
 fn parse_tree_leaf<'a>() -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
-    map(terminated(quoted_char, empty_lines), |data| {
-        ParseTree::Leaf { data }
-    })
+    map(
+        terminated(
+            tuple((opt(terminated(ident(), ws(char(':')))), quoted_string)),
+            empty_lines,
+        ),
+        |(ident, data)| ParseTree::Leaf { ident, data },
+    )
 }
 
 fn parse_tree_node<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
@@ -206,6 +216,20 @@ fn ident<'a>() -> impl FnMut(&'a str) -> Result<'a, Ident> + 'a {
         recognize(many1(alt((alphanumeric1, tag("_"))))),
         move |ident: &str| Ident(IDENT_INTERNER.intern(ident)),
     )
+}
+
+fn quoted_string(input: &str) -> Result<String> {
+    let string = |delimiter| {
+        map(
+            delimited(
+                tag(delimiter),
+                recognize(take_until(delimiter)),
+                tag(delimiter),
+            ),
+            |s: &str| s.to_owned(),
+        )
+    };
+    alt((string("'"), string("\"")))(input)
 }
 
 fn quoted_char(input: &str) -> Result<char> {

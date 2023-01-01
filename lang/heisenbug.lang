@@ -1,0 +1,8 @@
+Number: Loop
+Loop: '0' | '0' Loop
+
+## Number
+0
+##
+Number: "0"
+##
