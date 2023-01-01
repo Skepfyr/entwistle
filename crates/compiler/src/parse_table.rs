@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::{self, Write as _},
     hash::Hash,
     ops::Index,
@@ -16,8 +16,8 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LrkParseTable {
-    start_states: HashMap<Ident, StateId>,
-    states: Vec<State>,
+    pub start_states: HashMap<Ident, StateId>,
+    pub states: Vec<State>,
 }
 
 impl fmt::Display for LrkParseTable {
@@ -39,6 +39,14 @@ impl fmt::Display for LrkParseTable {
     }
 }
 
+impl Index<StateId> for LrkParseTable {
+    type Output = State;
+
+    fn index(&self, index: StateId) -> &Self::Output {
+        &self.states[index.0]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StateId(usize);
 
@@ -50,13 +58,13 @@ impl fmt::Display for StateId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
-    action: Action,
-    goto: HashMap<NonTerminal, StateId>,
+    pub action: Action,
+    pub goto: HashMap<NonTerminal, StateId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
-    Ambiguous(Vec<(Terminal, Action)>),
+    Ambiguous(BTreeMap<Terminal, Action>),
     Shift(Terminal, StateId),
     Reduce(NonTerminal, Vec<Term>),
 }
@@ -70,7 +78,7 @@ impl fmt::Display for Action {
         ) -> fmt::Result {
             match action {
                 Action::Ambiguous(ambiguities) => {
-                    for (terminal, action) in &**ambiguities {
+                    for (terminal, action) in ambiguities {
                         lookahead.push(terminal.clone());
                         display(action, f, lookahead)?;
                         lookahead.pop();

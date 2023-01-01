@@ -2,13 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     hash::Hash,
-    sync::Arc,
 };
 
-use crate::{
-    language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule},
-    util::Interner,
-};
+use crate::language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule};
 
 #[derive(Debug)]
 pub struct Grammar {
@@ -24,7 +20,7 @@ impl fmt::Display for Grammar {
     }
 }
 
-pub fn lower(language: Language) -> Grammar {
+pub fn lower(language: &Language) -> Grammar {
     let mut productions = HashMap::new();
     let mut next_anon = {
         let mut next_index = 0;
@@ -52,7 +48,7 @@ pub fn lower(language: Language) -> Grammar {
             Production(
                 [vec![
                     Term::NonTerminal(non_terminal.clone()),
-                    Term::Terminal(Terminal::EndOfInput { goal: non_terminal }),
+                    Term::Terminal(Terminal::EndOfInput(ident.clone())),
                 ]]
                 .into_iter()
                 .collect(),
@@ -129,7 +125,6 @@ fn lower_term(
         return Term::NonTerminal(non_terminal);
     }
 
-    static TERMINAL_INTERNER: Interner = Interner::new();
     match item {
         Item::Ident { mark, ident } => {
             let name = if ident == &current_name.ident {
@@ -149,10 +144,7 @@ fn lower_term(
             };
             Term::NonTerminal(NonTerminal::Named { name })
         }
-        Item::String(string) => Term::Terminal(Terminal::Real {
-            name: None,
-            data: TERMINAL_INTERNER.intern(string),
-        }),
+        &Item::Char(data) => Term::Terminal(Terminal::Real(data)),
         Item::Group(rule) => {
             let non_terminal = next_anon();
             let production = lower_rule(productions, next_anon, rule, current_name);
@@ -197,18 +189,15 @@ impl fmt::Display for Name {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Terminal {
-    Real { name: Option<Ident>, data: Arc<str> },
-    EndOfInput { goal: NonTerminal },
+    Real(char),
+    EndOfInput(Ident),
 }
 
 impl fmt::Display for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Terminal::Real {
-                name: Some(ident), ..
-            } => write!(f, "{ident}"),
-            Terminal::Real { name: None, data } => write!(f, "{data:?}"),
-            Terminal::EndOfInput { goal } => write!(f, "EoI({goal})"),
+            Terminal::Real(data) => write!(f, "{data:?}"),
+            Terminal::EndOfInput(goal) => write!(f, "EoI({goal})"),
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use entwistle::{language::Language, lower::lower, parse_table::parse_table};
+use entwistle::{language::Language, lower::lower, parse_table::parse_table, test::run_test};
 use tracing::Level;
 use tracing_subscriber::{filter, prelude::*};
 
@@ -13,14 +13,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let input = std::fs::read_to_string(file)?;
     let language = Language::parse(&input);
-    let grammar = lower(language);
+
+    println!("{language:?}");
+    println!("--------------");
+
+    let grammar = lower(&language);
 
     println!("{grammar}");
     println!("--------------");
 
-    println!("{}", parse_table(&grammar));
+    let parse_table = parse_table(&grammar);
+    println!("{parse_table}");
 
     println!("--------------");
+
+    for test in language.tests.values().flatten() {
+        if let Some(tree) = run_test(&parse_table, test) {
+            println!("Test failed:\n{tree}");
+        }
+    }
 
     Ok(())
 }

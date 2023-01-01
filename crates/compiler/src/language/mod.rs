@@ -1,13 +1,15 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fmt,
+    fmt::{self, Write as _},
     sync::Arc,
 };
+
+use indenter::indented;
 
 mod parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Ident(Arc<str>);
+pub struct Ident(pub Arc<str>);
 
 impl fmt::Display for Ident {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -84,7 +86,7 @@ pub struct Expression {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Item {
     Ident { mark: Mark, ident: Ident },
-    String(String),
+    Char(char),
     Group(Rule),
 }
 
@@ -105,19 +107,31 @@ pub enum Mark {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Test {
-    ident: Ident,
-    test: Arc<str>,
-    parse_tree: ParseTree,
+    pub ident: Ident,
+    pub test: Arc<str>,
+    pub parse_tree: ParseTree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ParseTree {
-    Leaf {
-        ident: Option<Ident>,
-        data: Arc<str>,
-    },
-    Node {
-        ident: Ident,
-        nodes: Vec<ParseTree>,
-    },
+    Leaf { data: char },
+    Node { ident: Ident, nodes: Vec<ParseTree> },
+}
+
+impl fmt::Display for ParseTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseTree::Leaf { data } => {
+                writeln!(f, "{data:?}")?;
+            }
+            ParseTree::Node { ident, nodes } => {
+                writeln!(f, "{ident}:")?;
+                let mut indented = indented(f).with_str("  ");
+                for node in nodes {
+                    write!(indented, "{node}")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
