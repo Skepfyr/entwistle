@@ -101,7 +101,7 @@ fn lower_rule(
                 expression
                     .sequence
                     .iter()
-                    .map(|(term, quantifier)| {
+                    .flat_map(|(term, quantifier)| {
                         lower_term(
                             language,
                             productions,
@@ -124,7 +124,7 @@ fn lower_term(
     item: &Item,
     quantifier: Quantifier,
     current_name: &Name,
-) -> Term {
+) -> Vec<Term> {
     if quantifier != Quantifier::Once {
         let non_terminal = next_anon();
         let term = lower_term(
@@ -142,25 +142,24 @@ fn lower_term(
         }
         // One time
         if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
-            production.insert(vec![term.clone()]);
+            production.insert(term.clone());
         }
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            production.insert(vec![
-                term,
-                Term {
-                    kind: TermKind::NonTerminal(non_terminal.clone()),
-                    silent: true,
-                    atomic: false,
-                },
-            ]);
+            let mut rule = term;
+            rule.push(Term {
+                kind: TermKind::NonTerminal(non_terminal.clone()),
+                silent: true,
+                atomic: false,
+            });
+            production.insert(rule);
         }
         productions.insert(non_terminal.clone(), Production(production));
-        return Term {
+        return vec![Term {
             kind: TermKind::NonTerminal(non_terminal),
             silent: true,
             atomic: false,
-        };
+        }];
     }
 
     match item {
@@ -181,26 +180,29 @@ fn lower_term(
                 }
             };
             let definition = &language.definitions[ident][0];
-            Term {
+            vec![Term {
                 kind: TermKind::NonTerminal(NonTerminal::Named { name }),
                 silent: definition.silent,
                 atomic: definition.atomic,
-            }
+            }]
         }
-        &Item::Char(data) => Term {
-            kind: TermKind::Terminal(Terminal::Real(data)),
-            silent: false,
-            atomic: true,
-        },
+        Item::String(data) => data
+            .chars()
+            .map(|data| Term {
+                kind: TermKind::Terminal(Terminal::Real(data)),
+                silent: false,
+                atomic: true,
+            })
+            .collect(),
         Item::Group(rule) => {
             let non_terminal = next_anon();
             let production = lower_rule(language, productions, next_anon, rule, current_name);
             productions.insert(non_terminal.clone(), production);
-            Term {
+            vec![Term {
                 kind: TermKind::NonTerminal(non_terminal),
                 silent: true,
                 atomic: false,
-            }
+            }]
         }
     }
 }

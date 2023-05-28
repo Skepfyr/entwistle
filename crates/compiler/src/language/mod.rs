@@ -87,7 +87,7 @@ pub struct Expression {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Item {
     Ident { mark: Mark, ident: Ident },
-    Char(char),
+    String(String),
     Group(Rule),
 }
 
