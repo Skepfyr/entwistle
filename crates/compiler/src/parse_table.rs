@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
     fmt::{self, Write as _},
@@ -11,7 +12,7 @@ use indenter::indented;
 use regex_automata::{
     dfa::{dense, Automaton},
     nfa::thompson,
-    MatchKind, SyntaxConfig,
+    MatchKind, PatternID, SyntaxConfig,
 };
 use tracing::{debug, instrument, trace};
 
@@ -843,7 +844,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                 }
                 Terminal::EndOfInput(ident) => {
                     eoi.insert(ident, action);
-                },
+                }
             };
         }
 
@@ -1254,34 +1255,56 @@ fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
     proper_left_corners(grammar, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
 }
 
+/// Check if any of the regexes are prefixes of any of the other regexes.
 fn validate_dfa(dfa: &Dfa, regexes: &[String]) {
     assert!(!dfa.has_starts_for_each_pattern());
     let start = dfa.start_state_forward(None, &[], 0, 0);
-    let mut to_visit = vec![start];
-    let mut discovered = HashSet::new();
-    discovered.insert(start);
-    while let Some(state) = to_visit.pop() {
-        if dfa.is_match_state(state) {
-            let match_count = dfa.match_count(state);
+    let mut to_visit = vec![(start, None::<PatternID>)];
+    let mut coloured = HashMap::new();
+    while let Some((state, mut new_colour)) = to_visit.pop() {
+        if let Some(old_colour) = coloured.get(&state).copied() {
+            if let Some(new_colour) = new_colour {
+                if new_colour != old_colour {
+                    panic!(
+                        "Conflicting tokens: {} and {}",
+                        regexes[old_colour.as_usize()],
+                        regexes[new_colour.as_usize()]
+                    );
+                }
+            }
+            continue;
+        } else if let Some(new_colour) = new_colour {
+            assert!(coloured.insert(state, new_colour).is_none());
+        }
+        let eoi_state = dfa.next_eoi_state(state);
+        if dfa.is_match_state(eoi_state) {
+            let match_count = dfa.match_count(eoi_state);
+            let intrinsic_colour = dfa.match_pattern(eoi_state, 0);
             if match_count > 1 {
                 panic!(
                     "Multiple tokens conflict:{}",
                     (0..match_count)
-                        .map(|i| &regexes[dfa.match_pattern(state, i).as_usize()])
+                        .map(|i| &regexes[dfa.match_pattern(eoi_state, i).as_usize()])
                         .flat_map(|r| [" ", r])
                         .collect::<String>()
                 );
+            } else if new_colour.is_some_and(|new_colour| new_colour != intrinsic_colour) {
+                panic!(
+                    "Conflicting tokens: {} and {}",
+                    regexes[intrinsic_colour.as_usize()],
+                    regexes[new_colour.unwrap().as_usize()]
+                );
             }
+            new_colour = Some(intrinsic_colour);
+        }
+        if let Some(new_colour) = new_colour {
+            coloured.insert(state, new_colour);
         }
         for i in 0..=u8::MAX {
             let next = dfa.next_state(state, i);
-            if discovered.insert(next) {
-                to_visit.push(next);
+            if !dfa.is_dead_state(next) {
+                to_visit.push((next, new_colour));
             }
-        }
-        let next = dfa.next_eoi_state(state);
-        if discovered.insert(next) {
-            to_visit.push(next);
         }
     }
 }
