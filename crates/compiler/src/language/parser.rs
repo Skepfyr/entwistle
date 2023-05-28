@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag, take_until},
-    character::complete::{alphanumeric1, char, space0, space1},
+    bytes::complete::{escaped, is_not, tag, take_until},
+    character::complete::{alphanumeric1, anychar, char, space0, space1},
     combinator::{eof, map, opt, recognize, success, value},
     multi::{count, fold_many0, many0, many1, many1_count, many_m_n, separated_list0},
     sequence::{delimited, preceded, terminated, tuple},
@@ -105,6 +105,7 @@ fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
             ident,
         }),
         map(quoted_string, Item::String),
+        map(regex, Item::Regex),
         map(
             delimited(char('('), move |input| rule()(input), char(')')),
             Item::Group,
@@ -230,6 +231,13 @@ fn quoted_string(input: &str) -> Result<String> {
         )
     };
     alt((string("'"), string("\"")))(input)
+}
+
+fn regex(input: &str) -> Result<String> {
+    map(
+        delimited(char('/'), escaped(is_not("/"), '\\', anychar), char('/')),
+        |s: &str| s.to_owned(),
+    )(input)
 }
 
 fn ws<'a, F, O>(f: F) -> impl FnMut(&'a str) -> Result<'a, O>

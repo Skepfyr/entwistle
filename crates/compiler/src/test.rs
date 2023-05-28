@@ -1,3 +1,4 @@
+use regex_automata::dfa::Automaton;
 use tracing::instrument;
 
 use crate::{
@@ -10,37 +11,46 @@ use crate::{
 pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
     let mut states = vec![parse_table.start_states[&test.ident]];
     let mut forest = vec![];
-    let input = test
-        .test
-        .chars()
-        .map(Terminal::Real)
-        .chain(std::iter::once(Terminal::EndOfInput(test.ident.clone())))
-        .collect::<Vec<_>>();
-    let mut i = 0;
+    let mut input: &str = &test.test;
     let tree = loop {
         let state = &parse_table[*states.last().unwrap()];
         let action = {
             let mut action = &state.action;
-            let mut lookahead = i;
+            let mut lookahead = 0;
             loop {
-                let Action::Ambiguous(ambiguities) = action else { break };
-                action = &ambiguities[&input[lookahead]];
-                lookahead += 1;
+                let Action::Ambiguous { dfa, regexes: _, actions, eoi } = action else { break };
+                if input.len() == lookahead {
+                    action = &eoi[&test.ident];
+                    break;
+                } else {
+                    let half_match = dfa
+                        .find_leftmost_fwd(input[lookahead..].as_bytes())
+                        .unwrap()
+                        .expect("No matches");
+                    action = &actions[half_match.pattern().as_usize()];
+                    lookahead += half_match.offset();
+                }
             }
             action
         };
         match action {
-            Action::Ambiguous(_) => unreachable!(),
-            Action::Shift(_terminal, new_state) => {
-                let terminal = &input[i];
-                i += 1;
-                assert_eq!(terminal, _terminal);
+            Action::Ambiguous { .. } => unreachable!(),
+            Action::Shift(Terminal::Token(dfa, _), new_state) => {
+                let half_match = dfa
+                    .find_leftmost_fwd(input.as_bytes())
+                    .unwrap()
+                    .expect("No matches");
                 forest.push(ParseTree::Leaf {
                     ident: None,
-                    data: match terminal {
-                        Terminal::Real(data) => String::from(*data),
-                        Terminal::EndOfInput(_) => String::new(),
-                    },
+                    data: input[..half_match.offset()].to_owned(),
+                });
+                states.push(*new_state);
+                input = &input[half_match.offset()..];
+            }
+            Action::Shift(Terminal::EndOfInput(_), new_state) => {
+                forest.push(ParseTree::Leaf {
+                    ident: None,
+                    data: String::new(),
                 });
                 states.push(*new_state);
             }

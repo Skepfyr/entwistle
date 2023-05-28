@@ -1,2 +1,5 @@
 [workspace]
 members = ["crates/compiler", "crates/lsp"]
+
+[profile.dev.package."*"]
+opt-level = 2

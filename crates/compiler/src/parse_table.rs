@@ -1,12 +1,18 @@
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
     fmt::{self, Write as _},
     hash::Hash,
     ops::Index,
     sync::Arc,
+    vec,
 };
 
 use indenter::indented;
+use regex_automata::{
+    dfa::{dense, Automaton},
+    nfa::thompson,
+    MatchKind, SyntaxConfig,
+};
 use tracing::{debug, instrument, trace};
 
 use crate::{
@@ -62,9 +68,15 @@ pub struct State {
     pub goto: HashMap<NonTerminal, StateId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) type Dfa = dense::DFA<Vec<u32>>;
+#[derive(Debug, Clone)]
 pub enum Action {
-    Ambiguous(BTreeMap<Terminal, Action>),
+    Ambiguous {
+        dfa: Dfa,
+        regexes: Vec<String>,
+        actions: Vec<Action>,
+        eoi: HashMap<Ident, Action>,
+    },
     Shift(Terminal, StateId),
     Reduce(NonTerminal, Vec<Term>),
 }
@@ -74,12 +86,22 @@ impl fmt::Display for Action {
         fn display(
             action: &Action,
             f: &mut fmt::Formatter<'_>,
-            lookahead: &mut Vec<Terminal>,
+            lookahead: &mut Vec<String>,
         ) -> fmt::Result {
             match action {
-                Action::Ambiguous(ambiguities) => {
-                    for (terminal, action) in ambiguities {
+                Action::Ambiguous {
+                    dfa: _,
+                    regexes,
+                    actions,
+                    eoi,
+                } => {
+                    for (terminal, action) in regexes.iter().zip(actions) {
                         lookahead.push(terminal.clone());
+                        display(action, f, lookahead)?;
+                        lookahead.pop();
+                    }
+                    for (ident, action) in eoi {
+                        lookahead.push(format!("EOI({})", ident));
                         display(action, f, lookahead)?;
                         lookahead.pop();
                     }
@@ -106,6 +128,31 @@ impl fmt::Display for Action {
         display(self, f, &mut Vec::new())
     }
 }
+
+impl PartialEq for Action {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Ambiguous {
+                    dfa: _,
+                    regexes: l_regexes,
+                    actions: l_actions,
+                    eoi: l_eoi,
+                },
+                Self::Ambiguous {
+                    dfa: _,
+                    regexes: r_regexes,
+                    actions: r_actions,
+                    eoi: r_eoi,
+                },
+            ) => l_regexes == r_regexes && l_actions == r_actions && l_eoi == r_eoi,
+            (Self::Shift(l0, l1), Self::Shift(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::Reduce(l0, l1), Self::Reduce(r0, r1)) => l0 == r0 && l1 == r1,
+            _ => false,
+        }
+    }
+}
+impl Eq for Action {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Item {
@@ -139,13 +186,13 @@ impl fmt::Display for Lr0StateId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemIndex {
-    state: Lr0StateId,
+    state_id: Lr0StateId,
     item: usize,
 }
 
 impl fmt::Display for ItemIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.state, self.item)
+        write!(f, "{}:{}", self.state_id, self.item)
     }
 }
 
@@ -213,7 +260,7 @@ impl Index<ItemIndex> for Lr0ParseTable {
     type Output = (Item, BTreeSet<ItemIndex>);
 
     fn index(&self, index: ItemIndex) -> &Self::Output {
-        &self[index.state].item_set[index.item]
+        &self[index.state_id].item_set[index.item]
     }
 }
 
@@ -303,7 +350,7 @@ pub fn lr0_parse_table(grammar: &Grammar) -> Lr0ParseTable {
                     })
                     .or_default()
                     .insert(ItemIndex {
-                        state: Lr0StateId(state_id),
+                        state_id: Lr0StateId(state_id),
                         item: id,
                     });
             }
@@ -389,7 +436,7 @@ fn closure(
                 break;
             }
             back_refs.insert(ItemIndex {
-                state: state_id,
+                state_id,
                 item: item_id,
             });
         }
@@ -607,7 +654,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                     }
                 }));
             }
-            visited.extend(lane_members.into_keys().map(|idx| idx.state));
+            visited.extend(lane_members.into_keys().map(|idx| idx.state_id));
         }
 
         let mut splitting_occurred = false;
@@ -705,9 +752,9 @@ impl<'a> LrkParseTableBuilder<'a> {
                                 back_refs.extend(
                                     back_refs
                                         .iter()
-                                        .filter(|item_idx| item_idx.state == state)
+                                        .filter(|item_idx| item_idx.state_id == state)
                                         .map(|item_idx| ItemIndex {
-                                            state: new_state_id,
+                                            state_id: new_state_id,
                                             item: item_idx.item,
                                         })
                                         .collect::<Vec<_>>(),
@@ -722,13 +769,13 @@ impl<'a> LrkParseTableBuilder<'a> {
                 for (_, back_refs) in &mut new_state.item_set {
                     let old_back_refs = std::mem::take(back_refs);
                     back_refs.extend(old_back_refs.into_iter().filter_map(|back_ref| {
-                        if marks.get(&back_ref.state).is_none() {
+                        if marks.get(&back_ref.state_id).is_none() {
                             Some(back_ref)
                         } else {
                             state_id_map
-                                .get(&(back_ref.state, split))
+                                .get(&(back_ref.state_id, split))
                                 .map(|&new_id| ItemIndex {
-                                    state: new_id,
+                                    state_id: new_id,
                                     item: back_ref.item,
                                 })
                         }
@@ -762,38 +809,65 @@ impl<'a> LrkParseTableBuilder<'a> {
             panic!("Ambiguity!");
         }
 
-        Some(Action::Ambiguous(
-            next.into_iter()
-                .map(|(terminal, conflicts)| {
-                    let loops = conflicts
-                        .values()
-                        .map(|v| {
-                            v.iter()
-                                .flat_map(|ambiguity| {
-                                    let mut history = ambiguity.history.iter().rev();
-                                    let first = history.next().unwrap();
-                                    history
-                                        .enumerate()
-                                        .filter(move |&(_, entry)| entry == first)
-                                        .map(|(i, _)| i)
-                                })
-                                .collect::<HashSet<_>>()
+        let mut regexes = Vec::with_capacity(next.len());
+        let mut actions = Vec::with_capacity(next.len());
+        let mut eoi = HashMap::new();
+        for (terminal, conflicts) in next {
+            let loops = conflicts
+                .values()
+                .map(|v| {
+                    v.iter()
+                        .flat_map(|ambiguity| {
+                            let mut history = ambiguity.history.iter().rev();
+                            let first = history.next().unwrap();
+                            history
+                                .enumerate()
+                                .filter(move |&(_, entry)| entry == first)
+                                .map(|(i, _)| i)
                         })
-                        .collect::<Vec<_>>();
-                    let contains_common_loops = loops
-                        .iter()
-                        .enumerate()
-                        .any(|(i, set1)| loops[i + 1..].iter().any(|set2| !set1.is_disjoint(set2)));
-                    if contains_common_loops {
-                        panic!("Ambiguity!");
-                    }
-                    Some((
-                        terminal,
-                        self.make_action(visited.clone(), conflicts, invalidate_state)?,
-                    ))
+                        .collect::<HashSet<_>>()
                 })
-                .collect::<Option<_>>()?,
-        ))
+                .collect::<Vec<_>>();
+            let contains_common_loops = loops
+                .iter()
+                .enumerate()
+                .any(|(i, set1)| loops[i + 1..].iter().any(|set2| !set1.is_disjoint(set2)));
+            if contains_common_loops {
+                panic!("Ambiguity!");
+            }
+            let action = self.make_action(visited.clone(), conflicts, invalidate_state)?;
+            match terminal {
+                Terminal::Token(_, regex) => {
+                    regexes.push(regex);
+                    actions.push(action);
+                }
+                Terminal::EndOfInput(ident) => {
+                    eoi.insert(ident, action);
+                },
+            };
+        }
+
+        let dfa = dense::Builder::new()
+            .configure(
+                dense::Config::new()
+                    .anchored(true)
+                    // FIXME: Is it valid to use All and leftmost find?
+                    .match_kind(MatchKind::All)
+                    .minimize(true),
+            )
+            .syntax(SyntaxConfig::new())
+            .thompson(thompson::Config::new())
+            .build_many(&regexes)
+            .unwrap();
+
+        validate_dfa(&dfa, &regexes);
+
+        Some(Action::Ambiguous {
+            dfa,
+            regexes,
+            actions,
+            eoi,
+        })
     }
 
     fn item_lane_heads(
@@ -823,7 +897,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         let mut ret = false;
         if let Some(next_state) = &transition {
             let existing_action = split_info
-                .entry(location.state)
+                .entry(location.state_id)
                 .or_default()
                 .entry(next_state.clone())
                 .or_default()
@@ -842,7 +916,7 @@ impl<'a> LrkParseTableBuilder<'a> {
 
         if item.index != 0 {
             for item_index in back_refs.clone() {
-                let transition = if item_index.state == location.state {
+                let transition = if item_index.state_id == location.state_id {
                     transition.clone()
                 } else {
                     self.lr0_parse_table[item_index].0.next()
@@ -858,7 +932,7 @@ impl<'a> LrkParseTableBuilder<'a> {
             }
         } else {
             for &back_ref in back_refs {
-                let transition = if back_ref.state == location.state {
+                let transition = if back_ref.state_id == location.state_id {
                     transition.clone()
                 } else {
                     self.lr0_parse_table[back_ref].0.next()
@@ -896,7 +970,7 @@ fn conflicts(
                 }
             };
             let location = ItemIndex {
-                state: Lr0StateId(lr0_state_id),
+                state_id: Lr0StateId(lr0_state_id),
                 item: item_idx,
             };
             Some((
@@ -1178,4 +1252,36 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
 
 fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
     proper_left_corners(grammar, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
+}
+
+fn validate_dfa(dfa: &Dfa, regexes: &[String]) {
+    assert!(!dfa.has_starts_for_each_pattern());
+    let start = dfa.start_state_forward(None, &[], 0, 0);
+    let mut to_visit = vec![start];
+    let mut discovered = HashSet::new();
+    discovered.insert(start);
+    while let Some(state) = to_visit.pop() {
+        if dfa.is_match_state(state) {
+            let match_count = dfa.match_count(state);
+            if match_count > 1 {
+                panic!(
+                    "Multiple tokens conflict:{}",
+                    (0..match_count)
+                        .map(|i| &regexes[dfa.match_pattern(state, i).as_usize()])
+                        .flat_map(|r| [" ", r])
+                        .collect::<String>()
+                );
+            }
+        }
+        for i in 0..=u8::MAX {
+            let next = dfa.next_state(state, i);
+            if discovered.insert(next) {
+                to_visit.push(next);
+            }
+        }
+        let next = dfa.next_eoi_state(state);
+        if discovered.insert(next) {
+            to_visit.push(next);
+        }
+    }
 }

@@ -88,6 +88,7 @@ pub struct Expression {
 pub enum Item {
     Ident { mark: Mark, ident: Ident },
     String(String),
+    Regex(String),
     Group(Rule),
 }
 

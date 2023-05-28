@@ -1,10 +1,20 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     fmt::{self, Write as _},
     hash::Hash,
 };
 
-use crate::language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule};
+use regex_automata::{
+    dfa::{dense, Automaton},
+    nfa::thompson,
+    MatchKind, SyntaxConfig,
+};
+
+use crate::{
+    language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule},
+    parse_table::Dfa,
+};
 
 #[derive(Debug)]
 pub struct Grammar {
@@ -101,7 +111,7 @@ fn lower_rule(
                 expression
                     .sequence
                     .iter()
-                    .flat_map(|(term, quantifier)| {
+                    .map(|(term, quantifier)| {
                         lower_term(
                             language,
                             productions,
@@ -124,7 +134,7 @@ fn lower_term(
     item: &Item,
     quantifier: Quantifier,
     current_name: &Name,
-) -> Vec<Term> {
+) -> Term {
     if quantifier != Quantifier::Once {
         let non_terminal = next_anon();
         let term = lower_term(
@@ -142,24 +152,25 @@ fn lower_term(
         }
         // One time
         if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
-            production.insert(term.clone());
+            production.insert(vec![term.clone()]);
         }
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            let mut rule = term;
-            rule.push(Term {
-                kind: TermKind::NonTerminal(non_terminal.clone()),
-                silent: true,
-                atomic: false,
-            });
-            production.insert(rule);
+            production.insert(vec![
+                term,
+                Term {
+                    kind: TermKind::NonTerminal(non_terminal.clone()),
+                    silent: true,
+                    atomic: false,
+                },
+            ]);
         }
         productions.insert(non_terminal.clone(), Production(production));
-        return vec![Term {
+        return Term {
             kind: TermKind::NonTerminal(non_terminal),
             silent: true,
             atomic: false,
-        }];
+        };
     }
 
     match item {
@@ -180,29 +191,31 @@ fn lower_term(
                 }
             };
             let definition = &language.definitions[ident][0];
-            vec![Term {
+            Term {
                 kind: TermKind::NonTerminal(NonTerminal::Named { name }),
                 silent: definition.silent,
                 atomic: definition.atomic,
-            }]
+            }
         }
-        Item::String(data) => data
-            .chars()
-            .map(|data| Term {
-                kind: TermKind::Terminal(Terminal::Real(data)),
-                silent: false,
-                atomic: true,
-            })
-            .collect(),
+        Item::String(data) => Term {
+            kind: TermKind::Terminal(Terminal::new_token(regex_syntax::escape(data))),
+            silent: false,
+            atomic: true,
+        },
+        Item::Regex(regex) => Term {
+            kind: TermKind::Terminal(Terminal::new_token(regex.clone())),
+            silent: false,
+            atomic: true,
+        },
         Item::Group(rule) => {
             let non_terminal = next_anon();
             let production = lower_rule(language, productions, next_anon, rule, current_name);
             productions.insert(non_terminal.clone(), production);
-            vec![Term {
+            Term {
                 kind: TermKind::NonTerminal(non_terminal),
                 silent: true,
                 atomic: false,
-            }]
+            }
         }
     }
 }
@@ -240,17 +253,74 @@ impl fmt::Display for Name {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub enum Terminal {
-    Real(char),
+    Token(Dfa, String),
     EndOfInput(Ident),
+}
+
+impl Terminal {
+    fn new_token(regex: String) -> Self {
+        let dfa = dense::Builder::new()
+            .configure(
+                dense::Config::new()
+                    .anchored(true)
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .minimize(true),
+            )
+            .syntax(SyntaxConfig::new())
+            .thompson(thompson::Config::new())
+            .build(&regex)
+            .unwrap();
+        let start = dfa.start_state_forward(None, &[], 0, 0);
+        let empty = dfa.next_eoi_state(start);
+        if dfa.is_match_state(empty) {
+            panic!("token {} matches empty string", regex);
+        }
+        Self::Token(dfa, regex)
+    }
 }
 
 impl fmt::Display for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Terminal::Real(data) => write!(f, "{data:?}"),
+            Terminal::Token(_, regex) => write!(f, "/{regex}/"),
             Terminal::EndOfInput(goal) => write!(f, "EoI({goal})"),
+        }
+    }
+}
+
+impl PartialEq for Terminal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Token(_, this), Self::Token(_, other)) => this.as_str() == other.as_str(),
+            (Self::EndOfInput(this), Self::EndOfInput(other)) => this == other,
+            _ => false,
+        }
+    }
+}
+impl Eq for Terminal {}
+impl PartialOrd for Terminal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Terminal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Token(_, this), Self::Token(_, other)) => this.as_str().cmp(other.as_str()),
+            (Self::EndOfInput(this), Self::EndOfInput(other)) => this.cmp(other),
+            (Self::Token(_, _), _) => Ordering::Less,
+            (_, Self::Token(_, _)) => Ordering::Greater,
+        }
+    }
+}
+impl Hash for Terminal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Token(_, regex) => regex.as_str().hash(state),
+            Self::EndOfInput(goal) => goal.hash(state),
         }
     }
 }
