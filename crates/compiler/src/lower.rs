@@ -157,12 +157,12 @@ fn lower_term(
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
             production.insert(vec![
-                term,
                 Term {
                     kind: TermKind::NonTerminal(non_terminal.clone()),
                     silent: true,
                     atomic: false,
                 },
+                term,
             ]);
         }
         productions.insert(non_terminal.clone(), Production(production));
