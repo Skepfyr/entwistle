@@ -883,7 +883,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         trace!(
             %action,
             %location,
-            ?transition,
+            transition = transition.as_ref().map(|t| t.to_string()),
             "Computing lane heads"
         );
         let (item, back_refs) = &self.lr0_parse_table[location];
@@ -1184,12 +1184,18 @@ fn normal_production(
                 grammar.productions[non_terminal]
                     .0
                     .iter()
-                    .filter(|rule| rule.first().filter(|rule| &rule.kind == symbol).is_some())
-                    .map(|rule| {
-                        rule.iter()
-                            .skip(1)
-                            .map(|term| term.kind.clone().into())
-                            .collect::<Vec<_>>()
+                    .filter_map(|rule| {
+                        let mut rule = rule.iter().map(|term| &term.kind);
+                        if rule
+                            .by_ref()
+                            .find(|term| term == &symbol || !can_be_empty(grammar, term))?
+                            != symbol
+                        {
+                            return None;
+                        }
+                        // The find call above has eaten all the empty symbols,
+                        // so we can just collect the rest of the rule.
+                        Some(rule.map(|term| term.clone().into()).collect::<Vec<_>>())
                     }),
             );
             // 2 - Moor00 5
@@ -1203,29 +1209,37 @@ fn normal_production(
                         _ => None,
                     })
                     .flat_map(|nt| {
-                        grammar.productions[&nt]
-                            .0
-                            .iter()
-                            .filter(move |rule| {
-                                rule.first().filter(|rule| &rule.kind == symbol).is_some()
-                            })
-                            .map(move |rule| {
-                                rule.iter()
-                                    .skip(1)
-                                    .map(|term| term.kind.clone().into())
+                        grammar.productions[&nt].0.iter().filter_map(move |rule| {
+                            let mut rule = rule.iter().map(|term| &term.kind);
+                            if rule
+                                .by_ref()
+                                .find(|term| term == &symbol || !can_be_empty(grammar, term))?
+                                != symbol
+                            {
+                                return None;
+                            }
+                            // The find call above has eaten all the empty symbols,
+                            // so we can just collect the rest of the rule.
+                            Some(
+                                rule.map(|term| term.clone().into())
                                     .chain(std::iter::once(NormalTerm::NonTerminal(
                                         NormalNonTerminal::Minus(
                                             non_terminal.clone(),
                                             TermKind::NonTerminal(nt.clone()),
                                         ),
                                     )))
-                                    .collect::<Vec<_>>()
-                            })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
                     }),
             );
             rules
         }
     }
+}
+
+fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
+    proper_left_corners(grammar, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
 }
 
 fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet<TermKind> {
@@ -1236,10 +1250,16 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
         grammar.productions[&nt]
             .0
             .iter()
-            .flat_map(|rule| rule.first().cloned())
+            .flat_map(|rule| {
+                rule.iter().scan(true, |prev_empty, term| {
+                    let res = prev_empty.then(|| term);
+                    *prev_empty = can_be_empty(grammar, &term.kind);
+                    res
+                })
+            })
             .for_each(|term| {
                 let new_term = left_corners.insert(term.kind.clone());
-                match term.kind {
+                match term.kind.clone() {
                     TermKind::NonTerminal(next) if new_term && &next != non_terminal => {
                         todo.push(next);
                     }
@@ -1251,8 +1271,24 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
     left_corners
 }
 
-fn left_recursive(grammar: &Grammar, non_terminal: NonTerminal) -> bool {
-    proper_left_corners(grammar, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
+fn can_be_empty(grammar: &Grammar, term: &TermKind) -> bool {
+    fn inner(grammar: &Grammar, term: &TermKind, visited: &mut HashSet<TermKind>) -> bool {
+        let TermKind::NonTerminal(nt) = term else {
+            return false;
+        };
+        grammar.productions[nt].0.iter().any(|alternative| {
+            alternative.iter().all(|term| {
+                if visited.insert(term.kind.clone()) {
+                    let res = inner(grammar, &term.kind, visited);
+                    visited.remove(&term.kind);
+                    res
+                } else {
+                    false
+                }
+            })
+        })
+    }
+    inner(grammar, term, &mut HashSet::new())
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.
