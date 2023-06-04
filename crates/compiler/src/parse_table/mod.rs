@@ -1,4 +1,3 @@
-use core::panic;
 use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, HashSet},
     fmt::{self, Write as _},
@@ -14,12 +13,16 @@ use regex_automata::{
     nfa::thompson,
     MatchKind, PatternID, SyntaxConfig,
 };
-use tracing::{debug, instrument, trace};
+use tracing::{debug, debug_span, trace};
 
 use crate::{
     language::Ident,
-    lower::{Grammar, NonTerminal, Term, TermKind, Terminal},
+    lower::{Alternative, Grammar, NonTerminal, Term, TermKind, Terminal},
 };
+
+use self::term_string::TermString;
+
+mod term_string;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LrkParseTable {
@@ -79,7 +82,7 @@ pub enum Action {
         eoi: HashMap<Ident, Action>,
     },
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Vec<Term>),
+    Reduce(NonTerminal, Alternative),
 }
 
 impl fmt::Display for Action {
@@ -114,15 +117,11 @@ impl fmt::Display for Action {
                     }
                     writeln!(f, ": Shift({terminal}) -> {state}")
                 }
-                Action::Reduce(non_terminal, production) => {
+                Action::Reduce(non_terminal, alternative) => {
                     for terminal in lookahead {
                         write!(f, "{terminal} ")?;
                     }
-                    write!(f, ": Reduce({non_terminal} ->")?;
-                    for term in &**production {
-                        write!(f, " {term}")?;
-                    }
-                    writeln!(f, ")")
+                    writeln!(f, ": Reduce({non_terminal} -> {alternative})")
                 }
             }
         }
@@ -158,21 +157,21 @@ impl Eq for Action {}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Item {
     pub non_terminal: NonTerminal,
-    pub production: Vec<Term>,
+    pub alternative: Alternative,
     pub index: usize,
 }
 
 impl Item {
-    fn new(non_terminal: NonTerminal, production: Vec<Term>) -> Self {
+    fn new(non_terminal: NonTerminal, alternative: Alternative) -> Self {
         Self {
             non_terminal,
-            production,
+            alternative,
             index: 0,
         }
     }
 
     fn next(&self) -> Option<Term> {
-        self.production.get(self.index).cloned()
+        self.alternative.terms.get(self.index).cloned()
     }
 }
 
@@ -199,9 +198,9 @@ impl fmt::Display for ItemIndex {
 
 pub fn first_set(grammar: &Grammar, non_terminal: &NonTerminal) -> (bool, HashSet<Terminal>) {
     grammar.productions[non_terminal]
-        .0
+        .alternatives
         .iter()
-        .map(|terms| terms.get(0))
+        .map(|alternative| alternative.terms.get(0))
         .fold(
             (false, HashSet::new()),
             |(contains_null, mut set), term| match term {
@@ -277,12 +276,15 @@ impl fmt::Display for Lr0State {
         writeln!(f, "Items:")?;
         for (item, _backlinks) in &self.item_set {
             write!(f, "    {} ->", item.non_terminal)?;
-            for term in &item.production[..item.index] {
+            for term in &item.alternative.terms[..item.index] {
                 write!(f, " {term}")?;
             }
             write!(f, " .")?;
-            for term in &item.production[item.index..] {
+            for term in &item.alternative.terms[item.index..] {
                 write!(f, " {term}")?;
+            }
+            if let Some(lookahead) = &item.alternative.negative_lookahead {
+                write!(f, "(!>>{})", lookahead)?;
             }
             writeln!(f)?;
         }
@@ -314,13 +316,9 @@ pub fn lr0_parse_table(grammar: &Grammar) -> Lr0ParseTable {
         };
 
         let mut root_item_set = BTreeSet::new();
-        for production in &production.0 {
+        for alternative in &production.alternatives {
             // There should only be one but doesn't hurt to add them "all"
-            root_item_set.insert(Item {
-                non_terminal: goal.clone(),
-                production: production.clone(),
-                index: 0,
-            });
+            root_item_set.insert(Item::new(goal.clone(), alternative.clone()));
         }
         let new_state = add_state(grammar, &mut states, &root_item_set);
         start_states.insert(ident, new_state);
@@ -346,7 +344,7 @@ pub fn lr0_parse_table(grammar: &Grammar) -> Lr0ParseTable {
                 new_state
                     .entry(Item {
                         non_terminal: item.non_terminal.clone(),
-                        production: item.production.clone(),
+                        alternative: item.alternative.clone(),
                         index: item.index + 1,
                     })
                     .or_default()
@@ -426,7 +424,7 @@ fn closure(
                 let start = state.len();
                 state.extend(
                     grammar.productions[non_terminal]
-                        .0
+                        .alternatives
                         .iter()
                         .map(|p| (Item::new(non_terminal.clone(), p.clone()), BTreeSet::new())),
                 );
@@ -468,7 +466,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         let mut lr0_state_id = 0;
         while lr0_state_id < self.lr0_parse_table.states.len() {
             let next_state = &self.lr0_parse_table[Lr0StateId(lr0_state_id)];
-            let conflicts = conflicts(next_state, lr0_state_id);
+            let conflicts = conflicts(next_state, lr0_state_id, self.grammar);
             let goto = next_state
                 .goto
                 .iter()
@@ -487,7 +485,9 @@ impl<'a> LrkParseTableBuilder<'a> {
             // it returns, so at worst it will convert the entire graph into a
             // tree and then exit.
             let action = loop {
-                debug!(state = %self.lr0_parse_table[Lr0StateId(lr0_state_id)], "Making top-level action");
+                let span = debug_span!("make_action", state = lr0_state_id);
+                let _enter = span.enter();
+                debug!("Making top-level action");
                 let make_action =
                     self.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
                 if let Some(action) = make_action {
@@ -499,7 +499,7 @@ impl<'a> LrkParseTableBuilder<'a> {
         }
         while let Some(lr0_state_id) = invalidated.pop() {
             let next_state = &self.lr0_parse_table[Lr0StateId(lr0_state_id)];
-            let conflicts = conflicts(next_state, lr0_state_id);
+            let conflicts = conflicts(next_state, lr0_state_id, self.grammar);
             let goto = next_state
                 .goto
                 .iter()
@@ -518,7 +518,9 @@ impl<'a> LrkParseTableBuilder<'a> {
             // it returns, so at worst it will convert the entire graph into a
             // tree and then exit.
             let action = loop {
-                debug!(state = %self.lr0_parse_table[Lr0StateId(lr0_state_id)], "Making top-level action");
+                let span = debug_span!("make_action", state = lr0_state_id);
+                let _enter = span.enter();
+                debug!("Making top-level action");
                 let make_action =
                     self.make_action(visited.clone(), conflicts.clone(), &mut invalidate_state);
                 if let Some(action) = make_action {
@@ -538,7 +540,6 @@ impl<'a> LrkParseTableBuilder<'a> {
         }
     }
 
-    #[instrument(skip_all)]
     fn make_action(
         &mut self,
         mut visited: HashSet<Lr0StateId>,
@@ -563,97 +564,71 @@ impl<'a> LrkParseTableBuilder<'a> {
 
         // Extend ambiguities to next lookahead item
         for (action, mut ambiguities) in conflicts {
+            let span = debug_span!("extend_ambiguities", action = %action);
+            let _enter = span.enter();
             let mut lane_members = HashMap::new();
             while let Some(Ambiguity {
                 location,
                 transition,
                 history,
-                mut term_string,
+                term_string,
             }) = ambiguities.pop()
             {
-                trace!(%location, ?history, %term_string, "Investigating ambiguity");
-                if let Some(term) = term_string.terms.get(term_string.next_term).cloned() {
-                    Arc::make_mut(&mut term_string).next_term += 1;
-                    match term {
-                        NormalTerm::Terminal(terminal) => {
-                            trace!(%terminal, "Found terminal");
+                trace!(%location, %history, %term_string, "Investigating ambiguity");
+                for (terminal, term_string) in term_string.next(self.grammar) {
+                    match terminal {
+                        Some(terminal) => {
+                            let new_action = action.with_lookahead(self.grammar, terminal.clone());
+                            if new_action.contains_finished_lookahead(self.grammar) {
+                                trace!("Dropping ambiguity because negative lookahead matched");
+                                continue;
+                            }
                             let mut history = history.clone();
-                            history.push((
-                                location,
-                                TermString {
-                                    terms: term_string.terms.clone(),
-                                    next_term: term_string.next_term,
-                                    parent: None,
-                                },
-                            ));
+                            history.0.push((location, term_string.with_no_parent()));
                             next.entry(terminal)
                                 .or_default()
-                                .entry(action.clone())
+                                .entry(new_action)
                                 .or_default()
                                 .push(Ambiguity {
                                     location,
-                                    transition,
+                                    transition: transition.clone(),
                                     history,
                                     term_string,
                                 });
                         }
-                        NormalTerm::NonTerminal(non_terminal) => {
-                            trace!(%non_terminal, "Walking down into non-terminal");
-                            ambiguities.extend(
-                                normal_production(self.grammar, &non_terminal)
-                                    .into_iter()
-                                    .map(|terms| Ambiguity {
+                        None => {
+                            // term_string is empty, so we must now walk the parse table.
+                            let mut lane_heads = HashSet::new();
+                            potential_ambiguity |= self.item_lane_heads(
+                                action.clone(),
+                                location,
+                                transition.clone(),
+                                &mut split_info,
+                                &mut lane_members,
+                                &mut lane_heads,
+                            );
+                            ambiguities.extend(lane_heads.into_iter().map(
+                                |(location, transition)| {
+                                    trace!(%location, "Walking parse table");
+                                    let item = &self.lr0_parse_table[location].0;
+                                    Ambiguity {
                                         location,
-                                        transition: transition.clone(),
+                                        transition,
                                         history: history.clone(),
-                                        term_string: Arc::new(TermString {
-                                            terms,
-                                            next_term: 0,
-                                            parent: Some(term_string.clone()),
-                                        }),
-                                    }),
-                            )
+                                        term_string: TermString::new(
+                                            item.alternative
+                                                .terms
+                                                .iter()
+                                                .map(|term| term.kind.clone().into())
+                                                .collect::<Vec<_>>(),
+                                            item.index + 1,
+                                        ),
+                                    }
+                                },
+                            ));
                         }
                     }
-                    continue;
-                } else if let Some(parent) = &term_string.parent {
-                    trace!("Walking up to parent");
-                    ambiguities.push(Ambiguity {
-                        location,
-                        transition,
-                        history,
-                        term_string: parent.clone(),
-                    });
-                    continue;
                 }
-                // term_string is empty, so we must now walk the parse table.
-                let mut lane_heads = HashSet::new();
-                potential_ambiguity |= self.item_lane_heads(
-                    action.clone(),
-                    location,
-                    transition,
-                    &mut split_info,
-                    &mut lane_members,
-                    &mut lane_heads,
-                );
-                ambiguities.extend(lane_heads.into_iter().map(|(location, transition)| {
-                    trace!(%location, "Walking parse table");
-                    let item = &self.lr0_parse_table[location].0;
-                    Ambiguity {
-                        location,
-                        transition,
-                        history: history.clone(),
-                        term_string: Arc::new(TermString {
-                            terms: item
-                                .production
-                                .iter()
-                                .map(|term| term.kind.clone().into())
-                                .collect::<Vec<_>>(),
-                            next_term: item.index + 1,
-                            parent: None,
-                        }),
-                    }
-                }));
             }
             visited.extend(lane_members.into_keys().map(|idx| idx.state_id));
         }
@@ -819,7 +794,7 @@ impl<'a> LrkParseTableBuilder<'a> {
                 .map(|v| {
                     v.iter()
                         .flat_map(|ambiguity| {
-                            let mut history = ambiguity.history.iter().rev();
+                            let mut history = ambiguity.history.0.iter().rev();
                             let first = history.next().unwrap();
                             history
                                 .enumerate()
@@ -836,6 +811,8 @@ impl<'a> LrkParseTableBuilder<'a> {
             if contains_common_loops {
                 panic!("Ambiguity!");
             }
+            let span = debug_span!("make_action", %terminal);
+            let _guard = span.enter();
             let action = self.make_action(visited.clone(), conflicts, invalidate_state)?;
             match terminal {
                 Terminal::Token(_, regex) => {
@@ -948,6 +925,7 @@ impl<'a> LrkParseTableBuilder<'a> {
 fn conflicts(
     next_state: &Lr0State,
     lr0_state_id: usize,
+    grammar: &Grammar,
 ) -> HashMap<ConflictedAction, Vec<Ambiguity>> {
     let conflicts: HashMap<_, _> = next_state
         .item_set
@@ -967,9 +945,29 @@ fn conflicts(
                     ConflictedAction::Shift(terminal, next_state)
                 }
                 None => {
-                    ConflictedAction::Reduce(item.non_terminal.clone(), item.production.clone())
+                    let remaining_negative_lookahead: Vec<_> = item
+                        .alternative
+                        .negative_lookahead
+                        .as_ref()
+                        .map(|negative_lookahead| {
+                            TermString::new(
+                                vec![NormalTerm::NonTerminal(negative_lookahead.clone().into())],
+                                0,
+                            )
+                        })
+                        .into_iter()
+                        .collect();
+                    ConflictedAction::Reduce(
+                        item.non_terminal.clone(),
+                        item.alternative.clone(),
+                        remaining_negative_lookahead,
+                    )
                 }
             };
+            if conflict.contains_finished_lookahead(grammar) {
+                // If negative lookahead is finished then this action doesn't exist.
+                return None;
+            }
             let location = ItemIndex {
                 state_id: Lr0StateId(lr0_state_id),
                 item: item_idx,
@@ -979,17 +977,16 @@ fn conflicts(
                 vec![Ambiguity {
                     location,
                     transition: None,
-                    history: vec![],
-                    term_string: Arc::new(TermString {
-                        terms: item
-                            .production
+                    history: History::default(),
+                    term_string: TermString::new(
+                        item.alternative
+                            .terms
                             .iter()
                             .cloned()
                             .map(|term| term.kind.into())
                             .collect(),
-                        next_term: item.index,
-                        parent: None,
-                    }),
+                        item.index,
+                    ),
                 }],
             ))
         })
@@ -1000,7 +997,42 @@ fn conflicts(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Vec<Term>),
+    Reduce(NonTerminal, Alternative, Vec<Arc<TermString>>),
+}
+impl ConflictedAction {
+    fn with_lookahead(&self, grammar: &Grammar, terminal: Terminal) -> ConflictedAction {
+        match self {
+            ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
+                let new_negative_lookahead = remaining_negative_lookahead
+                    .iter()
+                    .flat_map(|term_string| term_string.clone().next(grammar))
+                    .filter(|(t, _)| {
+                        // Cannot be None because the action should have already
+                        // been removed in that case
+                        t.as_ref().unwrap() == &terminal
+                    })
+                    .map(|(_, term_string)| term_string)
+                    .collect();
+                ConflictedAction::Reduce(
+                    non_terminal.clone(),
+                    alternative.clone(),
+                    new_negative_lookahead,
+                )
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn contains_finished_lookahead(&self, grammar: &Grammar) -> bool {
+        match self {
+            ConflictedAction::Shift(_, _) => false,
+            ConflictedAction::Reduce(_, _, remaining_negative_lookahead) => {
+                remaining_negative_lookahead
+                    .iter()
+                    .any(|term_string| term_string.clone().next(grammar).any(|(t, _)| t.is_none()))
+            }
+        }
+    }
 }
 
 impl fmt::Display for ConflictedAction {
@@ -1009,10 +1041,10 @@ impl fmt::Display for ConflictedAction {
             ConflictedAction::Shift(terminal, id) => {
                 write!(f, "Shift({terminal}) -> {id}")?;
             }
-            ConflictedAction::Reduce(nt, ref terms) => {
-                write!(f, "Reduce({nt} ->")?;
-                for term in &**terms {
-                    write!(f, " {term}")?;
+            ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
+                write!(f, "Reduce({non_terminal} -> {alternative}")?;
+                for lookahead in remaining_negative_lookahead {
+                    write!(f, " (!>> {})", lookahead)?;
                 }
                 write!(f, ")")?;
             }
@@ -1025,8 +1057,8 @@ impl From<ConflictedAction> for Action {
     fn from(conflict: ConflictedAction) -> Self {
         match conflict {
             ConflictedAction::Shift(terminal, id) => Action::Shift(terminal, id),
-            ConflictedAction::Reduce(non_terminal, production) => {
-                Action::Reduce(non_terminal, production)
+            ConflictedAction::Reduce(non_terminal, alternative, _) => {
+                Action::Reduce(non_terminal, alternative)
             }
         }
     }
@@ -1036,7 +1068,7 @@ impl From<ConflictedAction> for Action {
 struct Ambiguity {
     location: ItemIndex,
     transition: Option<Term>,
-    history: Vec<(ItemIndex, TermString)>,
+    history: History,
     term_string: Arc<TermString>,
 }
 
@@ -1046,42 +1078,20 @@ impl fmt::Display for Ambiguity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TermString {
-    terms: Vec<NormalTerm>,
-    next_term: usize,
-    parent: Option<Arc<TermString>>,
-}
+#[derive(Debug, Default, Clone)]
+struct History(Vec<(ItemIndex, TermString)>);
 
-impl fmt::Display for TermString {
+impl fmt::Display for History {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn display(
-            this: &TermString,
-            f: &mut fmt::Formatter<'_>,
-            child: &mut dyn FnMut(&mut fmt::Formatter) -> fmt::Result,
-        ) -> fmt::Result {
-            let mut fmt_this = move |f: &mut fmt::Formatter<'_>| {
-                for (i, term) in this.terms[..this.next_term].iter().enumerate() {
-                    if i != 0 {
-                        f.write_char(' ')?;
-                    }
-                    write!(f, "{term}")?;
-                }
-                f.write_char('(')?;
-                child(f)?;
-                f.write_char(')')?;
-                for term in &this.terms[this.next_term..] {
-                    write!(f, " {term}")?;
-                }
-                Ok(())
-            };
-            if let Some(parent) = &this.parent {
-                display(parent, f, &mut fmt_this)
-            } else {
-                fmt_this(f)
+        f.write_char('[')?;
+        for (i, (location, term_string)) in self.0.iter().enumerate() {
+            write!(f, "{} ({})", location, term_string)?;
+            if i != self.0.len() - 1 {
+                f.write_str(", ")?;
             }
         }
-        display(self, f, &mut |_| Ok(()))
+        f.write_char(']')?;
+        Ok(())
     }
 }
 
@@ -1166,10 +1176,12 @@ fn normal_production(
             } else {
                 // 4 - Moor00 5
                 original_production
-                    .0
+                    .alternatives
                     .iter()
-                    .map(|rule| {
-                        rule.iter()
+                    .map(|alternative| {
+                        alternative
+                            .terms
+                            .iter()
                             .map(|term| term.kind.clone().into())
                             .collect::<Vec<_>>()
                     })
@@ -1182,10 +1194,10 @@ fn normal_production(
             // 3 - Moor00 5
             rules.extend(
                 grammar.productions[non_terminal]
-                    .0
+                    .alternatives
                     .iter()
-                    .filter_map(|rule| {
-                        let mut rule = rule.iter().map(|term| &term.kind);
+                    .filter_map(|alternative| {
+                        let mut rule = alternative.terms.iter().map(|term| &term.kind);
                         if rule
                             .by_ref()
                             .find(|term| term == &symbol || !can_be_empty(grammar, term))?
@@ -1209,28 +1221,30 @@ fn normal_production(
                         _ => None,
                     })
                     .flat_map(|nt| {
-                        grammar.productions[&nt].0.iter().filter_map(move |rule| {
-                            let mut rule = rule.iter().map(|term| &term.kind);
-                            if rule
-                                .by_ref()
-                                .find(|term| term == &symbol || !can_be_empty(grammar, term))?
-                                != symbol
-                            {
-                                return None;
-                            }
-                            // The find call above has eaten all the empty symbols,
-                            // so we can just collect the rest of the rule.
-                            Some(
-                                rule.map(|term| term.clone().into())
-                                    .chain(std::iter::once(NormalTerm::NonTerminal(
-                                        NormalNonTerminal::Minus(
-                                            non_terminal.clone(),
-                                            TermKind::NonTerminal(nt.clone()),
-                                        ),
-                                    )))
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
+                        grammar.productions[&nt].alternatives.iter().filter_map(
+                            move |alternative| {
+                                let mut rule = alternative.terms.iter().map(|term| &term.kind);
+                                if rule
+                                    .by_ref()
+                                    .find(|term| term == &symbol || !can_be_empty(grammar, term))?
+                                    != symbol
+                                {
+                                    return None;
+                                }
+                                // The find call above has eaten all the empty symbols,
+                                // so we can just collect the rest of the rule.
+                                Some(
+                                    rule.map(|term| term.clone().into())
+                                        .chain(std::iter::once(NormalTerm::NonTerminal(
+                                            NormalNonTerminal::Minus(
+                                                non_terminal.clone(),
+                                                TermKind::NonTerminal(nt.clone()),
+                                            ),
+                                        )))
+                                        .collect::<Vec<_>>(),
+                                )
+                            },
+                        )
                     }),
             );
             rules
@@ -1248,10 +1262,10 @@ fn proper_left_corners(grammar: &Grammar, non_terminal: &NonTerminal) -> HashSet
 
     while let Some(nt) = todo.pop() {
         grammar.productions[&nt]
-            .0
+            .alternatives
             .iter()
-            .flat_map(|rule| {
-                rule.iter().scan(true, |prev_empty, term| {
+            .flat_map(|alternative| {
+                alternative.terms.iter().scan(true, |prev_empty, term| {
                     let res = prev_empty.then(|| term);
                     *prev_empty = can_be_empty(grammar, &term.kind);
                     res
@@ -1276,17 +1290,20 @@ fn can_be_empty(grammar: &Grammar, term: &TermKind) -> bool {
         let TermKind::NonTerminal(nt) = term else {
             return false;
         };
-        grammar.productions[nt].0.iter().any(|alternative| {
-            alternative.iter().all(|term| {
-                if visited.insert(term.kind.clone()) {
-                    let res = inner(grammar, &term.kind, visited);
-                    visited.remove(&term.kind);
-                    res
-                } else {
-                    false
-                }
+        grammar.productions[nt]
+            .alternatives
+            .iter()
+            .any(|alternative| {
+                alternative.terms.iter().all(|term| {
+                    if visited.insert(term.kind.clone()) {
+                        let res = inner(grammar, &term.kind, visited);
+                        visited.remove(&term.kind);
+                        res
+                    } else {
+                        false
+                    }
+                })
             })
-        })
     }
     inner(grammar, term, &mut HashSet::new())
 }

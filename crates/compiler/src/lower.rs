@@ -55,8 +55,8 @@ pub fn lower(language: &Language) -> Grammar {
             NonTerminal::Goal {
                 ident: ident.clone(),
             },
-            Production(
-                [vec![
+            Production {
+                alternatives: [vec![
                     Term {
                         kind: TermKind::NonTerminal(non_terminal.clone()),
                         silent: definition.silent,
@@ -69,8 +69,9 @@ pub fn lower(language: &Language) -> Grammar {
                     },
                 ]]
                 .into_iter()
+                .map(Alternative::from)
                 .collect(),
-            ),
+            },
         );
         for (index, rule) in definition.rules.iter().enumerate() {
             let name = Name {
@@ -80,16 +81,19 @@ pub fn lower(language: &Language) -> Grammar {
             let mut production =
                 lower_rule(language, &mut productions, &mut next_anon, rule, &name);
             if name.index < definition.rules.len() - 1 {
-                production.0.insert(vec![Term {
-                    kind: TermKind::NonTerminal(NonTerminal::Named {
-                        name: Name {
-                            ident: ident.clone(),
-                            index: index + 1,
-                        },
-                    }),
-                    silent: true,
-                    atomic: false,
-                }]);
+                production.alternatives.insert(
+                    vec![Term {
+                        kind: TermKind::NonTerminal(NonTerminal::Named {
+                            name: Name {
+                                ident: ident.clone(),
+                                index: index + 1,
+                            },
+                        }),
+                        silent: true,
+                        atomic: false,
+                    }]
+                    .into(),
+                );
             }
             productions.insert(NonTerminal::Named { name }, production);
         }
@@ -104,12 +108,31 @@ fn lower_rule(
     rule: &Rule,
     current_name: &Name,
 ) -> Production {
-    Production(
-        rule.alternatives
+    Production {
+        alternatives: rule
+            .alternatives
             .iter()
             .map(|expression| {
-                expression
-                    .sequence
+                let (sequence, lookahead) = match expression.sequence.last() {
+                    Some((Item::Lookaround(lookaround_type, rule), Quantifier::Once)) => {
+                        if lookaround_type.positive || !lookaround_type.ahead {
+                            panic!("Only negative lookahead is supported");
+                        }
+                        let production =
+                            lower_rule(language, productions, next_anon, rule, current_name);
+                        let non_terminal = next_anon();
+                        productions.insert(non_terminal.clone(), production);
+                        (
+                            &expression.sequence[..expression.sequence.len() - 1],
+                            Some(non_terminal),
+                        )
+                    }
+                    Some((Item::Lookaround(_, _), _)) => {
+                        panic!("Lookaround cannot have a quantifier")
+                    }
+                    _ => (&expression.sequence[..], None),
+                };
+                let terms = sequence
                     .iter()
                     .map(|(term, quantifier)| {
                         lower_term(
@@ -121,10 +144,14 @@ fn lower_rule(
                             current_name,
                         )
                     })
-                    .collect::<Vec<Term>>()
+                    .collect::<Vec<_>>();
+                Alternative {
+                    terms,
+                    negative_lookahead: lookahead,
+                }
             })
             .collect(),
-    )
+    }
 }
 
 fn lower_term(
@@ -145,27 +172,30 @@ fn lower_term(
             Quantifier::Once,
             current_name,
         );
-        let mut production: HashSet<Vec<Term>> = HashSet::new();
+        let mut alternatives: HashSet<Alternative> = HashSet::new();
         // Zero times
         if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
-            production.insert(vec![]);
+            alternatives.insert(vec![].into());
         }
         // One time
         if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
-            production.insert(vec![term.clone()]);
+            alternatives.insert(vec![term.clone()].into());
         }
         // Many times
         if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            production.insert(vec![
-                Term {
-                    kind: TermKind::NonTerminal(non_terminal.clone()),
-                    silent: true,
-                    atomic: false,
-                },
-                term,
-            ]);
+            alternatives.insert(
+                vec![
+                    Term {
+                        kind: TermKind::NonTerminal(non_terminal.clone()),
+                        silent: true,
+                        atomic: false,
+                    },
+                    term,
+                ]
+                .into(),
+            );
         }
-        productions.insert(non_terminal.clone(), Production(production));
+        productions.insert(non_terminal.clone(), Production { alternatives });
         return Term {
             kind: TermKind::NonTerminal(non_terminal),
             silent: true,
@@ -216,6 +246,9 @@ fn lower_term(
                 silent: true,
                 atomic: false,
             }
+        }
+        Item::Lookaround(_, _) => {
+            panic!("Only negative lookahead is supported at the end of an expression")
         }
     }
 }
@@ -326,17 +359,47 @@ impl Hash for Terminal {
 }
 
 #[derive(Debug)]
-pub struct Production(pub HashSet<Vec<Term>>);
+pub struct Production {
+    pub alternatives: HashSet<Alternative>,
+}
 
 impl fmt::Display for Production {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, production) in self.0.iter().enumerate() {
+        for (i, alternative) in self.alternatives.iter().enumerate() {
             if i != 0 {
-                write!(f, " |")?;
+                write!(f, " | ")?;
             }
-            for term in production {
-                write!(f, " {term}")?;
+            write!(f, "{alternative}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Alternative {
+    pub terms: Vec<Term>,
+    pub negative_lookahead: Option<NonTerminal>,
+}
+
+impl From<Vec<Term>> for Alternative {
+    fn from(terms: Vec<Term>) -> Self {
+        Self {
+            terms,
+            negative_lookahead: None,
+        }
+    }
+}
+
+impl fmt::Display for Alternative {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, term) in self.terms.iter().enumerate() {
+            if i != 0 {
+                write!(f, " ")?;
             }
+            write!(f, "{term}")?;
+        }
+        if let Some(non_terminal) = &self.negative_lookahead {
+            write!(f, " (!>>{non_terminal})")?;
         }
         Ok(())
     }

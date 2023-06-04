@@ -5,7 +5,7 @@ use nom::{
     bytes::complete::{escaped, is_not, tag, take_until},
     character::complete::{alphanumeric1, anychar, char, space0, space1},
     combinator::{eof, map, opt, recognize, success, value},
-    multi::{count, fold_many0, many0, many1, many1_count, many_m_n, separated_list0},
+    multi::{fold_many0, many0, many1, separated_list0},
     sequence::{delimited, preceded, terminated, tuple},
 };
 use tracing::error;
@@ -13,7 +13,8 @@ use tracing::error;
 use crate::util::Interner;
 
 use super::{
-    Definition, Expression, Ident, Item, Language, Mark, ParseTree, Quantifier, Rule, Test,
+    Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
+    Rule, Test,
 };
 
 type Result<'a, T> = nom::IResult<&'a str, T>;
@@ -107,6 +108,14 @@ fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
         map(quoted_string, Item::String),
         map(regex, Item::Regex),
         map(
+            delimited(
+                char('('),
+                tuple((lookaround, |input| rule()(input))),
+                char(')'),
+            ),
+            |(lookaround_type, rule)| Item::Lookaround(lookaround_type, rule),
+        ),
+        map(
             delimited(char('('), move |input| rule()(input), char(')')),
             Item::Group,
         ),
@@ -138,16 +147,30 @@ fn quantifier(input: &str) -> Result<Quantifier> {
     )))(input)
 }
 
+fn lookaround(input: &str) -> Result<LookaroundType> {
+    map(
+        ws(tuple((
+            opt(char('!')),
+            space0,
+            alt((value(true, tag(">>")), value(false, tag("<<")))),
+        ))),
+        |(negative, _, ahead)| LookaroundType {
+            positive: negative.is_none(),
+            ahead,
+        },
+    )(input)
+}
+
 fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
     move |input| {
-        let (input, hashes) = preceded(space0, many1_count(char('#')))(input)?;
+        let (input, hashes) = preceded(space0, recognize(many1(char('#'))))(input)?;
         let (input, ident) = terminated(ws(ident()), nl)(input)?;
         let (input, test) = test_body(hashes)(input)?;
-        let (input, _) = ws(count(char('#'), hashes))(input)?;
+        let (input, _) = ws(tag(hashes))(input)?;
         let (input, _) = empty_lines(input)?;
         let (input, indent) = space0(input)?;
         let (input, parse_tree) = parse_tree(indent)(input)?;
-        let (input, _) = ws(count(char('#'), hashes))(input)?;
+        let (input, _) = ws(tag(hashes))(input)?;
         let (input, _) = empty_lines(input)?;
         Ok((
             input,
@@ -160,18 +183,12 @@ fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
     }
 }
 
-fn test_body<'a>(hashes: usize) -> impl FnMut(&'a str) -> Result<&'a str> {
-    map(
-        recognize(many0(terminated(
-            alt((recognize(many_m_n(1, hashes - 1, char('#'))), is_not("#\n"))),
-            nl,
-        ))),
-        |s: &str| match s.as_bytes() {
-            [.., b'\r', b'\n'] => &s[..s.len() - 2],
-            [.., b'\n'] => &s[..s.len() - 1],
-            _ => s,
-        },
-    )
+fn test_body<'a>(hashes: &'a str) -> impl FnMut(&'a str) -> Result<&'a str> {
+    map(take_until(hashes), |s: &str| match s.as_bytes() {
+        [.., b'\r', b'\n'] => &s[..s.len() - 2],
+        [.., b'\n'] => &s[..s.len() - 1],
+        _ => s,
+    })
 }
 
 fn parse_tree<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {

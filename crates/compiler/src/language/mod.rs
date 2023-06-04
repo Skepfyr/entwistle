@@ -90,6 +90,27 @@ pub enum Item {
     String(String),
     Regex(String),
     Group(Rule),
+    Lookaround(LookaroundType, Rule),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LookaroundType {
+    pub positive: bool,
+    pub ahead: bool,
+}
+
+impl fmt::Display for LookaroundType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.positive {
+            write!(f, "!")?;
+        }
+        if self.ahead {
+            write!(f, ">>")?;
+        } else {
+            write!(f, "<<")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

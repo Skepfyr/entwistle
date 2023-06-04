@@ -54,12 +54,13 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                 });
                 states.push(*new_state);
             }
-            Action::Reduce(non_terminal, terms) => {
-                let nodes = forest.split_off(forest.len().checked_sub(terms.len()).unwrap());
-                states.truncate(states.len().checked_sub(terms.len()).unwrap());
+            Action::Reduce(non_terminal, alternative) => {
+                let nodes =
+                    forest.split_off(forest.len().checked_sub(alternative.terms.len()).unwrap());
+                states.truncate(states.len().checked_sub(alternative.terms.len()).unwrap());
                 let ident = match non_terminal {
                     NonTerminal::Goal { .. } => {
-                        if terms[0].atomic {
+                        if alternative.terms[0].atomic {
                             break ParseTree::Leaf {
                                 ident: nodes[0].ident().cloned(),
                                 data: nodes[0].data(),
@@ -76,7 +77,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
 
                 let nodes = nodes
                     .into_iter()
-                    .zip(terms)
+                    .zip(&alternative.terms)
                     .flat_map(|(node, term)| match term {
                         Term {
                             kind: _,
