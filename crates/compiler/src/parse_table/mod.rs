@@ -9,9 +9,8 @@ use std::{
 
 use indenter::indented;
 use regex_automata::{
-    dfa::{dense, Automaton},
-    nfa::thompson,
-    MatchKind, PatternID, SyntaxConfig,
+    nfa::thompson::{State as NfaState, NFA},
+    PatternID,
 };
 use tracing::{debug, debug_span, trace};
 
@@ -72,11 +71,10 @@ pub struct State {
     pub goto: HashMap<NonTerminal, StateId>,
 }
 
-pub(crate) type Dfa = dense::DFA<Vec<u32>>;
 #[derive(Debug, Clone)]
 pub enum Action {
     Ambiguous {
-        dfa: Dfa,
+        nfa: NFA,
         regexes: Vec<String>,
         actions: Vec<Action>,
         eoi: HashMap<Ident, Action>,
@@ -94,7 +92,7 @@ impl fmt::Display for Action {
         ) -> fmt::Result {
             match action {
                 Action::Ambiguous {
-                    dfa: _,
+                    nfa: _,
                     regexes,
                     actions,
                     eoi,
@@ -134,13 +132,13 @@ impl PartialEq for Action {
         match (self, other) {
             (
                 Self::Ambiguous {
-                    dfa: _,
+                    nfa: _,
                     regexes: l_regexes,
                     actions: l_actions,
                     eoi: l_eoi,
                 },
                 Self::Ambiguous {
-                    dfa: _,
+                    nfa: _,
                     regexes: r_regexes,
                     actions: r_actions,
                     eoi: r_eoi,
@@ -825,23 +823,15 @@ impl<'a> LrkParseTableBuilder<'a> {
             };
         }
 
-        let dfa = dense::Builder::new()
-            .configure(
-                dense::Config::new()
-                    .anchored(true)
-                    // FIXME: Is it valid to use All and leftmost find?
-                    .match_kind(MatchKind::All)
-                    .minimize(true),
-            )
-            .syntax(SyntaxConfig::new())
-            .thompson(thompson::Config::new())
+        let nfa = NFA::compiler()
+            .configure(NFA::config().shrink(true))
             .build_many(&regexes)
             .unwrap();
 
-        validate_dfa(&dfa, &regexes);
+        validate_nfa(&nfa, &regexes);
 
         Some(Action::Ambiguous {
-            dfa,
+            nfa,
             regexes,
             actions,
             eoi,
@@ -1309,14 +1299,41 @@ fn can_be_empty(grammar: &Grammar, term: &TermKind) -> bool {
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.
-fn validate_dfa(dfa: &Dfa, regexes: &[String]) {
-    assert!(!dfa.has_starts_for_each_pattern());
-    let start = dfa.start_state_forward(None, &[], 0, 0);
+fn validate_nfa(nfa: &NFA, regexes: &[String]) {
+    assert!(nfa.pattern_len() == regexes.len());
+    let mut start = BTreeSet::new();
+    start.insert(nfa.start_anchored());
     let mut to_visit = vec![(start, None::<PatternID>)];
-    let mut coloured = HashMap::new();
-    while let Some((state, mut new_colour)) = to_visit.pop() {
-        if let Some(old_colour) = coloured.get(&state).copied() {
-            if let Some(new_colour) = new_colour {
+    let mut visited = HashMap::new();
+    while let Some((mut states, mut new_colour)) = to_visit.pop() {
+        loop {
+            let mut to_add = Vec::new();
+            for &id in &states {
+                match nfa.state(id) {
+                    &NfaState::Look { look: _, next } => to_add.push(next),
+                    NfaState::Union { alternates } => to_add.extend(alternates.iter().copied()),
+                    &NfaState::BinaryUnion { alt1, alt2 } => {
+                        to_add.push(alt1);
+                        to_add.push(alt2);
+                    }
+                    &NfaState::Capture { next, .. } => to_add.push(next),
+                    NfaState::ByteRange { .. }
+                    | NfaState::Sparse(_)
+                    | NfaState::Dense(_)
+                    | NfaState::Fail
+                    | NfaState::Match { .. } => {}
+                }
+            }
+            let mut modified = false;
+            for state in to_add {
+                modified |= states.insert(state);
+            }
+            if !modified {
+                break;
+            }
+        }
+        if let Some(old_colour) = visited.get(&states).copied() {
+            if let (Some(old_colour), Some(new_colour)) = (old_colour, new_colour) {
                 if new_colour != old_colour {
                     panic!(
                         "Conflicting tokens: {} and {}",
@@ -1326,38 +1343,55 @@ fn validate_dfa(dfa: &Dfa, regexes: &[String]) {
                 }
             }
             continue;
-        } else if let Some(new_colour) = new_colour {
-            assert!(coloured.insert(state, new_colour).is_none());
         }
-        let eoi_state = dfa.next_eoi_state(state);
-        if dfa.is_match_state(eoi_state) {
-            let match_count = dfa.match_count(eoi_state);
-            let intrinsic_colour = dfa.match_pattern(eoi_state, 0);
-            if match_count > 1 {
-                panic!(
-                    "Multiple tokens conflict:{}",
-                    (0..match_count)
-                        .map(|i| &regexes[dfa.match_pattern(eoi_state, i).as_usize()])
-                        .flat_map(|r| [" ", r])
-                        .collect::<String>()
-                );
-            } else if new_colour.is_some_and(|new_colour| new_colour != intrinsic_colour) {
+        let mut intrinsic_colour: Option<PatternID> = None;
+        for &state in &states {
+            if let &NfaState::Match {
+                pattern_id: this_colour,
+            } = nfa.state(state)
+            {
+                if let Some(other_colour) = intrinsic_colour {
+                    if other_colour != this_colour {
+                        panic!(
+                            "Conflicting tokens: {} and {}",
+                            regexes[other_colour.as_usize()],
+                            regexes[this_colour.as_usize()]
+                        );
+                    }
+                } else {
+                    intrinsic_colour = Some(this_colour);
+                }
+            }
+        }
+        if let (Some(intrinsic_colour), Some(new_colour)) = (intrinsic_colour, new_colour) {
+            if new_colour != intrinsic_colour {
                 panic!(
                     "Conflicting tokens: {} and {}",
                     regexes[intrinsic_colour.as_usize()],
-                    regexes[new_colour.unwrap().as_usize()]
+                    regexes[new_colour.as_usize()]
                 );
             }
-            new_colour = Some(intrinsic_colour);
         }
-        if let Some(new_colour) = new_colour {
-            coloured.insert(state, new_colour);
-        }
+        new_colour = new_colour.or(intrinsic_colour);
         for i in 0..=u8::MAX {
-            let next = dfa.next_state(state, i);
-            if !dfa.is_dead_state(next) {
-                to_visit.push((next, new_colour));
+            let next_states: BTreeSet<_> = states
+                .iter()
+                .flat_map(|id| match nfa.state(*id) {
+                    NfaState::ByteRange { trans } => trans.matches_byte(i).then_some(trans.next),
+                    NfaState::Sparse(trans) => trans.matches_byte(i),
+                    NfaState::Dense(trans) => trans.matches_byte(i),
+                    NfaState::Look { .. }
+                    | NfaState::Union { .. }
+                    | NfaState::BinaryUnion { .. }
+                    | NfaState::Capture { .. }
+                    | NfaState::Fail
+                    | NfaState::Match { .. } => None,
+                })
+                .collect();
+            if !next_states.is_empty() {
+                to_visit.push((next_states, new_colour));
             }
         }
+        visited.insert(states, new_colour);
     }
 }

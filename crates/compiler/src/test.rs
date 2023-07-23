@@ -1,4 +1,4 @@
-use regex_automata::dfa::Automaton;
+use regex_automata::{nfa::thompson::pikevm::PikeVM, Anchored, Input};
 use tracing::instrument;
 
 use crate::{
@@ -11,41 +11,54 @@ use crate::{
 pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
     let mut states = vec![parse_table.start_states[&test.ident]];
     let mut forest = vec![];
-    let mut input: &str = &test.test;
+    let input = Input::new(&*test.test).anchored(Anchored::Yes);
+    let mut offset = 0;
     let tree = loop {
         let state = &parse_table[*states.last().unwrap()];
         let action = {
             let mut action = &state.action;
             let mut lookahead = 0;
             loop {
-                let Action::Ambiguous { dfa, regexes: _, actions, eoi } = action else { break };
-                if input.len() == lookahead {
+                let Action::Ambiguous {
+                    nfa,
+                    regexes: _,
+                    actions,
+                    eoi,
+                } = action
+                else {
+                    break;
+                };
+                if input.get_span().len() == offset + lookahead {
                     action = &eoi[&test.ident];
                     break;
                 } else {
-                    let half_match = dfa
-                        .find_leftmost_fwd(input[lookahead..].as_bytes())
-                        .unwrap()
+                    let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
+                    let half_match = pike_vm
+                        .find(
+                            &mut pike_vm.create_cache(),
+                            input.clone().range((offset + lookahead)..),
+                        )
                         .expect("No matches");
                     action = &actions[half_match.pattern().as_usize()];
-                    lookahead += half_match.offset();
+                    lookahead += half_match.len();
                 }
             }
             action
         };
         match action {
             Action::Ambiguous { .. } => unreachable!(),
-            Action::Shift(Terminal::Token(dfa, _), new_state) => {
-                let half_match = dfa
-                    .find_leftmost_fwd(input.as_bytes())
-                    .unwrap()
+            Action::Shift(Terminal::Token(nfa, _), new_state) => {
+                let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
+                let half_match = pike_vm
+                    .find(&mut pike_vm.create_cache(), input.clone().range(offset..))
                     .expect("No matches");
                 forest.push(ParseTree::Leaf {
                     ident: None,
-                    data: input[..half_match.offset()].to_owned(),
+                    data: String::from_utf8(input.haystack()[half_match.range()].to_owned())
+                        .unwrap(),
                 });
                 states.push(*new_state);
-                input = &input[half_match.offset()..];
+                offset = half_match.end();
             }
             Action::Shift(Terminal::EndOfInput(_), new_state) => {
                 forest.push(ParseTree::Leaf {

@@ -5,16 +5,9 @@ use std::{
     hash::Hash,
 };
 
-use regex_automata::{
-    dfa::{dense, Automaton},
-    nfa::thompson,
-    MatchKind, SyntaxConfig,
-};
+use regex_automata::nfa::thompson::NFA;
 
-use crate::{
-    language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule},
-    parse_table::Dfa,
-};
+use crate::language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule};
 
 #[derive(Debug)]
 pub struct Grammar {
@@ -288,29 +281,20 @@ impl fmt::Display for Name {
 
 #[derive(Debug, Clone)]
 pub enum Terminal {
-    Token(Dfa, String),
+    Token(NFA, String),
     EndOfInput(Ident),
 }
 
 impl Terminal {
     fn new_token(regex: String) -> Self {
-        let dfa = dense::Builder::new()
-            .configure(
-                dense::Config::new()
-                    .anchored(true)
-                    .match_kind(MatchKind::LeftmostFirst)
-                    .minimize(true),
-            )
-            .syntax(SyntaxConfig::new())
-            .thompson(thompson::Config::new())
+        let nfa = NFA::compiler()
+            .configure(NFA::config().shrink(true))
             .build(&regex)
-            .unwrap();
-        let start = dfa.start_state_forward(None, &[], 0, 0);
-        let empty = dfa.next_eoi_state(start);
-        if dfa.is_match_state(empty) {
+            .expect("Invalid regex");
+        if nfa.has_empty() {
             panic!("token {} matches empty string", regex);
         }
-        Self::Token(dfa, regex)
+        Self::Token(nfa, regex)
     }
 }
 
