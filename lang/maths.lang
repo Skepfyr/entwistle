@@ -5,15 +5,15 @@ Statement:
   Variable _ '=' _ Expression
   Expression
 
-## Statement
+== Statement
 a = b
-##
+==
 Statement:
   Variable: "a"
   "="
   Expression:
     Variable: "b"
-##
+==
 
 Expression:
   Expression _ ('+' | '-') _ ~Expression
@@ -24,9 +24,9 @@ Expression:
   Number
   Variable
 
-## Expression
+== Expression
 1 + 2 * 3 + -4.0
-##
+==
 Expression:
   Expression:
     Expression:
@@ -43,16 +43,16 @@ Expression:
     "-"
     Expression:
       Number: "4.0"
-##
+==
 
 @Number: /\d[\d_]*(.\d+)?/
 @Variable: /[[:alpha:]][\w_]*/
 
-## Number
+== Number
 3.14159265
-##
+==
 Number: "3.14159265"
-##
+==
 
 -@_: /\s+/?
 -@nl: '\n'

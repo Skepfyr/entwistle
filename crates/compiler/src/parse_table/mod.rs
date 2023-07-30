@@ -1310,6 +1310,8 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
             let mut to_add = Vec::new();
             for &id in &states {
                 match nfa.state(id) {
+                    // This is overzealous and will flag word boundaries etc as
+                    // clashing when they actually aren't.
                     &NfaState::Look { look: _, next } => to_add.push(next),
                     NfaState::Union { alternates } => to_add.extend(alternates.iter().copied()),
                     &NfaState::BinaryUnion { alt1, alt2 } => {

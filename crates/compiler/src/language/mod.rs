@@ -68,9 +68,10 @@ impl Language {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
-    pub ident: Ident,
     pub silent: bool,
     pub atomic: bool,
+    pub ident: Ident,
+    pub generics: Vec<Ident>,
     pub rules: Vec<Rule>,
 }
 
@@ -86,7 +87,7 @@ pub struct Expression {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Item {
-    Ident { mark: Mark, ident: Ident },
+    Ident { mark: Mark, ident: Ident, generics: Vec<Expression> },
     String(String),
     Regex(String),
     Group(Rule),

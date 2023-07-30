@@ -38,9 +38,15 @@ pub fn lower(language: &Language) -> Grammar {
             [definition] => definition,
             _ => panic!("Should have exactly one rule"),
         };
+        if !definition.generics.is_empty() {
+            // Don't need to generate productions for uninstantiated generics
+            // (we don't even know what to instantiate them with here).
+            continue;
+        }
         let non_terminal = NonTerminal::Named {
             name: Name {
                 ident: ident.clone(),
+                generics: Vec::new(),
                 index: 0,
             },
         };
@@ -69,6 +75,7 @@ pub fn lower(language: &Language) -> Grammar {
         for (index, rule) in definition.rules.iter().enumerate() {
             let name = Name {
                 ident: ident.clone(),
+                generics: Vec::new(),
                 index,
             };
             let mut production =
@@ -79,6 +86,7 @@ pub fn lower(language: &Language) -> Grammar {
                         kind: TermKind::NonTerminal(NonTerminal::Named {
                             name: Name {
                                 ident: ident.clone(),
+                                generics: Vec::new(),
                                 index: index + 1,
                             },
                         }),
@@ -197,10 +205,15 @@ fn lower_term(
     }
 
     match item {
-        Item::Ident { mark, ident } => {
+        Item::Ident {
+            mark,
+            ident,
+            generics,
+        } => {
             let name = if ident == &current_name.ident {
                 Name {
                     ident: current_name.ident.clone(),
+                    generics: generics.clone(),
                     index: match mark {
                         Mark::Super => 0,
                         Mark::This => current_name.index,
@@ -270,12 +283,25 @@ impl fmt::Display for NonTerminal {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Name {
     pub ident: Ident,
+    pub generics: Vec<NonTerminal>,
     pub index: usize,
 }
 
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}#{}", self.ident, self.index)
+        write!(f, "{}", self.ident)?;
+        if self.generics.is_empty() {
+            f.write_char('[')?;
+            for (i, generic) in self.generics.iter().enumerate() {
+                if i != 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", generic)?;
+            }
+            f.write_char(']')?;
+        }
+        write!(f, "#{}", self.index)?;
+        Ok(())
     }
 }
 
