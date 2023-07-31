@@ -1,57 +1,30 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::BTreeSet,
     fmt::{self, Write as _},
     hash::Hash,
 };
 
 use regex_automata::nfa::thompson::NFA;
 
-use crate::language::{Definition, Ident, Item, Language, Mark, Quantifier, Rule};
+use crate::language::{Definition, Expression, Ident, Item, Language, Mark, Quantifier, Rule};
 
-#[derive(Debug)]
-pub struct Grammar {
-    pub productions: HashMap<NonTerminal, Production>,
-}
-
-impl fmt::Display for Grammar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (nt, production) in &self.productions {
-            writeln!(f, "{nt}: {production}")?;
-        }
-        Ok(())
-    }
-}
-
-pub fn lower(language: &Language) -> Grammar {
-    let mut productions = HashMap::new();
-    let mut next_anon = {
-        let mut next_index = 0;
-        move || {
-            let index = next_index;
-            next_index += 1;
-            NonTerminal::Anonymous { index }
-        }
-    };
-    for (ident, definitions) in &language.definitions {
-        let definition: &Definition = match definitions.as_slice() {
-            [definition] => definition,
-            _ => panic!("Should have exactly one rule"),
-        };
-        let non_terminal = NonTerminal::Named {
-            name: Name {
-                ident: ident.clone(),
-                index: 0,
-            },
-        };
-        productions.insert(
-            NonTerminal::Goal {
-                ident: ident.clone(),
-            },
+pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production {
+    match non_terminal {
+        NonTerminal::Goal { ident } => {
+            let definition: &Definition = match language.definitions[ident].as_slice() {
+                [definition] => definition,
+                _ => panic!("Should have exactly one rule"),
+            };
             Production {
                 alternatives: [vec![
                     Term {
-                        kind: TermKind::NonTerminal(non_terminal.clone()),
+                        kind: TermKind::NonTerminal(NonTerminal::Named {
+                            name: Name {
+                                ident: ident.clone(),
+                                index: 0,
+                            },
+                        }),
                         silent: definition.silent,
                         atomic: definition.atomic,
                     },
@@ -64,22 +37,87 @@ pub fn lower(language: &Language) -> Grammar {
                 .into_iter()
                 .map(Alternative::from)
                 .collect(),
-            },
-        );
-        for (index, rule) in definition.rules.iter().enumerate() {
-            let name = Name {
-                ident: ident.clone(),
-                index,
+            }
+        }
+        NonTerminal::Named { name } => {
+            let definition: &Definition = match language.definitions[&name.ident].as_slice() {
+                [definition] => definition,
+                _ => panic!("Should have exactly one rule"),
             };
-            let mut production =
-                lower_rule(language, &mut productions, &mut next_anon, rule, &name);
-            if name.index < definition.rules.len() - 1 {
-                production.alternatives.insert(
+            if definition.rules.is_empty() {
+                if name.index > 0 {
+                    panic!(
+                        "Unexpected index {} for empty definition for {}",
+                        name.index, name.ident
+                    );
+                }
+                return Production {
+                    alternatives: vec![],
+                };
+            }
+            fn contains_this_sub(this: &Ident, rule: &Rule) -> (bool, bool) {
+                let mut contains_this = false;
+                let mut contains_sub = false;
+                for alternative in &rule.alternatives {
+                    for (item, _) in &alternative.sequence {
+                        match item {
+                            Item::Ident { mark, ident } if ident == this => {
+                                contains_this |= mark == &Mark::This;
+                                contains_sub |= mark == &Mark::Sub;
+                            }
+                            Item::Group(inner_rule) => {
+                                let (this, sub) = contains_this_sub(this, inner_rule);
+                                contains_this |= this;
+                                contains_sub |= sub;
+                            }
+                            _ => {}
+                        }
+                        if contains_this && contains_sub {
+                            return (true, true);
+                        }
+                    }
+                }
+                (contains_this, contains_sub)
+            }
+            // Whether this rule contains a split below it.
+            let splits = definition
+                .rules
+                .iter()
+                .map(|rule| contains_this_sub(&name.ident, rule))
+                .chain(Some((false, false)))
+                .scan(false, |prev_split_below, (this, sub)| {
+                    let split_above = *prev_split_below || this;
+                    *prev_split_below = sub;
+                    Some(split_above)
+                })
+                .skip(1);
+            let mut index = name.index;
+            let mut first = 0;
+            let mut last = 0;
+            for (i, split_below) in splits.enumerate() {
+                last = i + 1;
+                if split_below {
+                    if index == 0 {
+                        break;
+                    }
+                    index -= 1;
+                    first = last;
+                }
+            }
+            if index > 0 {
+                panic!("Index {} out of bounds for {}", name.index, name.ident);
+            }
+            let mut alternatives: Vec<_> = definition.rules[first..last]
+                .iter()
+                .flat_map(|rule| lower_rule(language, rule, Some(name)).alternatives)
+                .collect();
+            if last != definition.rules.len() {
+                alternatives.push(
                     vec![Term {
                         kind: TermKind::NonTerminal(NonTerminal::Named {
                             name: Name {
-                                ident: ident.clone(),
-                                index: index + 1,
+                                ident: name.ident.clone(),
+                                index: name.index + 1,
                             },
                         }),
                         silent: true,
@@ -88,19 +126,46 @@ pub fn lower(language: &Language) -> Grammar {
                     .into(),
                 );
             }
-            productions.insert(NonTerminal::Named { name }, production);
+            Production { alternatives }
+        }
+        NonTerminal::Anonymous { rule, context } => {
+            if rule.alternatives.len() == 1
+                && rule.alternatives.iter().next().unwrap().sequence.len() == 1
+            {
+                let (item, quantifier) = &rule.alternatives.iter().next().unwrap().sequence[0];
+                let term = lower_term(language, item, Quantifier::Once, context.as_ref());
+                let mut alternatives: Vec<Alternative> = Vec::new();
+                // Zero times
+                if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
+                    alternatives.push(vec![].into());
+                }
+                // One time
+                if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
+                    alternatives.push(vec![term.clone()].into());
+                }
+                // Many times
+                if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
+                    alternatives.push(
+                        vec![
+                            Term {
+                                kind: TermKind::NonTerminal(non_terminal.clone()),
+                                silent: true,
+                                atomic: false,
+                            },
+                            term,
+                        ]
+                        .into(),
+                    );
+                }
+                Production { alternatives }
+            } else {
+                lower_rule(language, rule, context.as_ref())
+            }
         }
     }
-    Grammar { productions }
 }
 
-fn lower_rule(
-    language: &Language,
-    productions: &mut HashMap<NonTerminal, Production>,
-    next_anon: &mut impl FnMut() -> NonTerminal,
-    rule: &Rule,
-    current_name: &Name,
-) -> Production {
+fn lower_rule(language: &Language, rule: &Rule, current_name: Option<&Name>) -> Production {
     Production {
         alternatives: rule
             .alternatives
@@ -111,13 +176,9 @@ fn lower_rule(
                         if lookaround_type.positive || !lookaround_type.ahead {
                             panic!("Only negative lookahead is supported");
                         }
-                        let production =
-                            lower_rule(language, productions, next_anon, rule, current_name);
-                        let non_terminal = next_anon();
-                        productions.insert(non_terminal.clone(), production);
                         (
                             &expression.sequence[..expression.sequence.len() - 1],
-                            Some(non_terminal),
+                            Some(NonTerminal::new_anonymous(rule.clone(), current_name)),
                         )
                     }
                     Some((Item::Lookaround(_, _), _)) => {
@@ -127,16 +188,7 @@ fn lower_rule(
                 };
                 let terms = sequence
                     .iter()
-                    .map(|(term, quantifier)| {
-                        lower_term(
-                            language,
-                            productions,
-                            next_anon,
-                            term,
-                            *quantifier,
-                            current_name,
-                        )
-                    })
+                    .map(|(term, quantifier)| lower_term(language, term, *quantifier, current_name))
                     .collect::<Vec<_>>();
                 Alternative {
                     terms,
@@ -149,48 +201,20 @@ fn lower_rule(
 
 fn lower_term(
     language: &Language,
-    productions: &mut HashMap<NonTerminal, Production>,
-    next_anon: &mut impl FnMut() -> NonTerminal,
     item: &Item,
     quantifier: Quantifier,
-    current_name: &Name,
+    current_name: Option<&Name>,
 ) -> Term {
     if quantifier != Quantifier::Once {
-        let non_terminal = next_anon();
-        let term = lower_term(
-            language,
-            productions,
-            next_anon,
-            item,
-            Quantifier::Once,
-            current_name,
-        );
-        let mut alternatives: HashSet<Alternative> = HashSet::new();
-        // Zero times
-        if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
-            alternatives.insert(vec![].into());
-        }
-        // One time
-        if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
-            alternatives.insert(vec![term.clone()].into());
-        }
-        // Many times
-        if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-            alternatives.insert(
-                vec![
-                    Term {
-                        kind: TermKind::NonTerminal(non_terminal.clone()),
-                        silent: true,
-                        atomic: false,
-                    },
-                    term,
-                ]
-                .into(),
-            );
-        }
-        productions.insert(non_terminal.clone(), Production { alternatives });
+        let mut alternatives = BTreeSet::new();
+        alternatives.insert(Expression {
+            sequence: vec![(item.clone(), quantifier)],
+        });
         return Term {
-            kind: TermKind::NonTerminal(non_terminal),
+            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
+                Rule { alternatives },
+                current_name,
+            )),
             silent: true,
             atomic: false,
         };
@@ -198,20 +222,19 @@ fn lower_term(
 
     match item {
         Item::Ident { mark, ident } => {
-            let name = if ident == &current_name.ident {
-                Name {
+            let name = match current_name {
+                Some(current_name) if ident == &current_name.ident => Name {
                     ident: current_name.ident.clone(),
                     index: match mark {
                         Mark::Super => 0,
                         Mark::This => current_name.index,
                         Mark::Sub => current_name.index + 1,
                     },
-                }
-            } else {
-                Name {
+                },
+                _ => Name {
                     ident: ident.clone(),
                     index: 0,
-                }
+                },
             };
             let definition = &language.definitions[ident][0];
             Term {
@@ -230,16 +253,11 @@ fn lower_term(
             silent: false,
             atomic: true,
         },
-        Item::Group(rule) => {
-            let non_terminal = next_anon();
-            let production = lower_rule(language, productions, next_anon, rule, current_name);
-            productions.insert(non_terminal.clone(), production);
-            Term {
-                kind: TermKind::NonTerminal(non_terminal),
-                silent: true,
-                atomic: false,
-            }
-        }
+        Item::Group(rule) => Term {
+            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(rule.clone(), current_name)),
+            silent: true,
+            atomic: false,
+        },
         Item::Lookaround(_, _) => {
             panic!("Only negative lookahead is supported at the end of an expression")
         }
@@ -250,7 +268,27 @@ fn lower_term(
 pub enum NonTerminal {
     Goal { ident: Ident },
     Named { name: Name },
-    Anonymous { index: u32 },
+    Anonymous { rule: Rule, context: Option<Name> },
+}
+
+impl NonTerminal {
+    fn new_anonymous(rule: Rule, context: Option<&Name>) -> NonTerminal {
+        fn contains_non_super_ident(rule: &Rule, context: &Ident) -> bool {
+            rule.alternatives
+                .iter()
+                .flat_map(|expression| &expression.sequence)
+                .any(|(item, _)| match item {
+                    Item::Ident { mark, ident } => ident == context && mark != &Mark::Super,
+                    Item::String(_) | Item::Regex(_) => false,
+                    Item::Group(rule) => contains_non_super_ident(rule, context),
+                    Item::Lookaround(_, rule) => contains_non_super_ident(rule, context),
+                })
+        }
+        let context = context
+            .filter(|name| contains_non_super_ident(&rule, &name.ident))
+            .cloned();
+        NonTerminal::Anonymous { rule, context }
+    }
 }
 
 impl fmt::Display for NonTerminal {
@@ -262,7 +300,10 @@ impl fmt::Display for NonTerminal {
             NonTerminal::Named { name } => {
                 write!(f, "{name}")
             }
-            NonTerminal::Anonymous { index } => write!(f, "#{index}"),
+            NonTerminal::Anonymous { rule, context } => match context {
+                Some(context) => write!(f, "{{{rule}}}#{context}"),
+                None => write!(f, "{{{rule}}}"),
+            },
         }
     }
 }
@@ -275,7 +316,11 @@ pub struct Name {
 
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}#{}", self.ident, self.index)
+        write!(f, "{}", self.ident)?;
+        if self.index > 0 {
+            write!(f, "#{}", self.index)?;
+        }
+        Ok(())
     }
 }
 
@@ -342,9 +387,9 @@ impl Hash for Terminal {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Production {
-    pub alternatives: HashSet<Alternative>,
+    pub alternatives: Vec<Alternative>,
 }
 
 impl fmt::Display for Production {

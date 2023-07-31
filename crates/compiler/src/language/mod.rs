@@ -79,9 +79,33 @@ pub struct Rule {
     pub alternatives: BTreeSet<Expression>,
 }
 
+impl fmt::Display for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, expression) in self.alternatives.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" | ")?;
+            }
+            write!(f, "{expression}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Expression {
     pub sequence: Vec<(Item, Quantifier)>,
+}
+
+impl fmt::Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (item, quantifier)) in self.sequence.iter().enumerate() {
+            if i > 0 {
+                f.write_char(' ')?;
+            }
+            write!(f, "{item}{quantifier}")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,6 +115,29 @@ pub enum Item {
     Regex(String),
     Group(Rule),
     Lookaround(LookaroundType, Rule),
+}
+
+impl fmt::Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Item::Ident { mark, ident } => {
+                write!(f, "{mark}{ident}")?;
+            }
+            Item::String(string) => {
+                write!(f, "{string:?}")?;
+            }
+            Item::Regex(regex) => {
+                write!(f, "/{regex}/")?;
+            }
+            Item::Group(rule) => {
+                write!(f, "({rule})")?;
+            }
+            Item::Lookaround(lookaround_type, rule) => {
+                write!(f, "({lookaround_type} {rule})")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,11 +168,34 @@ pub enum Quantifier {
     Any,
 }
 
+impl fmt::Display for Quantifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Quantifier::Once => {}
+            Quantifier::AtMostOnce => f.write_char('?')?,
+            Quantifier::AtLeastOnce => f.write_char('+')?,
+            Quantifier::Any => f.write_char('*')?,
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mark {
     Super,
     This,
     Sub,
+}
+
+impl fmt::Display for Mark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Mark::Super => f.write_char('^')?,
+            Mark::This => {}
+            Mark::Sub => f.write_char('$')?,
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

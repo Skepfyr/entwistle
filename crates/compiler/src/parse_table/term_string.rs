@@ -6,8 +6,8 @@ use std::{
 use tracing::trace;
 
 use crate::{
-    lower::{Grammar, Terminal},
-    parse_table::{normal_production, NormalTerm},
+    lower::Terminal,
+    parse_table::{normal_production, NormalTerm}, language::Language,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,8 +26,8 @@ impl TermString {
         })
     }
 
-    pub fn next(self: Arc<Self>, grammar: &Grammar) -> Iter {
-        Iter::new(self, grammar)
+    pub fn next(self: Arc<Self>, language: &Language) -> Iter {
+        Iter::new(self, language)
     }
 
     pub fn with_no_parent(&self) -> TermString {
@@ -74,11 +74,11 @@ impl fmt::Display for TermString {
 #[derive(Debug, Clone)]
 pub struct Iter<'a> {
     stack: Vec<Arc<TermString>>,
-    grammar: &'a Grammar,
+    grammar: &'a Language,
 }
 
 impl<'a> Iter<'a> {
-    fn new(term_string: Arc<TermString>, grammar: &'a Grammar) -> Self {
+    fn new(term_string: Arc<TermString>, grammar: &'a Language) -> Self {
         Self {
             stack: vec![term_string],
             grammar,

@@ -85,7 +85,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     NonTerminal::Named {
                         name: Name { ident, .. },
                     } => ident.clone(),
-                    NonTerminal::Anonymous { index } => Ident(format!("#{index}").into()),
+                    NonTerminal::Anonymous { .. } => Ident("anon".into()),
                 };
 
                 let nodes = nodes
