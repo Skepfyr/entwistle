@@ -140,7 +140,9 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                     alternatives.push(vec![].into());
                 }
                 // One time
-                if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce = quantifier {
+                if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce | Quantifier::Once =
+                    quantifier
+                {
                     alternatives.push(vec![term.clone()].into());
                 }
                 // Many times
