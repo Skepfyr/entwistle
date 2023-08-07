@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as _},
     hash::Hash,
 };
@@ -16,6 +16,9 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 [definition] => definition,
                 _ => panic!("Should have exactly one rule"),
             };
+            if !definition.generics.is_empty() {
+                panic!("Unexpected generics for goal {ident}");
+            }
             Production {
                 alternatives: [vec![
                     Term {
@@ -24,6 +27,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                                 ident: ident.clone(),
                                 index: 0,
                             },
+                            generics: Vec::new(),
                         }),
                         silent: definition.silent,
                         atomic: definition.atomic,
@@ -39,11 +43,27 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 .collect(),
             }
         }
-        NonTerminal::Named { name } => {
+        NonTerminal::Named {
+            name,
+            generics: generic_parameters,
+        } => {
             let definition: &Definition = match language.definitions[&name.ident].as_slice() {
                 [definition] => definition,
                 _ => panic!("Should have exactly one rule"),
             };
+            if definition.generics.len() != generic_parameters.len() {
+                panic!(
+                    "Expected {} generics for {}, found {}",
+                    definition.generics.len(),
+                    name.ident,
+                    generic_parameters.len()
+                );
+            }
+            let generics = std::iter::Iterator::zip(
+                definition.generics.iter().cloned(),
+                generic_parameters.iter().cloned(),
+            )
+            .collect();
             if definition.rules.is_empty() {
                 if name.index > 0 {
                     panic!(
@@ -61,7 +81,11 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 for alternative in &rule.alternatives {
                     for (item, _) in &alternative.sequence {
                         match item {
-                            Item::Ident { mark, ident } if ident == this => {
+                            Item::Ident {
+                                mark,
+                                ident,
+                                generics: _,
+                            } if ident == this => {
                                 contains_this |= mark == &Mark::This;
                                 contains_sub |= mark == &Mark::Sub;
                             }
@@ -109,7 +133,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
             }
             let mut alternatives: Vec<_> = definition.rules[first..last]
                 .iter()
-                .flat_map(|rule| lower_rule(language, rule, Some(name)).alternatives)
+                .flat_map(|rule| lower_rule(language, rule, Some(name), &generics).alternatives)
                 .collect();
             if last != definition.rules.len() {
                 alternatives.push(
@@ -119,6 +143,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                                 ident: name.ident.clone(),
                                 index: name.index + 1,
                             },
+                            generics: generic_parameters.clone(),
                         }),
                         silent: true,
                         atomic: false,
@@ -128,12 +153,16 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
             }
             Production { alternatives }
         }
-        NonTerminal::Anonymous { rule, context } => {
+        NonTerminal::Anonymous {
+            rule,
+            context,
+            generics,
+        } => {
             if rule.alternatives.len() == 1
                 && rule.alternatives.iter().next().unwrap().sequence.len() == 1
             {
                 let (item, quantifier) = &rule.alternatives.iter().next().unwrap().sequence[0];
-                let term = lower_term(language, item, Quantifier::Once, context.as_ref());
+                let term = lower_term(language, generics, item, Quantifier::Once, context.as_ref());
                 let mut alternatives: Vec<Alternative> = Vec::new();
                 // Zero times
                 if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
@@ -161,13 +190,18 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 }
                 Production { alternatives }
             } else {
-                lower_rule(language, rule, context.as_ref())
+                lower_rule(language, rule, context.as_ref(), generics)
             }
         }
     }
 }
 
-fn lower_rule(language: &Language, rule: &Rule, current_name: Option<&Name>) -> Production {
+fn lower_rule(
+    language: &Language,
+    rule: &Rule,
+    current_name: Option<&Name>,
+    generics: &BTreeMap<Ident, NonTerminal>,
+) -> Production {
     Production {
         alternatives: rule
             .alternatives
@@ -180,7 +214,11 @@ fn lower_rule(language: &Language, rule: &Rule, current_name: Option<&Name>) -> 
                         }
                         (
                             &expression.sequence[..expression.sequence.len() - 1],
-                            Some(NonTerminal::new_anonymous(rule.clone(), current_name)),
+                            Some(NonTerminal::new_anonymous(
+                                rule.clone(),
+                                current_name,
+                                generics.clone(),
+                            )),
                         )
                     }
                     Some((Item::Lookaround(_, _), _)) => {
@@ -190,7 +228,9 @@ fn lower_rule(language: &Language, rule: &Rule, current_name: Option<&Name>) -> 
                 };
                 let terms = sequence
                     .iter()
-                    .map(|(term, quantifier)| lower_term(language, term, *quantifier, current_name))
+                    .map(|(term, quantifier)| {
+                        lower_term(language, generics, term, *quantifier, current_name)
+                    })
                     .collect::<Vec<_>>();
                 Alternative {
                     terms,
@@ -203,6 +243,7 @@ fn lower_rule(language: &Language, rule: &Rule, current_name: Option<&Name>) -> 
 
 fn lower_term(
     language: &Language,
+    generics: &BTreeMap<Ident, NonTerminal>,
     item: &Item,
     quantifier: Quantifier,
     current_name: Option<&Name>,
@@ -216,6 +257,7 @@ fn lower_term(
             kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                 Rule { alternatives },
                 current_name,
+                generics.clone(),
             )),
             silent: true,
             atomic: false,
@@ -223,28 +265,51 @@ fn lower_term(
     }
 
     match item {
-        Item::Ident { mark, ident } => {
-            let name = match current_name {
-                Some(current_name) if ident == &current_name.ident => Name {
-                    ident: current_name.ident.clone(),
-                    index: match mark {
-                        Mark::Super => 0,
-                        Mark::This => current_name.index,
-                        Mark::Sub => current_name.index + 1,
+        Item::Ident {
+            mark,
+            ident,
+            generics: generic_arguments,
+        } => match generics.get(ident) {
+            Some(nt) => Term {
+                kind: TermKind::NonTerminal(nt.clone()),
+                silent: true,
+                atomic: false,
+            },
+            None => {
+                let name = match current_name {
+                    Some(current_name) if ident == &current_name.ident => Name {
+                        ident: current_name.ident.clone(),
+                        index: match mark {
+                            Mark::Super => 0,
+                            Mark::This => current_name.index,
+                            Mark::Sub => current_name.index + 1,
+                        },
                     },
-                },
-                _ => Name {
-                    ident: ident.clone(),
-                    index: 0,
-                },
-            };
-            let definition = &language.definitions[ident][0];
-            Term {
-                kind: TermKind::NonTerminal(NonTerminal::Named { name }),
-                silent: definition.silent,
-                atomic: definition.atomic,
+                    _ => Name {
+                        ident: ident.clone(),
+                        index: 0,
+                    },
+                };
+                let definition = match language.definitions.get(ident) {
+                    Some(definitions) => &definitions[0],
+                    None => panic!("{ident} is not defined"),
+                };
+                let generic_parameters = generic_arguments
+                    .iter()
+                    .map(|arg| {
+                        NonTerminal::new_anonymous(arg.clone(), current_name, generics.clone())
+                    })
+                    .collect();
+                Term {
+                    kind: TermKind::NonTerminal(NonTerminal::Named {
+                        name,
+                        generics: generic_parameters,
+                    }),
+                    silent: definition.silent,
+                    atomic: definition.atomic,
+                }
             }
-        }
+        },
         Item::String(data) => Term {
             kind: TermKind::Terminal(Terminal::new_token(regex_syntax::escape(data))),
             silent: false,
@@ -256,7 +321,11 @@ fn lower_term(
             atomic: true,
         },
         Item::Group(rule) => Term {
-            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(rule.clone(), current_name)),
+            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
+                rule.clone(),
+                current_name,
+                generics.clone(),
+            )),
             silent: true,
             atomic: false,
         },
@@ -268,19 +337,36 @@ fn lower_term(
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NonTerminal {
-    Goal { ident: Ident },
-    Named { name: Name },
-    Anonymous { rule: Rule, context: Option<Name> },
+    Goal {
+        ident: Ident,
+    },
+    Named {
+        name: Name,
+        generics: Vec<NonTerminal>,
+    },
+    Anonymous {
+        rule: Rule,
+        context: Option<Name>,
+        generics: BTreeMap<Ident, NonTerminal>,
+    },
 }
 
 impl NonTerminal {
-    fn new_anonymous(rule: Rule, context: Option<&Name>) -> NonTerminal {
+    fn new_anonymous(
+        rule: Rule,
+        context: Option<&Name>,
+        generics: BTreeMap<Ident, NonTerminal>,
+    ) -> NonTerminal {
         fn contains_non_super_ident(rule: &Rule, context: &Ident) -> bool {
             rule.alternatives
                 .iter()
                 .flat_map(|expression| &expression.sequence)
                 .any(|(item, _)| match item {
-                    Item::Ident { mark, ident } => ident == context && mark != &Mark::Super,
+                    Item::Ident {
+                        mark,
+                        ident,
+                        generics: _,
+                    } => ident == context && mark != &Mark::Super,
                     Item::String(_) | Item::Regex(_) => false,
                     Item::Group(rule) => contains_non_super_ident(rule, context),
                     Item::Lookaround(_, rule) => contains_non_super_ident(rule, context),
@@ -289,7 +375,11 @@ impl NonTerminal {
         let context = context
             .filter(|name| contains_non_super_ident(&rule, &name.ident))
             .cloned();
-        NonTerminal::Anonymous { rule, context }
+        NonTerminal::Anonymous {
+            rule,
+            context,
+            generics,
+        }
     }
 }
 
@@ -297,16 +387,43 @@ impl fmt::Display for NonTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NonTerminal::Goal { ident } => {
-                write!(f, "Goal({ident})")
+                write!(f, "Goal({ident})")?;
             }
-            NonTerminal::Named { name } => {
-                write!(f, "{name}")
+            NonTerminal::Named { name, generics } => {
+                write!(f, "{name}")?;
+                if !generics.is_empty() {
+                    f.write_str("<")?;
+                    for (i, generic) in generics.iter().enumerate() {
+                        if i != 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{generic}")?;
+                    }
+                    f.write_str(">")?;
+                }
             }
-            NonTerminal::Anonymous { rule, context } => match context {
-                Some(context) => write!(f, "{{{rule}}}#{context}"),
-                None => write!(f, "{{{rule}}}"),
-            },
+            NonTerminal::Anonymous {
+                rule,
+                generics,
+                context,
+            } => {
+                match context {
+                    Some(context) => write!(f, "{{{rule}}}#{context}")?,
+                    None => write!(f, "{{{rule}}}")?,
+                }
+                if !generics.is_empty() {
+                    f.write_str("<")?;
+                    for (i, (name, value)) in generics.iter().enumerate() {
+                        if i != 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{name}={value}")?;
+                    }
+                    f.write_str(">")?;
+                }
+            }
         }
+        Ok(())
     }
 }
 

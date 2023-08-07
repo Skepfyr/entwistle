@@ -68,9 +68,10 @@ impl Language {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
-    pub ident: Ident,
     pub silent: bool,
     pub atomic: bool,
+    pub ident: Ident,
+    pub generics: Vec<Ident>,
     pub rules: Vec<Rule>,
 }
 
@@ -110,7 +111,11 @@ impl fmt::Display for Expression {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Item {
-    Ident { mark: Mark, ident: Ident },
+    Ident {
+        mark: Mark,
+        ident: Ident,
+        generics: Vec<Rule>,
+    },
     String(String),
     Regex(String),
     Group(Rule),
@@ -120,8 +125,22 @@ pub enum Item {
 impl fmt::Display for Item {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Item::Ident { mark, ident } => {
+            Item::Ident {
+                mark,
+                ident,
+                generics,
+            } => {
                 write!(f, "{mark}{ident}")?;
+                if !generics.is_empty() {
+                    write!(f, "<")?;
+                    for (i, generic) in generics.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{generic}")?;
+                    }
+                    write!(f, ">")?;
+                }
             }
             Item::String(string) => {
                 write!(f, "{string:?}")?;
@@ -190,9 +209,9 @@ pub enum Mark {
 impl fmt::Display for Mark {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Mark::Super => f.write_char('^')?,
+            Mark::Super => f.write_char('$')?,
             Mark::This => {}
-            Mark::Sub => f.write_char('$')?,
+            Mark::Sub => f.write_char('~')?,
         }
         Ok(())
     }

@@ -3,9 +3,9 @@ String: Hashes '"' Char* '"' Hashes
 @Char: /[^"#]/ | '#' | '"' (!>> Hashes)
 @Hashes: '#' '#'
 
-##### Book
+== Book
 ##"""####""#"####"##""##
-#####
+==
 Book:
   String:
     Hashes: '##'
@@ -28,4 +28,4 @@ Book:
     Char: '"'
     '"'
     Hashes: '##'
-#####
+==

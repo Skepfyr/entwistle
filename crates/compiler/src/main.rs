@@ -22,8 +22,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut non_terminals = language
         .definitions
-        .keys()
-        .map(|ident| NonTerminal::Goal {
+        .iter()
+        .filter(|(_, definitions)| definitions.len() == 1 && definitions[0].generics.is_empty())
+        .map(|(ident, _)| NonTerminal::Goal {
             ident: ident.clone(),
         })
         .collect::<Vec<_>>();

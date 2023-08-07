@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, is_not, tag, take_until},
+    bytes::complete::{escaped, is_not, tag, take_till, take_until},
     character::complete::{alphanumeric1, anychar, char, space0, space1},
     combinator::{eof, map, opt, recognize, success, value},
     multi::{fold_many0, many0, many1, separated_list0},
@@ -72,16 +72,28 @@ fn definition<'a>() -> impl FnMut(&'a str) -> Result<'a, Definition> + 'a {
         tuple((
             ws(silent),
             ws(atomic),
-            terminated(ws(ident()), tuple((ws(char(':')), opt(empty_lines)))),
+            terminated(
+                ws(tuple((ident(), opt(ws(generic_params))))),
+                tuple((ws(char(':')), opt(empty_lines))),
+            ),
             many0(terminated(ws(rule()), empty_lines)),
         )),
-        |(silent, atomic, ident, productions)| Definition {
-            ident,
+        |(silent, atomic, (ident, generic_params), productions)| Definition {
             silent,
             atomic,
+            ident,
+            generics: generic_params.unwrap_or_default(),
             rules: productions,
         },
     )
+}
+
+fn generic_params(input: &str) -> Result<Vec<Ident>> {
+    delimited(
+        char('<'),
+        separated_list0(char(','), ws(ident())),
+        char('>'),
+    )(input)
 }
 
 fn rule<'a>() -> impl FnMut(&'a str) -> Result<'a, Rule> + 'a {
@@ -101,10 +113,14 @@ fn expression<'a>() -> impl FnMut(&'a str) -> Result<'a, Expression> + 'a {
 
 fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
     alt((
-        map(tuple((mark, ident())), |(mark, ident)| Item::Ident {
-            mark,
-            ident,
-        }),
+        map(
+            tuple((mark, ident(), opt(ws(generic_args)))),
+            |(mark, ident, generic_args)| Item::Ident {
+                mark,
+                ident,
+                generics: generic_args.unwrap_or_default(),
+            },
+        ),
         map(quoted_string, Item::String),
         map(regex, Item::Regex),
         map(
@@ -138,6 +154,14 @@ fn mark(input: &str) -> Result<Mark> {
     )))(input)
 }
 
+fn generic_args(input: &str) -> Result<Vec<Rule>> {
+    delimited(
+        char('<'),
+        separated_list0(char(','), ws(rule())),
+        char('>'),
+    )(input)
+}
+
 fn quantifier(input: &str) -> Result<Quantifier> {
     ws(alt((
         value(Quantifier::Any, char('*')),
@@ -151,10 +175,9 @@ fn lookaround(input: &str) -> Result<LookaroundType> {
     map(
         ws(tuple((
             opt(char('!')),
-            space0,
             alt((value(true, tag(">>")), value(false, tag("<<")))),
         ))),
-        |(negative, _, ahead)| LookaroundType {
+        |(negative, ahead)| LookaroundType {
             positive: negative.is_none(),
             ahead,
         },
@@ -163,14 +186,14 @@ fn lookaround(input: &str) -> Result<LookaroundType> {
 
 fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
     move |input| {
-        let (input, hashes) = preceded(space0, recognize(many1(char('#'))))(input)?;
+        let (input, equals) = preceded(space0, recognize(many1(char('='))))(input)?;
         let (input, ident) = terminated(ws(ident()), nl)(input)?;
-        let (input, test) = test_body(hashes)(input)?;
-        let (input, _) = ws(tag(hashes))(input)?;
+        let (input, test) = test_body(equals)(input)?;
+        let (input, _) = ws(tag(equals))(input)?;
         let (input, _) = empty_lines(input)?;
         let (input, indent) = space0(input)?;
         let (input, parse_tree) = parse_tree(indent)(input)?;
-        let (input, _) = ws(tag(hashes))(input)?;
+        let (input, _) = ws(tag(equals))(input)?;
         let (input, _) = empty_lines(input)?;
         Ok((
             input,
@@ -183,8 +206,8 @@ fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
     }
 }
 
-fn test_body<'a>(hashes: &'a str) -> impl FnMut(&'a str) -> Result<&'a str> {
-    map(take_until(hashes), |s: &str| match s.as_bytes() {
+fn test_body<'a>(equals: &'a str) -> impl FnMut(&'a str) -> Result<&'a str> {
+    map(take_until(equals), |s: &str| match s.as_bytes() {
         [.., b'\r', b'\n'] => &s[..s.len() - 2],
         [.., b'\n'] => &s[..s.len() - 1],
         _ => s,
@@ -265,9 +288,13 @@ where
 }
 
 fn empty_lines(input: &str) -> Result<&str> {
-    recognize(many1(tuple((space0, nl))))(input)
+    recognize(many1(tuple((space0, opt(line_comment), nl))))(input)
 }
 
 fn nl(input: &str) -> Result<&str> {
     recognize(alt((tag("\r\n"), tag("\n"))))(input)
+}
+
+fn line_comment(input: &str) -> Result<&str> {
+    preceded(tag("#"), take_till(|c: char| c.is_ascii_control()))(input)
 }

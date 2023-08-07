@@ -2,18 +2,18 @@ Module:
   (_ Statement _ nl | _ nl)*
 
 Statement:
-  Variable _ '=' _ Expression
+  Ident _ '=' _ Expression
   Expression
 
-## Statement
+== Statement
 a = b
-##
+==
 Statement:
-  Variable: "a"
+  Ident: "a"
   "="
   Expression:
-    Variable: "b"
-##
+    Ident: "b"
+==
 
 Expression:
   Expression _ ('+' | '-') _ ~Expression
@@ -21,12 +21,13 @@ Expression:
   ('+' | '-') Expression
   Expression '!'
   '(' _ $Expression _ ')'
+  Ident '(' CommaSeparated<$Expression> ')'
   Number
-  Variable
+  Ident
 
-## Expression
+== Expression
 1 + 2 * 3 + -4.0
-##
+==
 Expression:
   Expression:
     Expression:
@@ -43,16 +44,32 @@ Expression:
     "-"
     Expression:
       Number: "4.0"
-##
+==
+
+== Expression
+log(a, 10)
+==
+Expression:
+  Ident: "log"
+  "("
+  Expression:
+    Ident: "a"
+  ","
+  Expression:
+    Number: "10"
+  ")"
+==
+
+-CommaSeparated<Item>: Item (_ "," _ Item)? (_ ",")?
 
 @Number: /\d[\d_]*(.\d+)?/
-@Variable: /[[:alpha:]][\w_]*/
+@Ident: /[[:alpha:]][\w_]*/
 
-## Number
+== Number
 3.14159265
-##
+==
 Number: "3.14159265"
-##
+==
 
 -@_: /\s+/?
 -@nl: '\n'

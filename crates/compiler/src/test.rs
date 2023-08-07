@@ -84,6 +84,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     }
                     NonTerminal::Named {
                         name: Name { ident, .. },
+                        generics: _,
                     } => ident.clone(),
                     NonTerminal::Anonymous { .. } => Ident("anon".into()),
                 };

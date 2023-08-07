@@ -307,7 +307,10 @@ pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
     let mut start_states = HashMap::new();
-    for ident in language.definitions.keys() {
+    for (ident, definitions) in &language.definitions {
+        if definitions.len() != 1 || !definitions[0].generics.is_empty() {
+            continue;
+        }
         let goal = NonTerminal::Goal {
             ident: ident.clone(),
         };
@@ -990,6 +993,7 @@ pub enum ConflictedAction {
     Shift(Terminal, StateId),
     Reduce(NonTerminal, Alternative, Vec<Arc<TermString>>),
 }
+
 impl ConflictedAction {
     fn with_lookahead(&self, language: &Language, terminal: Terminal) -> ConflictedAction {
         match self {
@@ -1313,6 +1317,8 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
             let mut to_add = Vec::new();
             for &id in &states {
                 match nfa.state(id) {
+                    // This is overzealous and will flag word boundaries etc as
+                    // clashing when they actually aren't.
                     &NfaState::Look { look: _, next } => to_add.push(next),
                     NfaState::Union { alternates } => to_add.extend(alternates.iter().copied()),
                     &NfaState::BinaryUnion { alt1, alt2 } => {
