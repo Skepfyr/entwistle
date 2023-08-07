@@ -10,7 +10,9 @@ a = b
 ==
 Statement:
   Ident: "a"
+  " "
   "="
+  " "
   Expression:
     Ident: "b"
 ==
@@ -32,14 +34,20 @@ Expression:
   Expression:
     Expression:
       Number: "1"
+    " "
     "+"
+    " "
     Expression:
       Expression:
         Number: "2"
+      " "
       "*"
+      " "
       Expression:
         Number: "3"
+  " "
   "+"
+  " "
   Expression:
     "-"
     Expression:
@@ -54,7 +62,9 @@ Expression:
   "("
   Expression:
     Ident: "a"
+  ""
   ","
+  " "
   Expression:
     Number: "10"
   ")"

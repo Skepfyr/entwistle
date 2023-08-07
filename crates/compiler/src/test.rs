@@ -97,14 +97,19 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                             kind: _,
                             silent: true,
                             atomic: true,
-                        } => vec![],
+                        } => vec![ParseTree::Leaf {
+                            ident: None,
+                            data: node.data(),
+                        }],
                         Term {
                             kind: _,
                             silent: true,
                             atomic: false,
                         } => match node {
-                            ParseTree::Leaf { .. } => vec![],
-                            ParseTree::Node { nodes, .. } => nodes,
+                            ParseTree::Leaf { ident: _, data } => {
+                                vec![ParseTree::Leaf { ident: None, data }]
+                            }
+                            ParseTree::Node { ident: _, nodes } => nodes,
                         },
                         Term {
                             kind: _,
