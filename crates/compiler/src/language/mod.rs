@@ -6,6 +6,8 @@ use std::{
 
 use indenter::indented;
 
+use crate::Span;
+
 mod parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -50,7 +52,7 @@ impl Language {
                 .alternatives
                 .iter()
                 .flat_map(|expression| expression.sequence.iter())
-                .for_each(|(term, _)| match term {
+                .for_each(|(term, _, _)| match term {
                     Item::Ident { ident, .. } => {
                         dependencies.insert(ident.clone());
                     }
@@ -72,11 +74,13 @@ pub struct Definition {
     pub atomic: bool,
     pub ident: Ident,
     pub generics: Vec<Ident>,
+    pub span: Span,
     pub rules: Vec<Rule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rule {
+    pub span: Span,
     pub alternatives: BTreeSet<Expression>,
 }
 
@@ -94,12 +98,13 @@ impl fmt::Display for Rule {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Expression {
-    pub sequence: Vec<(Item, Quantifier)>,
+    pub span: Span,
+    pub sequence: Vec<(Item, Quantifier, Span)>,
 }
 
 impl fmt::Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, (item, quantifier)) in self.sequence.iter().enumerate() {
+        for (i, (item, quantifier, _)) in self.sequence.iter().enumerate() {
             if i > 0 {
                 f.write_char(' ')?;
             }
@@ -220,6 +225,7 @@ impl fmt::Display for Mark {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Test {
     pub ident: Ident,
+    pub span: Span,
     pub test: Arc<str>,
     pub parse_tree: ParseTree,
 }

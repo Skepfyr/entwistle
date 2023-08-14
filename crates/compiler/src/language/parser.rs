@@ -1,300 +1,399 @@
-use std::collections::HashMap;
+use std::ops::Range;
 
-use nom::{
-    branch::alt,
-    bytes::complete::{escaped, is_not, tag, take_till, take_until},
-    character::complete::{alphanumeric1, anychar, char, space0, space1},
-    combinator::{eof, map, opt, recognize, success, value},
-    multi::{fold_many0, many0, many1, separated_list0},
-    sequence::{delimited, preceded, terminated, tuple},
+use chumsky::{
+    prelude::*,
+    text::{newline, Character},
+    Stream,
 };
 use tracing::error;
 
-use crate::util::Interner;
+use crate::{util::Interner, Span};
 
 use super::{
     Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
     Rule, Test,
 };
 
-type Result<'a, T> = nom::IResult<&'a str, T>;
-
 pub(super) fn parse_grammar(input: &str) -> Language {
-    let mut parser = file();
-    match parser(input) {
-        Ok(("", grammar)) => grammar,
-        e => {
-            error!(?e, "Failed to parse");
+    let stream = Stream::from_iter(
+        Span {
+            start: input.len(),
+            end: input.len(),
+        },
+        input.chars().enumerate().map(|(i, c)| {
+            (
+                c,
+                Span {
+                    start: i,
+                    end: i + 1,
+                },
+            )
+        }),
+    );
+    match file().parse(stream) {
+        Ok(grammar) => grammar,
+        Err(errors) => {
+            for error in errors {
+                error!(?error, "Failed to parse");
+            }
             Language::default()
         }
     }
 }
 
-fn file<'a>() -> impl FnMut(&'a str) -> Result<'a, Language> + 'a {
+type ParseError = Simple<char, Span>;
+
+impl chumsky::Span for Span {
+    type Context = ();
+    type Offset = usize;
+
+    fn new(_context: Self::Context, range: Range<Self::Offset>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+
+    fn context(&self) -> Self::Context {}
+
+    fn start(&self) -> Self::Offset {
+        self.start
+    }
+
+    fn end(&self) -> Self::Offset {
+        self.end
+    }
+}
+
+fn file() -> impl Parser<char, Language, Error = ParseError> {
     enum RuleOrTest {
         Rule(Definition),
         Test(Test),
     }
-    let file = terminated(
-        fold_many0(
-            alt((
-                map(definition(), RuleOrTest::Rule),
-                map(test(), RuleOrTest::Test),
-            )),
-            || (HashMap::<_, Vec<_>>::new(), HashMap::<_, Vec<_>>::new()),
-            |(mut rules, mut tests), rule_or_test| {
+    choice((
+        definition().map(RuleOrTest::Rule),
+        test().map(RuleOrTest::Test),
+    ))
+    .repeated()
+    .map(|items| {
+        items
+            .into_iter()
+            .fold(Language::default(), |mut language, rule_or_test| {
                 match rule_or_test {
-                    RuleOrTest::Rule(rule) => {
-                        rules.entry(rule.ident.clone()).or_default().push(rule)
-                    }
-                    RuleOrTest::Test(test) => {
-                        tests.entry(test.ident.clone()).or_default().push(test)
-                    }
+                    RuleOrTest::Rule(rule) => language
+                        .definitions
+                        .entry(rule.ident.clone())
+                        .or_default()
+                        .push(rule),
+                    RuleOrTest::Test(test) => language
+                        .tests
+                        .entry(test.ident.clone())
+                        .or_default()
+                        .push(test),
                 }
-                (rules, tests)
+                language
+            })
+    })
+    .then_ignore(end())
+}
+
+fn definition() -> impl Parser<char, Definition, Error = ParseError> {
+    silent()
+        .then(atomic())
+        .then(
+            ident()
+                .map_with_span(|ident, span| (ident, span))
+                .then(generic_params().or_not()),
+        )
+        .then(
+            just(':').padded_by(lws()).ignore_then(choice((
+                empty_lines().ignore_then(
+                    filter(|c: &char| c.is_inline_whitespace())
+                        .repeated()
+                        .at_least(1)
+                        .ignore_then(rule())
+                        .then_ignore(empty_lines())
+                        .repeated(),
+                ),
+                rule().map(|r| vec![r]).then_ignore(empty_lines()),
+            ))),
+        )
+        .map(
+            |(((silent, atomic), ((ident, span), generic_params)), productions)| Definition {
+                silent,
+                atomic,
+                ident,
+                span,
+                generics: generic_params.unwrap_or_default(),
+                rules: productions,
             },
-        ),
-        eof,
-    );
+        )
+}
 
-    map(file, |(rules, tests)| {
-        let rules = rules.into_iter().collect();
-        let tests = tests.into_iter().collect();
-        Language {
-            definitions: rules,
-            tests,
-        }
+fn generic_params() -> impl Parser<char, Vec<Ident>, Error = ParseError> {
+    just('<')
+        .ignore_then(
+            ident()
+                .padded_by(lws())
+                .separated_by(just(','))
+                .allow_trailing(),
+        )
+        .then_ignore(just('>'))
+}
+
+fn rule() -> impl Parser<char, Rule, Error = ParseError> + Clone {
+    recursive(|rule| {
+        expression(rule)
+            .separated_by(just('|').padded_by(lws()))
+            .map_with_span(|expressions, span| Rule {
+                alternatives: expressions.into_iter().collect(),
+                span,
+            })
     })
 }
 
-fn definition<'a>() -> impl FnMut(&'a str) -> Result<'a, Definition> + 'a {
-    map(
-        tuple((
-            ws(silent),
-            ws(atomic),
-            terminated(
-                ws(tuple((ident(), opt(ws(generic_params))))),
-                tuple((ws(char(':')), opt(empty_lines))),
-            ),
-            many0(terminated(ws(rule()), empty_lines)),
-        )),
-        |(silent, atomic, (ident, generic_params), productions)| Definition {
-            silent,
-            atomic,
-            ident,
-            generics: generic_params.unwrap_or_default(),
-            rules: productions,
-        },
-    )
+fn expression(
+    rule: impl Parser<char, Rule, Error = ParseError> + Clone,
+) -> impl Parser<char, Expression, Error = ParseError> {
+    term(rule)
+        .then(quantifier())
+        .map_with_span(|(item, quantifier), span| (item, quantifier, span))
+        .repeated()
+        .map_with_span(|sequence, span| Expression { sequence, span })
 }
 
-fn generic_params(input: &str) -> Result<Vec<Ident>> {
-    delimited(
-        char('<'),
-        separated_list0(char(','), ws(ident())),
-        char('>'),
-    )(input)
-}
-
-fn rule<'a>() -> impl FnMut(&'a str) -> Result<'a, Rule> + 'a {
-    map(
-        separated_list0(ws(char('|')), expression()),
-        |expressions| Rule {
-            alternatives: expressions.into_iter().collect(),
-        },
-    )
-}
-
-fn expression<'a>() -> impl FnMut(&'a str) -> Result<'a, Expression> + 'a {
-    map(many0(tuple((ws(term()), ws(quantifier)))), |sequence| {
-        Expression { sequence }
-    })
-}
-
-fn term<'a>() -> impl FnMut(&'a str) -> Result<'a, Item> + 'a {
-    alt((
-        map(
-            tuple((mark, ident(), opt(ws(generic_args)))),
-            |(mark, ident, generic_args)| Item::Ident {
+fn term(
+    rule: impl Parser<char, Rule, Error = ParseError> + Clone,
+) -> impl Parser<char, Item, Error = ParseError> {
+    choice((
+        mark()
+            .then(ident())
+            .then(generic_args(rule.clone()).or_not())
+            .map(|((mark, ident), generic_args)| Item::Ident {
                 mark,
                 ident,
                 generics: generic_args.unwrap_or_default(),
-            },
-        ),
-        map(quoted_string, Item::String),
-        map(regex, Item::Regex),
-        map(
-            delimited(
-                char('('),
-                tuple((lookaround, |input| rule()(input))),
-                char(')'),
-            ),
-            |(lookaround_type, rule)| Item::Lookaround(lookaround_type, rule),
-        ),
-        map(
-            delimited(char('('), move |input| rule()(input), char(')')),
-            Item::Group,
-        ),
+            }),
+        quoted_string().map(Item::String),
+        regex().map(Item::Regex),
+        just('(')
+            .ignore_then(lookaround().then(rule.clone()))
+            .then_ignore(just(')'))
+            .map(|(lookaround_type, rule)| Item::Lookaround(lookaround_type, rule)),
+        just('(')
+            .ignore_then(rule)
+            .then_ignore(just(')'))
+            .map(Item::Group),
     ))
 }
 
-fn silent(input: &str) -> Result<bool> {
-    map(ws(opt(char('-'))), |opt| opt.is_some())(input)
+fn silent() -> impl Parser<char, bool, Error = ParseError> {
+    just('-').padded_by(lws()).or_not().map(|opt| opt.is_some())
 }
 
-fn atomic(input: &str) -> Result<bool> {
-    map(ws(opt(char('@'))), |opt| opt.is_some())(input)
+fn atomic() -> impl Parser<char, bool, Error = ParseError> {
+    just('@').padded_by(lws()).or_not().map(|opt| opt.is_some())
 }
 
-fn mark(input: &str) -> Result<Mark> {
-    ws(alt((
-        value(Mark::Super, char('$')),
-        value(Mark::Sub, char('~')),
-        value(Mark::This, success(())),
-    )))(input)
+fn mark() -> impl Parser<char, Mark, Error = ParseError> {
+    choice((
+        just('$').to(Mark::Super),
+        just('~').to(Mark::Sub),
+        empty().to(Mark::This),
+    ))
+    .padded_by(lws())
 }
 
-fn generic_args(input: &str) -> Result<Vec<Rule>> {
-    delimited(
-        char('<'),
-        separated_list0(char(','), ws(rule())),
-        char('>'),
-    )(input)
-}
-
-fn quantifier(input: &str) -> Result<Quantifier> {
-    ws(alt((
-        value(Quantifier::Any, char('*')),
-        value(Quantifier::AtLeastOnce, char('+')),
-        value(Quantifier::AtMostOnce, char('?')),
-        value(Quantifier::Once, success(())),
-    )))(input)
-}
-
-fn lookaround(input: &str) -> Result<LookaroundType> {
-    map(
-        ws(tuple((
-            opt(char('!')),
-            alt((value(true, tag(">>")), value(false, tag("<<")))),
-        ))),
-        |(negative, ahead)| LookaroundType {
-            positive: negative.is_none(),
-            ahead,
-        },
-    )(input)
-}
-
-fn test<'a>() -> impl FnMut(&'a str) -> Result<'a, Test> + 'a {
-    move |input| {
-        let (input, equals) = preceded(space0, recognize(many1(char('='))))(input)?;
-        let (input, ident) = terminated(ws(ident()), nl)(input)?;
-        let (input, test) = test_body(equals)(input)?;
-        let (input, _) = ws(tag(equals))(input)?;
-        let (input, _) = empty_lines(input)?;
-        let (input, indent) = space0(input)?;
-        let (input, parse_tree) = parse_tree(indent)(input)?;
-        let (input, _) = ws(tag(equals))(input)?;
-        let (input, _) = empty_lines(input)?;
-        Ok((
-            input,
-            Test {
-                ident,
-                test: test.into(),
-                parse_tree,
-            },
-        ))
-    }
-}
-
-fn test_body<'a>(equals: &'a str) -> impl FnMut(&'a str) -> Result<&'a str> {
-    map(take_until(equals), |s: &str| match s.as_bytes() {
-        [.., b'\r', b'\n'] => &s[..s.len() - 2],
-        [.., b'\n'] => &s[..s.len() - 1],
-        _ => s,
-    })
-}
-
-fn parse_tree<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
-    alt((parse_tree_leaf(), parse_tree_node(indent)))
-}
-
-fn parse_tree_leaf<'a>() -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
-    map(
-        terminated(
-            tuple((opt(terminated(ident(), ws(char(':')))), quoted_string)),
-            empty_lines,
-        ),
-        |(ident, data)| ParseTree::Leaf { ident, data },
-    )
-}
-
-fn parse_tree_node<'a>(indent: &'a str) -> impl FnMut(&'a str) -> Result<'a, ParseTree> + 'a {
-    let nodes = move |input| {
-        let (input, new_indent) = recognize(tuple((tag(indent), space1)))(input)?;
-        let (input, node) = parse_tree(new_indent)(input)?;
-        let nodes = vec![node];
-        fold_many0(
-            preceded(tag(new_indent), parse_tree(new_indent)),
-            move || nodes.clone(),
-            |mut nodes, node| {
-                nodes.push(node);
-                nodes
-            },
-        )(input)
-    };
-    map(
-        tuple((
-            terminated(ws(ident()), tuple((char(':'), empty_lines))),
-            nodes,
-        )),
-        |(ident, nodes)| ParseTree::Node { ident, nodes },
-    )
-}
-
-fn ident<'a>() -> impl FnMut(&'a str) -> Result<'a, Ident> + 'a {
-    static IDENT_INTERNER: Interner = Interner::new();
-    map(
-        recognize(many1(alt((alphanumeric1, tag("_"))))),
-        move |ident: &str| Ident(IDENT_INTERNER.intern(ident)),
-    )
-}
-
-fn quoted_string(input: &str) -> Result<String> {
-    let string = |delimiter| {
-        map(
-            delimited(
-                tag(delimiter),
-                recognize(take_until(delimiter)),
-                tag(delimiter),
-            ),
-            |s: &str| s.to_owned(),
+fn generic_args(
+    rule: impl Parser<char, Rule, Error = ParseError>,
+) -> impl Parser<char, Vec<Rule>, Error = ParseError> {
+    just('<')
+        .ignore_then(
+            rule.padded_by(lws())
+                .separated_by(just(','))
+                .allow_trailing(),
         )
+        .then_ignore(just('>'))
+}
+
+fn quantifier() -> impl Parser<char, Quantifier, Error = ParseError> {
+    choice((
+        just('*').to(Quantifier::Any),
+        just('+').to(Quantifier::AtLeastOnce),
+        just('?').to(Quantifier::AtMostOnce),
+        empty().to(Quantifier::Once),
+    ))
+    .padded_by(lws())
+}
+
+fn lookaround() -> impl Parser<char, LookaroundType, Error = ParseError> {
+    just('!')
+        .or_not()
+        .map(|opt| opt.is_none())
+        .then(choice((just(">>").to(true), just("<<").to(false))))
+        .map(|(positive, ahead)| LookaroundType { positive, ahead })
+}
+
+fn test() -> impl Parser<char, Test, Error = ParseError> {
+    lws()
+        .ignore_then(just('=').repeated().at_least(1).map(|equals| equals.len()))
+        .then_with(|equals: usize| {
+            ident()
+                .map_with_span(|ident, span| (ident, span))
+                .padded_by(lws())
+                .then_ignore(newline())
+                .then(test_body(equals))
+                .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
+                .then_ignore(empty_lines())
+                .then(parse_tree())
+                .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
+                .then_ignore(empty_lines())
+        })
+        .map(|(((ident, span), test), parse_tree)| Test {
+            ident,
+            span,
+            test: test.into(),
+            parse_tree,
+        })
+}
+
+fn test_body(equals: usize) -> impl Parser<char, String, Error = ParseError> {
+    take_until(lws().then(just('=').repeated().exactly(equals)).rewind())
+        .map(|(s, _)| s)
+        .collect()
+        .map(|mut s: String| {
+            match s.as_bytes() {
+                [.., b'\r', b'\n'] => s.truncate(s.len() - 2),
+                [.., b'\n'] => s.truncate(s.len() - 1),
+                _ => {}
+            };
+            s
+        })
+}
+
+fn parse_tree() -> impl Parser<char, ParseTree, Error = ParseError> {
+    lws()
+        .then(
+            ident()
+                .then_ignore(just(':').padded_by(lws()))
+                .or_not()
+                .then(quoted_string().or_not())
+                .then_ignore(empty_lines()),
+        )
+        .repeated()
+        .validate(|lines, span, emit| {
+            let mut trees: Vec<(String, Ident, Vec<ParseTree>)> = Vec::new();
+            for (indent, tree_info) in lines {
+                while trees
+                    .last()
+                    .map(|(i, _, _)| i.as_str().len() >= indent.len())
+                    .unwrap_or(false)
+                {
+                    let (old_indent, old_ident, old_nodes) = trees.pop().unwrap();
+                    let old_parse_tree = ParseTree::Node {
+                        ident: old_ident,
+                        nodes: old_nodes,
+                    };
+                    let Some((_, _, top_nodes)) = trees.last_mut() else {
+                        emit(ParseError::custom(span, "Only one top level parse tree is allowed."));
+                        return old_parse_tree;
+                    };
+                    if !old_indent.starts_with(&indent) {
+                        emit(ParseError::custom(
+                            span,
+                            "Parse tree indentation must be consistent.",
+                        ));
+                        return old_parse_tree;
+                    }
+                    top_nodes.push(old_parse_tree);
+                }
+                match tree_info {
+                    (ident, Some(data)) => {
+                        let new_item = ParseTree::Leaf { ident, data };
+                        match trees.last_mut() {
+                            Some((_, _, nodes)) => nodes.push(new_item),
+                            None => return new_item,
+                        }
+                    }
+                    (Some(ident), None) => {
+                        trees.push((indent, ident, Vec::new()));
+                    }
+                    (None, None) => {
+                        unreachable!("Empty lines should be ignored")
+                    }
+                }
+            }
+            while trees.len() > 1 {
+                let (_, ident, nodes) = trees.pop().unwrap();
+                trees
+                    .last_mut()
+                    .unwrap()
+                    .2
+                    .push(ParseTree::Node { ident, nodes });
+            }
+            match trees.pop() {
+                Some((_, ident, nodes)) => ParseTree::Node { ident, nodes },
+                None => {
+                    emit(ParseError::custom(span, "No parse tree found."));
+                    ParseTree::Leaf {
+                        ident: None,
+                        data: String::new(),
+                    }
+                }
+            }
+        })
+}
+
+fn ident() -> impl Parser<char, Ident, Error = ParseError> {
+    static IDENT_INTERNER: Interner = Interner::new();
+    chumsky::text::ident()
+        .map(move |ident: String| Ident(IDENT_INTERNER.intern(&ident)))
+        .labelled("ident")
+}
+
+fn quoted_string() -> impl Parser<char, String, Error = ParseError> {
+    let string = |delimiter| {
+        just(delimiter)
+            .ignore_then(none_of(delimiter).repeated().collect())
+            .then_ignore(just(delimiter))
     };
-    alt((string("'"), string("\"")))(input)
+    string('"').or(string('\''))
 }
 
-fn regex(input: &str) -> Result<String> {
-    map(
-        delimited(char('/'), escaped(is_not("/"), '\\', anychar), char('/')),
-        |s: &str| s.to_owned(),
-    )(input)
+fn regex() -> impl Parser<char, String, Error = ParseError> {
+    just('/')
+        .ignore_then(
+            none_of("\\/")
+                .map(|c| vec![c])
+                .or(just('\\').ignore_then(choice((
+                    just('/').to(vec!['/']),
+                    none_of("/").map(|c| vec!['\\', c]),
+                ))))
+                .repeated()
+                .flatten()
+                .collect(),
+        )
+        .then_ignore(just('/'))
 }
 
-fn ws<'a, F, O>(f: F) -> impl FnMut(&'a str) -> Result<'a, O>
-where
-    F: FnMut(&'a str) -> Result<O>,
-{
-    delimited(space0, f, space0)
+fn empty_lines() -> impl Parser<char, (), Error = ParseError> {
+    lws()
+        .then(line_comment().or_not())
+        .then(newline())
+        .ignored()
+        .repeated()
+        .at_least(1)
+        .collect()
 }
 
-fn empty_lines(input: &str) -> Result<&str> {
-    recognize(many1(tuple((space0, opt(line_comment), nl))))(input)
+fn line_comment() -> impl Parser<char, (), Error = ParseError> {
+    just('#')
+        .chain(filter(|c: &char| !c.is_control()).repeated())
+        .ignored()
 }
 
-fn nl(input: &str) -> Result<&str> {
-    recognize(alt((tag("\r\n"), tag("\n"))))(input)
-}
-
-fn line_comment(input: &str) -> Result<&str> {
-    preceded(tag("#"), take_till(|c: char| c.is_ascii_control()))(input)
+fn lws() -> impl Parser<char, String, Error = ParseError> + Clone {
+    filter(|c: &char| c.is_inline_whitespace())
+        .repeated()
+        .collect()
 }

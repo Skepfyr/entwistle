@@ -7,7 +7,10 @@ use std::{
 
 use regex_automata::nfa::thompson::NFA;
 
-use crate::language::{Definition, Expression, Ident, Item, Language, Mark, Quantifier, Rule};
+use crate::{
+    language::{Definition, Expression, Ident, Item, Language, Mark, Quantifier, Rule},
+    Span,
+};
 
 pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production {
     match non_terminal {
@@ -79,7 +82,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 let mut contains_this = false;
                 let mut contains_sub = false;
                 for alternative in &rule.alternatives {
-                    for (item, _) in &alternative.sequence {
+                    for (item, _, _) in &alternative.sequence {
                         match item {
                             Item::Ident {
                                 mark,
@@ -161,8 +164,16 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
             if rule.alternatives.len() == 1
                 && rule.alternatives.iter().next().unwrap().sequence.len() == 1
             {
-                let (item, quantifier) = &rule.alternatives.iter().next().unwrap().sequence[0];
-                let term = lower_term(language, generics, item, Quantifier::Once, context.as_ref());
+                let (item, quantifier, span) =
+                    &rule.alternatives.iter().next().unwrap().sequence[0];
+                let term = lower_term(
+                    language,
+                    generics,
+                    item,
+                    Quantifier::Once,
+                    *span,
+                    context.as_ref(),
+                );
                 let mut alternatives: Vec<Alternative> = Vec::new();
                 // Zero times
                 if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
@@ -208,7 +219,7 @@ fn lower_rule(
             .iter()
             .map(|expression| {
                 let (sequence, lookahead) = match expression.sequence.last() {
-                    Some((Item::Lookaround(lookaround_type, rule), Quantifier::Once)) => {
+                    Some((Item::Lookaround(lookaround_type, rule), Quantifier::Once, _)) => {
                         if lookaround_type.positive || !lookaround_type.ahead {
                             panic!("Only negative lookahead is supported");
                         }
@@ -221,15 +232,15 @@ fn lower_rule(
                             )),
                         )
                     }
-                    Some((Item::Lookaround(_, _), _)) => {
+                    Some((Item::Lookaround(_, _), _, _)) => {
                         panic!("Lookaround cannot have a quantifier")
                     }
                     _ => (&expression.sequence[..], None),
                 };
                 let terms = sequence
                     .iter()
-                    .map(|(term, quantifier)| {
-                        lower_term(language, generics, term, *quantifier, current_name)
+                    .map(|(term, quantifier, span)| {
+                        lower_term(language, generics, term, *quantifier, *span, current_name)
                     })
                     .collect::<Vec<_>>();
                 Alternative {
@@ -246,16 +257,18 @@ fn lower_term(
     generics: &BTreeMap<Ident, NonTerminal>,
     item: &Item,
     quantifier: Quantifier,
+    span: Span,
     current_name: Option<&Name>,
 ) -> Term {
     if quantifier != Quantifier::Once {
         let mut alternatives = BTreeSet::new();
         alternatives.insert(Expression {
-            sequence: vec![(item.clone(), quantifier)],
+            sequence: vec![(item.clone(), quantifier, span)],
+            span,
         });
         return Term {
             kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
-                Rule { alternatives },
+                Rule { alternatives, span },
                 current_name,
                 generics.clone(),
             )),
@@ -361,7 +374,7 @@ impl NonTerminal {
             rule.alternatives
                 .iter()
                 .flat_map(|expression| &expression.sequence)
-                .any(|(item, _)| match item {
+                .any(|(item, _, _)| match item {
                     Item::Ident {
                         mark,
                         ident,
