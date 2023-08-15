@@ -155,11 +155,16 @@ fn rule() -> impl Parser<char, Rule, Error = ParseError> + Clone {
 fn expression(
     rule: impl Parser<char, Rule, Error = ParseError> + Clone,
 ) -> impl Parser<char, Expression, Error = ParseError> {
-    term(rule)
-        .then(quantifier())
-        .map_with_span(|(item, quantifier), span| (item, quantifier, span))
-        .repeated()
-        .map_with_span(|sequence, span| Expression { sequence, span })
+    choice((
+        term(rule)
+            .then(quantifier())
+            .padded_by(lws())
+            .map_with_span(|(item, quantifier), span| (item, quantifier, span))
+            .repeated()
+            .at_least(1),
+        just("()").to(Vec::new()),
+    ))
+    .map_with_span(|sequence, span| Expression { sequence, span })
 }
 
 fn term(
@@ -223,7 +228,6 @@ fn quantifier() -> impl Parser<char, Quantifier, Error = ParseError> {
         just('?').to(Quantifier::AtMostOnce),
         empty().to(Quantifier::Once),
     ))
-    .padded_by(lws())
 }
 
 fn lookaround() -> impl Parser<char, LookaroundType, Error = ParseError> {

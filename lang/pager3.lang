@@ -4,6 +4,6 @@ X: 'e' | 'e' 'g'
 W: P
 V: U
 U: 'a' Y Z
-Z: 'a' Q | P |
+Z: 'a' Q | P | ()
 P: 'b' U
-Q: 'c' |
+Q: 'c' | ()
