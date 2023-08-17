@@ -7,7 +7,7 @@ use chumsky::{
 };
 use tracing::error;
 
-use crate::{util::Interner, Span};
+use crate::{diagnostics::emit, util::Interner, Span};
 
 use super::{
     Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
@@ -80,16 +80,24 @@ fn file() -> impl Parser<char, Language, Error = ParseError> {
             .into_iter()
             .fold(Language::default(), |mut language, rule_or_test| {
                 match rule_or_test {
-                    RuleOrTest::Rule(rule) => language
-                        .definitions
-                        .entry(rule.ident.clone())
-                        .or_default()
-                        .push(rule),
-                    RuleOrTest::Test(test) => language
-                        .tests
-                        .entry(test.ident.clone())
-                        .or_default()
-                        .push(test),
+                    RuleOrTest::Rule(rule) => {
+                        if let Some(rule) = language.definitions.insert(rule.ident.clone(), rule) {
+                            emit(
+                                "Duplicate definition",
+                                vec![(
+                                    rule.span,
+                                    Some(format!("Duplicate definition of {}", rule.ident)),
+                                )],
+                            );
+                        }
+                    }
+                    RuleOrTest::Test(test) => {
+                        language
+                            .tests
+                            .entry(test.ident.clone())
+                            .or_default()
+                            .push(test);
+                    }
                 }
                 language
             })
@@ -158,9 +166,8 @@ fn expression(
     choice((
         term(rule)
             .then(quantifier())
-            .padded_by(lws())
             .map_with_span(|(item, quantifier), span| (item, quantifier, span))
-            .repeated()
+            .separated_by(lws())
             .at_least(1),
         just("()").to(Vec::new()),
     ))
@@ -235,7 +242,11 @@ fn lookaround() -> impl Parser<char, LookaroundType, Error = ParseError> {
         .or_not()
         .map(|opt| opt.is_none())
         .then(choice((just(">>").to(true), just("<<").to(false))))
-        .map(|(positive, ahead)| LookaroundType { positive, ahead })
+        .map_with_span(|(positive, ahead), span| LookaroundType {
+            positive,
+            ahead,
+            span,
+        })
 }
 
 fn test() -> impl Parser<char, Test, Error = ParseError> {
@@ -246,19 +257,22 @@ fn test() -> impl Parser<char, Test, Error = ParseError> {
                 .map_with_span(|ident, span| (ident, span))
                 .padded_by(lws())
                 .then_ignore(newline())
-                .then(test_body(equals))
+                .then(test_body(equals).map_with_span(|body, span| (body, span)))
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
                 .then(parse_tree())
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
         })
-        .map(|(((ident, span), test), parse_tree)| Test {
-            ident,
-            span,
-            test: test.into(),
-            parse_tree,
-        })
+        .map(
+            |(((ident, ident_span), (test, test_span)), parse_tree)| Test {
+                ident,
+                ident_span,
+                test: test.into(),
+                test_span,
+                parse_tree,
+            },
+        )
 }
 
 fn test_body(equals: usize) -> impl Parser<char, String, Error = ParseError> {
@@ -299,7 +313,10 @@ fn parse_tree() -> impl Parser<char, ParseTree, Error = ParseError> {
                         nodes: old_nodes,
                     };
                     let Some((_, _, top_nodes)) = trees.last_mut() else {
-                        emit(ParseError::custom(span, "Only one top level parse tree is allowed."));
+                        emit(ParseError::custom(
+                            span,
+                            "Only one top level parse tree is allowed.",
+                        ));
                         return old_parse_tree;
                     };
                     if !old_indent.starts_with(&indent) {

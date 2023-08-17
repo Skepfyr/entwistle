@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    error::Error,
     fmt::{self, Write as _},
     hash::Hash,
 };
@@ -8,59 +9,66 @@ use std::{
 use regex_automata::nfa::thompson::NFA;
 
 use crate::{
-    language::{Definition, Expression, Ident, Item, Language, Mark, Quantifier, Rule},
+    diagnostics::emit,
+    language::{Expression, Ident, Item, Language, Mark, Quantifier, Rule},
     Span,
 };
 
-pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production {
+pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Production {
     match non_terminal {
-        NonTerminal::Goal { ident } => {
-            let definition: &Definition = match language.definitions[ident].as_slice() {
-                [definition] => definition,
-                _ => panic!("Should have exactly one rule"),
-            };
+        &NonTerminalUse::Goal { ref ident, span } => {
+            let definition = &language.definitions[ident];
             if !definition.generics.is_empty() {
-                panic!("Unexpected generics for goal {ident}");
+                emit("Goals cannot have generics", vec![(definition.span, None)]);
+                return Production {
+                    alternatives: vec![],
+                };
             }
+
             Production {
-                alternatives: [vec![
-                    Term {
-                        kind: TermKind::NonTerminal(NonTerminal::Named {
-                            name: Name {
-                                ident: ident.clone(),
-                                index: 0,
-                            },
-                            generics: Vec::new(),
-                        }),
-                        silent: definition.silent,
-                        atomic: definition.atomic,
-                    },
-                    Term {
-                        kind: TermKind::Terminal(Terminal::EndOfInput(ident.clone())),
-                        silent: true,
-                        atomic: true,
-                    },
-                ]]
-                .into_iter()
-                .map(Alternative::from)
-                .collect(),
+                alternatives: vec![Alternative {
+                    span,
+                    terms: vec![
+                        Term {
+                            kind: TermKind::NonTerminal(NonTerminalUse::Named {
+                                name: Name {
+                                    ident: ident.clone(),
+                                    index: 0,
+                                },
+                                generics: Vec::new(),
+                                span,
+                            }),
+                            silent: definition.silent,
+                            atomic: definition.atomic,
+                        },
+                        Term {
+                            kind: TermKind::Terminal(Terminal::EndOfInput(ident.clone(), span)),
+                            silent: true,
+                            atomic: true,
+                        },
+                    ],
+                    negative_lookahead: None,
+                }],
             }
         }
-        NonTerminal::Named {
+        NonTerminalUse::Named {
             name,
             generics: generic_parameters,
+            span,
         } => {
-            let definition: &Definition = match language.definitions[&name.ident].as_slice() {
-                [definition] => definition,
-                _ => panic!("Should have exactly one rule"),
-            };
+            let definition = &language.definitions[&name.ident];
             if definition.generics.len() != generic_parameters.len() {
-                panic!(
-                    "Expected {} generics for {}, found {}",
-                    definition.generics.len(),
-                    name.ident,
-                    generic_parameters.len()
+                emit(
+                    format!(
+                        "Expected {} generics, found {}",
+                        definition.generics.len(),
+                        generic_parameters.len()
+                    ),
+                    vec![(*span, None)],
                 );
+                return Production {
+                    alternatives: vec![],
+                };
             }
             let generics = std::iter::Iterator::zip(
                 definition.generics.iter().cloned(),
@@ -69,6 +77,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
             .collect();
             if definition.rules.is_empty() {
                 if name.index > 0 {
+                    // ICE
                     panic!(
                         "Unexpected index {} for empty definition for {}",
                         name.index, name.ident
@@ -132,6 +141,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 }
             }
             if index > 0 {
+                // ICE
                 panic!("Index {} out of bounds for {}", name.index, name.ident);
             }
             let mut alternatives: Vec<_> = definition.rules[first..last]
@@ -139,24 +149,30 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
                 .flat_map(|rule| lower_rule(language, rule, Some(name), &generics).alternatives)
                 .collect();
             if last != definition.rules.len() {
-                alternatives.push(
-                    vec![Term {
-                        kind: TermKind::NonTerminal(NonTerminal::Named {
+                let span = Span {
+                    start: definition.rules[first].span.start,
+                    end: definition.rules[last - 1].span.end,
+                };
+                alternatives.push(Alternative {
+                    span,
+                    terms: vec![Term {
+                        kind: TermKind::NonTerminal(NonTerminalUse::Named {
                             name: Name {
                                 ident: name.ident.clone(),
                                 index: name.index + 1,
                             },
                             generics: generic_parameters.clone(),
+                            span,
                         }),
                         silent: true,
                         atomic: false,
-                    }]
-                    .into(),
-                );
+                    }],
+                    negative_lookahead: None,
+                });
             }
             Production { alternatives }
         }
-        NonTerminal::Anonymous {
+        NonTerminalUse::Anonymous {
             rule,
             context,
             generics,
@@ -164,40 +180,49 @@ pub fn production(language: &Language, non_terminal: &NonTerminal) -> Production
             if rule.alternatives.len() == 1
                 && rule.alternatives.iter().next().unwrap().sequence.len() == 1
             {
-                let (item, quantifier, span) =
+                let &(ref item, ref quantifier, span) =
                     &rule.alternatives.iter().next().unwrap().sequence[0];
                 let term = lower_term(
                     language,
                     generics,
                     item,
                     Quantifier::Once,
-                    *span,
+                    span,
                     context.as_ref(),
                 );
                 let mut alternatives: Vec<Alternative> = Vec::new();
                 // Zero times
                 if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
-                    alternatives.push(vec![].into());
+                    alternatives.push(Alternative {
+                        span,
+                        terms: vec![],
+                        negative_lookahead: None,
+                    });
                 }
                 // One time
                 if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce | Quantifier::Once =
                     quantifier
                 {
-                    alternatives.push(vec![term.clone()].into());
+                    alternatives.push(Alternative {
+                        span,
+                        terms: vec![term.clone()],
+                        negative_lookahead: None,
+                    });
                 }
                 // Many times
                 if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-                    alternatives.push(
-                        vec![
+                    alternatives.push(Alternative {
+                        span,
+                        terms: vec![
                             Term {
                                 kind: TermKind::NonTerminal(non_terminal.clone()),
                                 silent: true,
                                 atomic: false,
                             },
                             term,
-                        ]
-                        .into(),
-                    );
+                        ],
+                        negative_lookahead: None,
+                    });
                 }
                 Production { alternatives }
             } else {
@@ -211,7 +236,7 @@ fn lower_rule(
     language: &Language,
     rule: &Rule,
     current_name: Option<&Name>,
-    generics: &BTreeMap<Ident, NonTerminal>,
+    generics: &BTreeMap<Ident, NonTerminalUse>,
 ) -> Production {
     Production {
         alternatives: rule
@@ -219,21 +244,30 @@ fn lower_rule(
             .iter()
             .map(|expression| {
                 let (sequence, lookahead) = match expression.sequence.last() {
-                    Some((Item::Lookaround(lookaround_type, rule), Quantifier::Once, _)) => {
-                        if lookaround_type.positive || !lookaround_type.ahead {
-                            panic!("Only negative lookahead is supported");
+                    Some((Item::Lookaround(lookaround_type, rule), quantifier, _)) => {
+                        if *quantifier != Quantifier::Once {
+                            emit(
+                                "Lookaround cannot have a quantifier",
+                                vec![(lookaround_type.span, None)],
+                            );
                         }
-                        (
-                            &expression.sequence[..expression.sequence.len() - 1],
-                            Some(NonTerminal::new_anonymous(
-                                rule.clone(),
-                                current_name,
-                                generics.clone(),
-                            )),
-                        )
-                    }
-                    Some((Item::Lookaround(_, _), _, _)) => {
-                        panic!("Lookaround cannot have a quantifier")
+                        let sequence = &expression.sequence[..expression.sequence.len() - 1];
+                        if lookaround_type.positive || !lookaround_type.ahead {
+                            emit(
+                                "Only negative lookahead is supported",
+                                vec![(lookaround_type.span, None)],
+                            );
+                            (sequence, None)
+                        } else {
+                            (
+                                sequence,
+                                Some(NonTerminalUse::new_anonymous(
+                                    rule.clone(),
+                                    current_name,
+                                    generics.clone(),
+                                )),
+                            )
+                        }
                     }
                     _ => (&expression.sequence[..], None),
                 };
@@ -244,6 +278,7 @@ fn lower_rule(
                     })
                     .collect::<Vec<_>>();
                 Alternative {
+                    span: expression.span,
                     terms,
                     negative_lookahead: lookahead,
                 }
@@ -254,7 +289,7 @@ fn lower_rule(
 
 fn lower_term(
     language: &Language,
-    generics: &BTreeMap<Ident, NonTerminal>,
+    generics: &BTreeMap<Ident, NonTerminalUse>,
     item: &Item,
     quantifier: Quantifier,
     span: Span,
@@ -267,7 +302,7 @@ fn lower_term(
             span,
         });
         return Term {
-            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
+            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
                 Rule { alternatives, span },
                 current_name,
                 generics.clone(),
@@ -304,19 +339,34 @@ fn lower_term(
                     },
                 };
                 let definition = match language.definitions.get(ident) {
-                    Some(definitions) => &definitions[0],
-                    None => panic!("{ident} is not defined"),
+                    Some(definition) => definition,
+                    None => {
+                        emit("This identifier is not defined", vec![(span, None)]);
+                        return Term {
+                            kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
+                                rule: Rule {
+                                    span,
+                                    alternatives: BTreeSet::new(),
+                                },
+                                context: None,
+                                generics: BTreeMap::new(),
+                            }),
+                            silent: true,
+                            atomic: false,
+                        };
+                    }
                 };
                 let generic_parameters = generic_arguments
                     .iter()
                     .map(|arg| {
-                        NonTerminal::new_anonymous(arg.clone(), current_name, generics.clone())
+                        NonTerminalUse::new_anonymous(arg.clone(), current_name, generics.clone())
                     })
                     .collect();
                 Term {
-                    kind: TermKind::NonTerminal(NonTerminal::Named {
+                    kind: TermKind::NonTerminal(NonTerminalUse::Named {
                         name,
                         generics: generic_parameters,
+                        span,
                     }),
                     silent: definition.silent,
                     atomic: definition.atomic,
@@ -324,17 +374,17 @@ fn lower_term(
             }
         },
         Item::String(data) => Term {
-            kind: TermKind::Terminal(Terminal::new_token(regex_syntax::escape(data))),
+            kind: TermKind::Terminal(Terminal::new_token(regex_syntax::escape(data), span)),
             silent: false,
             atomic: true,
         },
         Item::Regex(regex) => Term {
-            kind: TermKind::Terminal(Terminal::new_token(regex.clone())),
+            kind: TermKind::Terminal(Terminal::new_token(regex.clone(), span)),
             silent: false,
             atomic: true,
         },
         Item::Group(rule) => Term {
-            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
+            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
                 rule.clone(),
                 current_name,
                 generics.clone(),
@@ -343,33 +393,103 @@ fn lower_term(
             atomic: false,
         },
         Item::Lookaround(_, _) => {
-            panic!("Only negative lookahead is supported at the end of an expression")
+            emit(
+                "Only negative lookahead is supported and only at the end of an expression",
+                vec![(span, None)],
+            );
+            Term {
+                kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
+                    rule: Rule {
+                        span,
+                        alternatives: BTreeSet::new(),
+                    },
+                    context: None,
+                    generics: BTreeMap::new(),
+                }),
+                silent: true,
+                atomic: false,
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminal {
+pub enum NonTerminalDefinition {
     Goal {
         ident: Ident,
+        span: Span,
     },
     Named {
         name: Name,
-        generics: Vec<NonTerminal>,
+        generics: Vec<NonTerminalDefinition>,
+        span: Span,
+    },
+    Anonymous {
+        rule: Rule,
+    },
+}
+
+impl NonTerminalDefinition {
+    pub fn span(&self) -> Span {
+        match self {
+            &NonTerminalDefinition::Goal { span, .. } => span,
+            &NonTerminalDefinition::Named { span, .. } => span,
+            NonTerminalDefinition::Anonymous { rule, .. } => rule.span,
+        }
+    }
+}
+
+impl fmt::Display for NonTerminalDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NonTerminalDefinition::Goal { ident, span: _ } => {
+                write!(f, "Goal({ident})")?;
+            }
+            NonTerminalDefinition::Named {
+                name,
+                generics,
+                span: _,
+            } => {
+                write!(f, "{name}")?;
+                if !generics.is_empty() {
+                    f.write_str("<")?;
+                    for (i, generic) in generics.iter().enumerate() {
+                        if i != 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{generic}")?;
+                    }
+                    f.write_str(">")?;
+                }
+            }
+            NonTerminalDefinition::Anonymous { rule } => {
+                write!(f, "{{{rule}}}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NonTerminalUse {
+    Goal {
+        ident: Ident,
+        span: Span,
+    },
+    Named {
+        name: Name,
+        generics: Vec<NonTerminalUse>,
+        span: Span,
     },
     Anonymous {
         rule: Rule,
         context: Option<Name>,
-        generics: BTreeMap<Ident, NonTerminal>,
+        generics: BTreeMap<Ident, NonTerminalUse>,
     },
 }
 
-impl NonTerminal {
-    fn new_anonymous(
-        rule: Rule,
-        context: Option<&Name>,
-        generics: BTreeMap<Ident, NonTerminal>,
-    ) -> NonTerminal {
+impl NonTerminalUse {
+    fn new_anonymous(rule: Rule, context: Option<&Name>, generics: BTreeMap<Ident, Self>) -> Self {
         fn contains_non_super_ident(rule: &Rule, context: &Ident) -> bool {
             rule.alternatives
                 .iter()
@@ -388,21 +508,51 @@ impl NonTerminal {
         let context = context
             .filter(|name| contains_non_super_ident(&rule, &name.ident))
             .cloned();
-        NonTerminal::Anonymous {
+        Self::Anonymous {
             rule,
             context,
             generics,
         }
     }
+
+    pub fn definition(&self, language: &Language) -> NonTerminalDefinition {
+        match self {
+            NonTerminalUse::Goal { ident, span } => NonTerminalDefinition::Goal {
+                ident: ident.clone(),
+                span: *span,
+            },
+            NonTerminalUse::Named {
+                name,
+                generics,
+                span: _,
+            } => NonTerminalDefinition::Named {
+                name: name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|generic| generic.definition(language))
+                    .collect(),
+                span: language.definitions[&name.ident].span,
+            },
+            NonTerminalUse::Anonymous {
+                rule,
+                context: _,
+                generics: _,
+            } => NonTerminalDefinition::Anonymous { rule: rule.clone() },
+        }
+    }
 }
 
-impl fmt::Display for NonTerminal {
+impl fmt::Display for NonTerminalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NonTerminal::Goal { ident } => {
+            NonTerminalUse::Goal { ident, span: _ } => {
                 write!(f, "Goal({ident})")?;
             }
-            NonTerminal::Named { name, generics } => {
+            NonTerminalUse::Named {
+                name,
+                generics,
+                span: _,
+            } => {
                 write!(f, "{name}")?;
                 if !generics.is_empty() {
                     f.write_str("<")?;
@@ -415,7 +565,7 @@ impl fmt::Display for NonTerminal {
                     f.write_str(">")?;
                 }
             }
-            NonTerminal::Anonymous {
+            NonTerminalUse::Anonymous {
                 rule,
                 generics,
                 context,
@@ -456,30 +606,62 @@ impl fmt::Display for Name {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Terminal {
-    Token(NFA, String),
-    EndOfInput(Ident),
+    Token(NFA, String, Span),
+    EndOfInput(Ident, Span),
 }
 
 impl Terminal {
-    fn new_token(regex: String) -> Self {
-        let nfa = NFA::compiler()
+    fn new_token(regex: String, span: Span) -> Self {
+        let nfa = match NFA::compiler()
             .configure(NFA::config().shrink(true))
             .build(&regex)
-            .expect("Invalid regex");
+        {
+            Ok(nfa) => nfa,
+            Err(error) => {
+                let mut message = error.to_string();
+                let mut error: &dyn Error = &error;
+                while let Some(source) = error.source() {
+                    error = source;
+                    write!(message, ": {}", error).unwrap();
+                }
+                emit("Failed to parse regex", vec![(span, Some(message))]);
+                return Self::Token(NFA::never_match(), regex, span);
+            }
+        };
         if nfa.has_empty() {
-            panic!("token {} matches empty string", regex);
+            emit("Tokens must not match the empty string", vec![(span, None)]);
         }
-        Self::Token(nfa, regex)
+        Self::Token(nfa, regex, span)
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Token(_, _, span) => *span,
+            Self::EndOfInput(_, span) => *span,
+        }
+    }
+}
+
+impl fmt::Debug for Terminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token(_, regex, span) => f.debug_tuple("Token").field(regex).field(span).finish(),
+            Self::EndOfInput(ident, span) => f
+                .debug_tuple("EndOfInput")
+                .field(ident)
+                .field(span)
+                .finish(),
+        }
     }
 }
 
 impl fmt::Display for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Terminal::Token(_, regex) => write!(f, "/{regex}/"),
-            Terminal::EndOfInput(goal) => write!(f, "EoI({goal})"),
+            Terminal::Token(_, regex, _) => write!(f, "/{regex}/"),
+            Terminal::EndOfInput(goal, _) => write!(f, "EoI({goal})"),
         }
     }
 }
@@ -487,8 +669,8 @@ impl fmt::Display for Terminal {
 impl PartialEq for Terminal {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Token(_, this), Self::Token(_, other)) => this.as_str() == other.as_str(),
-            (Self::EndOfInput(this), Self::EndOfInput(other)) => this == other,
+            (Self::Token(_, this, _), Self::Token(_, other, _)) => this.as_str() == other.as_str(),
+            (Self::EndOfInput(this, _), Self::EndOfInput(other, _)) => this == other,
             _ => false,
         }
     }
@@ -502,10 +684,12 @@ impl PartialOrd for Terminal {
 impl Ord for Terminal {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Self::Token(_, this), Self::Token(_, other)) => this.as_str().cmp(other.as_str()),
-            (Self::EndOfInput(this), Self::EndOfInput(other)) => this.cmp(other),
-            (Self::Token(_, _), _) => Ordering::Less,
-            (_, Self::Token(_, _)) => Ordering::Greater,
+            (Self::Token(_, this, _), Self::Token(_, other, _)) => {
+                this.as_str().cmp(other.as_str())
+            }
+            (Self::EndOfInput(this, _), Self::EndOfInput(other, _)) => this.cmp(other),
+            (Self::Token(_, _, _), _) => Ordering::Less,
+            (_, Self::Token(_, _, _)) => Ordering::Greater,
         }
     }
 }
@@ -513,8 +697,8 @@ impl Hash for Terminal {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
-            Self::Token(_, regex) => regex.as_str().hash(state),
-            Self::EndOfInput(goal) => goal.hash(state),
+            Self::Token(_, regex, _) => regex.as_str().hash(state),
+            Self::EndOfInput(goal, _) => goal.hash(state),
         }
     }
 }
@@ -538,17 +722,9 @@ impl fmt::Display for Production {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Alternative {
+    pub span: Span,
     pub terms: Vec<Term>,
-    pub negative_lookahead: Option<NonTerminal>,
-}
-
-impl From<Vec<Term>> for Alternative {
-    fn from(terms: Vec<Term>) -> Self {
-        Self {
-            terms,
-            negative_lookahead: None,
-        }
-    }
+    pub negative_lookahead: Option<NonTerminalUse>,
 }
 
 impl fmt::Display for Alternative {
@@ -588,7 +764,7 @@ impl fmt::Display for Term {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TermKind {
     Terminal(Terminal),
-    NonTerminal(NonTerminal),
+    NonTerminal(NonTerminalUse),
 }
 
 impl fmt::Display for TermKind {

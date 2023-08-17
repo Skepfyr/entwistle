@@ -1,9 +1,12 @@
+use std::fmt::Write;
+
 use regex_automata::{nfa::thompson::pikevm::PikeVM, Anchored, Input};
 use tracing::instrument;
 
 use crate::{
+    diagnostics::emit,
     language::{Ident, ParseTree, Test},
-    lower::{Name, NonTerminal, Term, Terminal},
+    lower::{Name, NonTerminalDefinition, Term, Terminal},
     parse_table::{Action, LrkParseTable},
 };
 
@@ -21,7 +24,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
             loop {
                 let Action::Ambiguous {
                     nfa,
-                    regexes: _,
+                    regexes,
                     actions,
                     eoi,
                 } = action
@@ -33,12 +36,29 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     break;
                 } else {
                     let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
-                    let half_match = pike_vm
-                        .find(
-                            &mut pike_vm.create_cache(),
-                            input.clone().range((offset + lookahead)..),
-                        )
-                        .expect("No matches");
+                    let Some(half_match) = pike_vm.find(
+                        &mut pike_vm.create_cache(),
+                        input.clone().range((offset + lookahead)..),
+                    ) else {
+                        let mut message = "Expected one of: ".to_string();
+                        for (i, regex) in regexes.iter().enumerate() {
+                            if i != 0 {
+                                write!(message, ", ").unwrap();
+                            }
+                            write!(message, "{regex}").unwrap();
+                        }
+                        emit(
+                            "Unable to find a match for any expected token",
+                            vec![(
+                                crate::Span {
+                                    start: offset,
+                                    end: offset,
+                                },
+                                Some(message),
+                            )],
+                        );
+                        return None;
+                    };
                     action = &actions[half_match.pattern().as_usize()];
                     lookahead += half_match.len();
                 }
@@ -47,11 +67,23 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
         };
         match action {
             Action::Ambiguous { .. } => unreachable!(),
-            Action::Shift(Terminal::Token(nfa, _), new_state) => {
+            Action::Shift(Terminal::Token(nfa, regex, _), new_state) => {
                 let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
-                let half_match = pike_vm
-                    .find(&mut pike_vm.create_cache(), input.clone().range(offset..))
-                    .expect("No matches");
+                let Some(half_match) =
+                    pike_vm.find(&mut pike_vm.create_cache(), input.clone().range(offset..))
+                else {
+                    emit(
+                        format!("Expected token: {regex}"),
+                        vec![(
+                            crate::Span {
+                                start: test.test_span.start + offset,
+                                end: test.test_span.start + offset,
+                            },
+                            None,
+                        )],
+                    );
+                    return None;
+                };
                 forest.push(ParseTree::Leaf {
                     ident: None,
                     data: String::from_utf8(input.haystack()[half_match.range()].to_owned())
@@ -60,7 +92,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                 states.push(*new_state);
                 offset = half_match.end();
             }
-            Action::Shift(Terminal::EndOfInput(_), new_state) => {
+            Action::Shift(Terminal::EndOfInput(_, _), new_state) => {
                 forest.push(ParseTree::Leaf {
                     ident: None,
                     data: String::new(),
@@ -72,7 +104,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     forest.split_off(forest.len().checked_sub(alternative.terms.len()).unwrap());
                 states.truncate(states.len().checked_sub(alternative.terms.len()).unwrap());
                 let ident = match non_terminal {
-                    NonTerminal::Goal { .. } => {
+                    NonTerminalDefinition::Goal { .. } => {
                         if alternative.terms[0].atomic {
                             break ParseTree::Leaf {
                                 ident: nodes[0].ident().cloned(),
@@ -82,11 +114,12 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                             break nodes.into_iter().next().unwrap();
                         }
                     }
-                    NonTerminal::Named {
+                    NonTerminalDefinition::Named {
                         name: Name { ident, .. },
                         generics: _,
+                        span: _,
                     } => ident.clone(),
-                    NonTerminal::Anonymous { .. } => Ident("anon".into()),
+                    NonTerminalDefinition::Anonymous { .. } => Ident("anon".into()),
                 };
 
                 let nodes = nodes

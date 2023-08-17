@@ -103,7 +103,7 @@
   macro
   override
   priv
-  typeOf
+  typeof
   unsized
   virtual
   yield
@@ -132,13 +132,13 @@
 
 @Whitespace: /\s/
 
-@EscapedNewline: r"\n"
-@EscapedCarriageReturn: r"\r"
-@EscapedTab: r"\t"
-@EscapedBackslash: r"\\"
-@EscapedNull: r"\0"
-@EscapedSingleQuote: r"\'"
-@EscapedDoubleQuote: r#"\""#
+@EscapedNewline: "\\n"
+@EscapedCarriageReturn: "\\r"
+@EscapedTab: "\\t"
+@EscapedBackslash: "\\\\"
+@EscapedNull: "\\0"
+@EscapedSingleQuote: "\\'"
+@EscapedDoubleQuote: #"\\""#
 @EscapedAsciiChar: /\\x[0-7][0-9a-fA-F]/
 @EscapedByte: /\\x[0-9a-fA-F]{2}/
 @EscapedUnicodeChar: /\\u\{([0-9a-fA-F]_*){1,6}\}/
@@ -183,7 +183,7 @@
 Character: "'" NonSingleQuoteStringChar "'"
 
 -@NonDoubleQuoteStringChar: (!>> '"') (StringChar | StringContinue)
-String: r#"""# NonDoubleQuoteStringChar* r#"""#
+String: '"' NonDoubleQuoteStringChar* '"'
 
 @RawStringContents<Hashes>: (!>> Hashes) /\P{C}/
 RawString: /r#{N}"/ RawStringContents</#{N}/> /"#{N}/
@@ -204,7 +204,7 @@ RawByteString: /br#{N}"/ RawStringContents</#{N}/> /"#{N}/
   /0o[0-7_]+/
   /0b[01_]+/
 
-@Float: /[0-9_]+(.[0-9_]+)?((e|E)(+|-)[0-9_]+)?/
+@Float: /[0-9_]+(.[0-9_]+)?((e|E)(\+|-)[0-9_]+)?/
 
 @Number: Integer | Float
 

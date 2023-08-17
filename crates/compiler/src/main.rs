@@ -1,8 +1,9 @@
-use std::{collections::HashSet, error::Error};
+use std::{collections::HashSet, error::Error, path::Path};
 
 use entwistle::{
+    diagnostics::diagnostics,
     language::Language,
-    lower::{production, NonTerminal, TermKind},
+    lower::{production, NonTerminalUse, TermKind},
     parse_table::parse_table,
     test::run_test,
 };
@@ -14,18 +15,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let file = std::env::args().nth(1).unwrap();
+    let file = Path::new(&file);
 
     let input = std::fs::read_to_string(file)?;
     let language = Language::parse(&input);
+
+    let diags = diagnostics();
+    if !diags.is_empty() {
+        for diag in diags {
+            diag.print(&input, file).unwrap();
+        }
+        return Ok(());
+    }
 
     println!("--------------");
 
     let mut non_terminals = language
         .definitions
         .iter()
-        .filter(|(_, definitions)| definitions.len() == 1 && definitions[0].generics.is_empty())
-        .map(|(ident, _)| NonTerminal::Goal {
+        .filter(|(_, definition)| definition.generics.is_empty())
+        .map(|(ident, definition)| NonTerminalUse::Goal {
             ident: ident.clone(),
+            span: definition.span,
         })
         .collect::<Vec<_>>();
     let mut visited = HashSet::new();
@@ -52,10 +63,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
     }
 
+    let diags = diagnostics();
+    if !diags.is_empty() {
+        for diag in diags {
+            diag.print(&input, file).unwrap();
+        }
+        return Ok(());
+    }
+
     println!("--------------");
 
     let parse_table = parse_table(&language);
     println!("{parse_table}");
+
+    let diags = diagnostics();
+    if !diags.is_empty() {
+        for diag in diags {
+            diag.print(&input, file).unwrap();
+        }
+        return Ok(());
+    }
 
     println!("--------------");
 
@@ -63,6 +90,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(tree) = run_test(&parse_table, test) {
             println!("Test failed:\n{tree}");
         }
+    }
+
+    let diags = diagnostics();
+    if !diags.is_empty() {
+        for diag in diags {
+            diag.print(&input, file).unwrap();
+        }
+        return Ok(());
     }
 
     Ok(())

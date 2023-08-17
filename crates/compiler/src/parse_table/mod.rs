@@ -15,8 +15,12 @@ use regex_automata::{
 use tracing::{debug, debug_span, trace};
 
 use crate::{
+    diagnostics::emit,
     language::{Ident, Language},
-    lower::{production, Alternative, NonTerminal, Term, TermKind, Terminal},
+    lower::{
+        production, Alternative, NonTerminalDefinition, NonTerminalUse, Term, TermKind, Terminal,
+    },
+    Span,
 };
 
 use self::term_string::TermString;
@@ -68,7 +72,7 @@ impl fmt::Display for StateId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub action: Action,
-    pub goto: HashMap<NonTerminal, StateId>,
+    pub goto: HashMap<NonTerminalDefinition, StateId>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +84,7 @@ pub enum Action {
         eoi: HashMap<Ident, Action>,
     },
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Alternative),
+    Reduce(NonTerminalDefinition, Alternative),
 }
 
 impl fmt::Display for Action {
@@ -154,13 +158,13 @@ impl Eq for Action {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Item {
-    pub non_terminal: NonTerminal,
+    pub non_terminal: NonTerminalDefinition,
     pub alternative: Alternative,
     pub index: usize,
 }
 
 impl Item {
-    fn new(non_terminal: NonTerminal, alternative: Alternative) -> Self {
+    fn new(non_terminal: NonTerminalDefinition, alternative: Alternative) -> Self {
         Self {
             non_terminal,
             alternative,
@@ -194,7 +198,31 @@ impl fmt::Display for ItemIndex {
     }
 }
 
-pub fn first_set(language: &Language, non_terminal: &NonTerminal) -> (bool, HashSet<Terminal>) {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum TermDef {
+    Terminal(Terminal),
+    NonTerminal(NonTerminalDefinition),
+}
+
+impl TermDef {
+    fn new(term: &Term, language: &Language) -> Self {
+        match &term.kind {
+            TermKind::Terminal(t) => Self::Terminal(t.clone()),
+            TermKind::NonTerminal(nt) => Self::NonTerminal(nt.definition(language)),
+        }
+    }
+}
+
+impl fmt::Display for TermDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Terminal(t) => write!(f, "{}", t),
+            Self::NonTerminal(nt) => write!(f, "{}", nt),
+        }
+    }
+}
+
+pub fn first_set(language: &Language, non_terminal: &NonTerminalUse) -> (bool, HashSet<Terminal>) {
     production(language, non_terminal)
         .alternatives
         .iter()
@@ -266,7 +294,7 @@ impl Index<ItemIndex> for Lr0ParseTable {
 pub struct Lr0State {
     pub item_set: Vec<(Item, BTreeSet<ItemIndex>)>,
     pub actions: HashMap<Terminal, Lr0StateId>,
-    pub goto: HashMap<NonTerminal, Lr0StateId>,
+    pub goto: HashMap<NonTerminalDefinition, Lr0StateId>,
 }
 
 impl fmt::Display for Lr0State {
@@ -307,17 +335,21 @@ pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
     let mut start_states = HashMap::new();
-    for (ident, definitions) in &language.definitions {
-        if definitions.len() != 1 || !definitions[0].generics.is_empty() {
+    for (ident, definition) in &language.definitions {
+        if !definition.generics.is_empty() {
             continue;
         }
-        let goal = NonTerminal::Goal {
+        let goal = NonTerminalUse::Goal {
             ident: ident.clone(),
+            span: definition.span,
         };
         let mut root_item_set = BTreeSet::new();
         for alternative in &production(language, &goal).alternatives {
             // There should only be one but doesn't hurt to add them "all"
-            root_item_set.insert(Item::new(goal.clone(), alternative.clone()));
+            root_item_set.insert(Item::new(
+                goal.clone().definition(language),
+                alternative.clone(),
+            ));
         }
         let new_state = add_state(language, &mut states, &root_item_set);
         start_states.insert(ident.clone(), new_state);
@@ -330,14 +362,20 @@ pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
         let state = &mut states[state_id];
         for (item, _) in &state.item_set {
             if let Some(next) = item.next() {
-                terms.insert(next);
+                terms.insert(TermDef::new(&next, language));
             }
         }
 
         for term in terms {
             let mut new_state: HashMap<_, HashSet<_>> = HashMap::new();
             for (id, (item, _)) in states[state_id].item_set.iter().enumerate() {
-                if item.next().as_ref() != Some(&term) {
+                if item
+                    .next()
+                    .as_ref()
+                    .map(|t| TermDef::new(t, language))
+                    .as_ref()
+                    != Some(&term)
+                {
                     continue;
                 }
                 new_state
@@ -362,11 +400,11 @@ pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
                     back_refs.extend(new_back_refs.iter().copied());
                 }
             }
-            match term.kind {
-                TermKind::NonTerminal(nt) => {
+            match term {
+                TermDef::NonTerminal(nt) => {
                     states[state_id].goto.insert(nt, next_state_id);
                 }
-                TermKind::Terminal(t) => {
+                TermDef::Terminal(t) => {
                     states[state_id].actions.insert(t, next_state_id);
                 }
             }
@@ -420,21 +458,20 @@ fn closure(
             }) => nt,
             _ => continue,
         };
+        let nt_def = non_terminal.definition(language);
 
-        let start = *added
-            .entry(non_terminal.clone())
-            .or_insert_with_key(|non_terminal| {
-                let start = state.len();
-                state.extend(
-                    production(language, non_terminal)
-                        .alternatives
-                        .iter()
-                        .map(|p| (Item::new(non_terminal.clone(), p.clone()), BTreeSet::new())),
-                );
-                start
-            });
+        let start = *added.entry(nt_def.clone()).or_insert_with(|| {
+            let start = state.len();
+            state.extend(
+                production(language, &non_terminal)
+                    .alternatives
+                    .iter()
+                    .map(|p| (Item::new(nt_def.clone(), p.clone()), BTreeSet::new())),
+            );
+            start
+        });
         for (item, back_refs) in &mut state[start..] {
-            if item.non_terminal != non_terminal {
+            if item.non_terminal != nt_def {
                 break;
             }
             back_refs.insert(ItemIndex {
@@ -555,14 +592,14 @@ fn make_action(
             conflicts
                 .into_iter()
                 .next()
-                .expect("conflicts contains 1 item")
+                .expect("conflicts contains 1 item") // ICE
                 .0
                 .into(),
         );
     }
 
     let mut split_info = HashMap::new();
-    let mut potential_ambiguity = false;
+    let mut potential_ambiguities = HashSet::new();
     let mut next: HashMap<Terminal, HashMap<ConflictedAction, Vec<Ambiguity>>> = HashMap::new();
 
     // Extend ambiguities to next lookahead item
@@ -602,14 +639,22 @@ fn make_action(
                     None => {
                         // term_string is empty, so we must now walk the parse table.
                         let mut lane_heads = HashSet::new();
-                        potential_ambiguity |= item_lane_heads(
-                            lr0_parse_table,
-                            action.clone(),
-                            location,
-                            transition.clone(),
-                            &mut split_info,
-                            &mut lane_members,
-                            &mut lane_heads,
+                        potential_ambiguities.extend(
+                            item_lane_heads(
+                                language,
+                                lr0_parse_table,
+                                action.clone(),
+                                location,
+                                transition.clone(),
+                                &mut split_info,
+                                &mut lane_members,
+                                &mut lane_heads,
+                            )
+                            .into_iter()
+                            .map(|mut source| {
+                                source.history = history.clone();
+                                source
+                            }),
                         );
                         ambiguities.extend(lane_heads.into_iter().map(|(location, transition)| {
                             trace!(%location, "Walking parse table");
@@ -637,7 +682,10 @@ fn make_action(
 
     let mut splitting_occurred = false;
     for (state, split_table) in split_info {
-        let mut splits: Vec<(HashSet<Term>, HashMap<NonTerminal, ConflictedAction>)> = Vec::new();
+        let mut splits: Vec<(
+            HashSet<TermDef>,
+            HashMap<NonTerminalDefinition, ConflictedAction>,
+        )> = Vec::new();
         for (term, actions) in split_table {
             let (terms, split_actions) = match splits.iter_mut().find(|(_, split)| {
                 actions.iter().all(|(nt, action)| {
@@ -689,9 +737,9 @@ fn make_action(
         }
         for (mark, (terms, _)) in splits.iter().enumerate() {
             for next in terms {
-                let next_state = match &next.kind {
-                    TermKind::Terminal(t) => lr0_parse_table[state].actions[t],
-                    TermKind::NonTerminal(nt) => lr0_parse_table[state].goto[nt],
+                let next_state = match &next {
+                    TermDef::Terminal(t) => lr0_parse_table[state].actions[t],
+                    TermDef::NonTerminal(nt) => lr0_parse_table[state].goto[&nt],
                 };
                 visit(
                     lr0_parse_table,
@@ -777,11 +825,43 @@ fn make_action(
         return None;
     }
 
-    if potential_ambiguity {
-        panic!("Ambiguity!");
+    if !potential_ambiguities.is_empty() {
+        debug!("Ambiguity detected");
+        for ambiguity in potential_ambiguities {
+            let string_for_conflict = |conflict: &ConflictedAction| match conflict {
+                ConflictedAction::Shift(_, _) => "could continue and read this".to_string(),
+                ConflictedAction::Reduce(nt, _, _) => format!("might have just read a {nt}"),
+            };
+            emit(
+                format!("Ambiguity {ambiguity}"),
+                vec![
+                    (
+                        ambiguity.conflict_a.span(),
+                        Some(string_for_conflict(&ambiguity.conflict_a)),
+                    ),
+                    (
+                        ambiguity.conflict_b.span(),
+                        Some(string_for_conflict(&ambiguity.conflict_b)),
+                    ),
+                ],
+            );
+        }
+        // Pick an arbitrary action to resolve the ambiguity
+        return Some(
+            next.into_iter()
+                .next()
+                .unwrap()
+                .1
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+                .into(),
+        );
     }
 
     let mut regexes = Vec::with_capacity(next.len());
+    let mut spans = Vec::with_capacity(next.len());
     let mut actions = Vec::with_capacity(next.len());
     let mut eoi = HashMap::new();
     for (terminal, conflicts) in next {
@@ -805,7 +885,7 @@ fn make_action(
             .enumerate()
             .any(|(i, set1)| loops[i + 1..].iter().any(|set2| !set1.is_disjoint(set2)));
         if contains_common_loops {
-            panic!("Ambiguity!");
+            panic!("I don't understand this code anymore, I think it's trying to prevent infinite loops");
         }
         let span = debug_span!("make_action", %terminal);
         let _guard = span.enter();
@@ -817,11 +897,12 @@ fn make_action(
             invalidate_state,
         )?;
         match terminal {
-            Terminal::Token(_, regex) => {
+            Terminal::Token(_, regex, span) => {
                 regexes.push(regex);
+                spans.push(span);
                 actions.push(action);
             }
-            Terminal::EndOfInput(ident) => {
+            Terminal::EndOfInput(ident, _) => {
                 eoi.insert(ident, action);
             }
         };
@@ -832,7 +913,7 @@ fn make_action(
         .build_many(&regexes)
         .unwrap();
 
-    validate_nfa(&nfa, &regexes);
+    validate_nfa(&nfa, &regexes, &spans);
 
     Some(Action::Ambiguous {
         nfa,
@@ -843,14 +924,18 @@ fn make_action(
 }
 
 fn item_lane_heads(
+    language: &Language,
     lr0_parse_table: &Lr0ParseTable,
     action: ConflictedAction,
     location: ItemIndex,
-    transition: Option<Term>,
-    split_info: &mut HashMap<Lr0StateId, HashMap<Term, HashMap<NonTerminal, ConflictedAction>>>,
+    transition: Option<TermDef>,
+    split_info: &mut HashMap<
+        Lr0StateId,
+        HashMap<TermDef, HashMap<NonTerminalDefinition, ConflictedAction>>,
+    >,
     visited: &mut HashMap<ItemIndex, u32>,
-    output: &mut HashSet<(ItemIndex, Option<Term>)>,
-) -> bool {
+    output: &mut HashSet<(ItemIndex, Option<TermDef>)>,
+) -> HashSet<AmbiguitySource> {
     trace!(
         %action,
         %location,
@@ -862,11 +947,11 @@ fn item_lane_heads(
     let num_visits = visited.entry(location).or_default();
     // Allow the search to pass through nodes twice so that cycles get counted properly.
     if *num_visits >= 2 {
-        return false;
+        return HashSet::new();
     }
     *num_visits += 1;
 
-    let mut ret = false;
+    let mut ret = HashSet::new();
     if let Some(next_state) = &transition {
         let existing_action = split_info
             .entry(location.state_id)
@@ -877,7 +962,14 @@ fn item_lane_heads(
         match existing_action {
             Entry::Occupied(entry) => {
                 if *entry.get() != action {
-                    ret = true;
+                    ret.insert(AmbiguitySource {
+                        state: location.state_id,
+                        transition: next_state.clone(),
+                        non_terminal: item.non_terminal.clone(),
+                        conflict_a: action.clone(),
+                        conflict_b: entry.get().clone(),
+                        history: History::default(),
+                    });
                 }
             }
             Entry::Vacant(entry) => {
@@ -891,9 +983,14 @@ fn item_lane_heads(
             let transition = if item_index.state_id == location.state_id {
                 transition.clone()
             } else {
-                lr0_parse_table[item_index].0.next()
+                lr0_parse_table[item_index]
+                    .0
+                    .next()
+                    .as_ref()
+                    .map(|t| TermDef::new(t, language))
             };
-            ret |= item_lane_heads(
+            ret.extend(item_lane_heads(
+                language,
                 lr0_parse_table,
                 action.clone(),
                 item_index,
@@ -901,19 +998,51 @@ fn item_lane_heads(
                 split_info,
                 visited,
                 output,
-            );
+            ));
         }
     } else {
         for &back_ref in back_refs {
             let transition = if back_ref.state_id == location.state_id {
                 transition.clone()
             } else {
-                lr0_parse_table[back_ref].0.next()
+                lr0_parse_table[back_ref]
+                    .0
+                    .next()
+                    .as_ref()
+                    .map(|t| TermDef::new(t, language))
             };
             output.insert((back_ref, transition));
         }
     }
     ret
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct AmbiguitySource {
+    state: Lr0StateId,
+    transition: TermDef,
+    non_terminal: NonTerminalDefinition,
+    conflict_a: ConflictedAction,
+    conflict_b: ConflictedAction,
+    history: History,
+}
+
+impl fmt::Display for AmbiguitySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "\n\
+            Ambiguity for {} and {}\n\
+            in state {} for non-terminal {} and transition {}\n\
+            history: {}",
+            self.conflict_a,
+            self.conflict_b,
+            self.state,
+            self.non_terminal,
+            self.transition,
+            self.history
+        )
+    }
 }
 
 fn conflicts(
@@ -991,7 +1120,7 @@ fn conflicts(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Alternative, Vec<Arc<TermString>>),
+    Reduce(NonTerminalDefinition, Alternative, Vec<Arc<TermString>>),
 }
 
 impl ConflictedAction {
@@ -1028,6 +1157,13 @@ impl ConflictedAction {
             }
         }
     }
+
+    fn span(&self) -> Span {
+        match self {
+            ConflictedAction::Shift(terminal, _) => terminal.span(),
+            ConflictedAction::Reduce(_, alternative, _) => alternative.span,
+        }
+    }
 }
 
 impl fmt::Display for ConflictedAction {
@@ -1062,7 +1198,7 @@ impl From<ConflictedAction> for Action {
 #[derive(Debug, Clone)]
 struct Ambiguity {
     location: ItemIndex,
-    transition: Option<Term>,
+    transition: Option<TermDef>,
     history: History,
     term_string: Arc<TermString>,
 }
@@ -1073,7 +1209,7 @@ impl fmt::Display for Ambiguity {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct History(Vec<(ItemIndex, TermString)>);
 
 impl fmt::Display for History {
@@ -1092,8 +1228,8 @@ impl fmt::Display for History {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalNonTerminal {
-    Original(NonTerminal),
-    Minus(NonTerminal, TermKind),
+    Original(NonTerminalUse),
+    Minus(NonTerminalUse, TermKind),
 }
 
 impl fmt::Display for NormalNonTerminal {
@@ -1108,14 +1244,14 @@ impl fmt::Display for NormalNonTerminal {
     }
 }
 
-impl From<NonTerminal> for NormalNonTerminal {
-    fn from(nt: NonTerminal) -> Self {
+impl From<NonTerminalUse> for NormalNonTerminal {
+    fn from(nt: NonTerminalUse) -> Self {
         Self::Original(nt)
     }
 }
 
 impl NormalNonTerminal {
-    fn base(&self) -> &NonTerminal {
+    fn base(&self) -> &NonTerminalUse {
         match self {
             NormalNonTerminal::Original(nt) => nt,
             NormalNonTerminal::Minus(nt, _) => nt,
@@ -1249,11 +1385,11 @@ fn normal_production(
     }
 }
 
-fn left_recursive(language: &Language, non_terminal: NonTerminal) -> bool {
+fn left_recursive(language: &Language, non_terminal: NonTerminalUse) -> bool {
     proper_left_corners(language, &non_terminal).contains(&TermKind::NonTerminal(non_terminal))
 }
 
-fn proper_left_corners(language: &Language, non_terminal: &NonTerminal) -> HashSet<TermKind> {
+fn proper_left_corners(language: &Language, non_terminal: &NonTerminalUse) -> HashSet<TermKind> {
     let mut left_corners = HashSet::new();
     let mut todo = vec![non_terminal.clone()];
 
@@ -1306,13 +1442,13 @@ fn can_be_empty(language: &Language, term: &TermKind) -> bool {
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.
-fn validate_nfa(nfa: &NFA, regexes: &[String]) {
+fn validate_nfa(nfa: &NFA, regexes: &[String], spans: &[Span]) {
     assert!(nfa.pattern_len() == regexes.len());
     let mut start = BTreeSet::new();
     start.insert(nfa.start_anchored());
-    let mut to_visit = vec![(start, None::<PatternID>)];
-    let mut visited = HashMap::new();
-    while let Some((mut states, mut new_colour)) = to_visit.pop() {
+    let mut to_visit = vec![(start, None::<(PatternID, Vec<u8>)>, Vec::new())];
+    let mut visited = HashSet::new();
+    while let Some((mut states, mut new_colour, string)) = to_visit.pop() {
         loop {
             let mut to_add = Vec::new();
             for &id in &states {
@@ -1341,16 +1477,7 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
                 break;
             }
         }
-        if let Some(old_colour) = visited.get(&states).copied() {
-            if let (Some(old_colour), Some(new_colour)) = (old_colour, new_colour) {
-                if new_colour != old_colour {
-                    panic!(
-                        "Conflicting tokens: {} and {}",
-                        regexes[old_colour.as_usize()],
-                        regexes[new_colour.as_usize()]
-                    );
-                }
-            }
+        if !visited.insert(states.clone()) {
             continue;
         }
         let mut intrinsic_colour: Option<PatternID> = None;
@@ -1361,10 +1488,15 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
             {
                 if let Some(other_colour) = intrinsic_colour {
                     if other_colour != this_colour {
-                        panic!(
-                            "Conflicting tokens: {} and {}",
-                            regexes[other_colour.as_usize()],
-                            regexes[this_colour.as_usize()]
+                        emit(
+                            format!(
+                                "Two tokens match the string {}",
+                                String::from_utf8_lossy(&string)
+                            ),
+                            vec![
+                                (spans[other_colour.as_usize()], None),
+                                (spans[this_colour.as_usize()], None),
+                            ],
                         );
                     }
                 } else {
@@ -1372,16 +1504,32 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
                 }
             }
         }
-        if let (Some(intrinsic_colour), Some(new_colour)) = (intrinsic_colour, new_colour) {
-            if new_colour != intrinsic_colour {
-                panic!(
-                    "Conflicting tokens: {} and {}",
-                    regexes[intrinsic_colour.as_usize()],
-                    regexes[new_colour.as_usize()]
+        if let (Some(intrinsic_colour), Some((new_colour, prefix))) =
+            (intrinsic_colour, &new_colour)
+        {
+            if *new_colour != intrinsic_colour {
+                emit(
+                    "Tokens conflict as one matches the prefix of the other",
+                    vec![
+                        (
+                            spans[intrinsic_colour.as_usize()],
+                            Some(format!(
+                                "matches the string {:?}",
+                                String::from_utf8_lossy(&string)
+                            )),
+                        ),
+                        (
+                            spans[new_colour.as_usize()],
+                            Some(format!(
+                                "matches the prefix {:?}",
+                                String::from_utf8_lossy(prefix)
+                            )),
+                        ),
+                    ],
                 );
             }
         }
-        new_colour = new_colour.or(intrinsic_colour);
+        new_colour = new_colour.or_else(|| intrinsic_colour.map(|c| (c, string.clone())));
         for i in 0..=u8::MAX {
             let next_states: BTreeSet<_> = states
                 .iter()
@@ -1398,9 +1546,10 @@ fn validate_nfa(nfa: &NFA, regexes: &[String]) {
                 })
                 .collect();
             if !next_states.is_empty() {
-                to_visit.push((next_states, new_colour));
+                let mut prefix = string.clone();
+                prefix.push(i);
+                to_visit.push((next_states, new_colour.clone(), prefix));
             }
         }
-        visited.insert(states, new_colour);
     }
 }

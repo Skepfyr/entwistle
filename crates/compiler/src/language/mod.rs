@@ -21,7 +21,7 @@ impl fmt::Display for Ident {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Language {
-    pub definitions: HashMap<Ident, Vec<Definition>>,
+    pub definitions: HashMap<Ident, Definition>,
     pub tests: HashMap<Ident, Vec<Test>>,
 }
 
@@ -60,10 +60,9 @@ impl Language {
                     _ => {}
                 })
         }
-        self.definitions[ident]
-            .iter()
-            .flat_map(|definition| &definition.rules)
-            .for_each(|rule| production_deps(&mut dependencies, rule));
+        for rule in &self.definitions[ident].rules {
+            production_deps(&mut dependencies, rule)
+        }
         dependencies
     }
 }
@@ -168,6 +167,7 @@ impl fmt::Display for Item {
 pub struct LookaroundType {
     pub positive: bool,
     pub ahead: bool,
+    pub span: Span,
 }
 
 impl fmt::Display for LookaroundType {
@@ -225,8 +225,9 @@ impl fmt::Display for Mark {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Test {
     pub ident: Ident,
-    pub span: Span,
+    pub ident_span: Span,
     pub test: Arc<str>,
+    pub test_span: Span,
     pub parse_tree: ParseTree,
 }
 
