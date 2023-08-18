@@ -414,14 +414,14 @@ fn lower_term(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalDefinition {
+pub enum NonTerminalDef {
     Goal {
         ident: Ident,
         span: Span,
     },
     Named {
         name: Name,
-        generics: Vec<NonTerminalDefinition>,
+        generics: Vec<NonTerminalDef>,
         span: Span,
     },
     Anonymous {
@@ -429,23 +429,23 @@ pub enum NonTerminalDefinition {
     },
 }
 
-impl NonTerminalDefinition {
+impl NonTerminalDef {
     pub fn span(&self) -> Span {
         match self {
-            &NonTerminalDefinition::Goal { span, .. } => span,
-            &NonTerminalDefinition::Named { span, .. } => span,
-            NonTerminalDefinition::Anonymous { rule, .. } => rule.span,
+            &NonTerminalDef::Goal { span, .. } => span,
+            &NonTerminalDef::Named { span, .. } => span,
+            NonTerminalDef::Anonymous { rule, .. } => rule.span,
         }
     }
 }
 
-impl fmt::Display for NonTerminalDefinition {
+impl fmt::Display for NonTerminalDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NonTerminalDefinition::Goal { ident, span: _ } => {
+            NonTerminalDef::Goal { ident, span: _ } => {
                 write!(f, "Goal({ident})")?;
             }
-            NonTerminalDefinition::Named {
+            NonTerminalDef::Named {
                 name,
                 generics,
                 span: _,
@@ -462,7 +462,7 @@ impl fmt::Display for NonTerminalDefinition {
                     f.write_str(">")?;
                 }
             }
-            NonTerminalDefinition::Anonymous { rule } => {
+            NonTerminalDef::Anonymous { rule } => {
                 write!(f, "{{{rule}}}")?;
             }
         }
@@ -515,9 +515,9 @@ impl NonTerminalUse {
         }
     }
 
-    pub fn definition(&self, language: &Language) -> NonTerminalDefinition {
+    pub fn definition(&self, language: &Language) -> NonTerminalDef {
         match self {
-            NonTerminalUse::Goal { ident, span } => NonTerminalDefinition::Goal {
+            NonTerminalUse::Goal { ident, span } => NonTerminalDef::Goal {
                 ident: ident.clone(),
                 span: *span,
             },
@@ -525,7 +525,7 @@ impl NonTerminalUse {
                 name,
                 generics,
                 span: _,
-            } => NonTerminalDefinition::Named {
+            } => NonTerminalDef::Named {
                 name: name.clone(),
                 generics: generics
                     .iter()
@@ -537,7 +537,7 @@ impl NonTerminalUse {
                 rule,
                 context: _,
                 generics: _,
-            } => NonTerminalDefinition::Anonymous { rule: rule.clone() },
+            } => NonTerminalDef::Anonymous { rule: rule.clone() },
         }
     }
 }

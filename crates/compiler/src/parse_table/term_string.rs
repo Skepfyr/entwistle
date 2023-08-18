@@ -29,14 +29,6 @@ impl TermString {
     pub fn next(self: Arc<Self>, language: &Language) -> Iter {
         Iter::new(self, language)
     }
-
-    pub fn with_no_parent(&self) -> TermString {
-        TermString {
-            terms: self.terms.clone(),
-            next_term: self.next_term,
-            parent: None,
-        }
-    }
 }
 
 impl fmt::Display for TermString {

@@ -74,10 +74,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("--------------");
 
     let parse_table = parse_table(&language);
-    println!("{parse_table}");
 
     let diags = diagnostics();
-    if !diags.is_empty() {
+    if diags.is_empty() {
+        println!("{parse_table}");
+    } else {
         for diag in diags {
             diag.print(&input, file).unwrap();
         }
@@ -90,14 +91,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(tree) = run_test(&parse_table, test) {
             println!("Test failed:\n{tree}");
         }
-    }
 
-    let diags = diagnostics();
-    if !diags.is_empty() {
-        for diag in diags {
-            diag.print(&input, file).unwrap();
+        let diags = diagnostics();
+        if !diags.is_empty() {
+            for diag in diags {
+                diag.print(&input, file).unwrap();
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     Ok(())

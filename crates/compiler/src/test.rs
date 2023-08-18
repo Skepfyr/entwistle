@@ -6,7 +6,7 @@ use tracing::instrument;
 use crate::{
     diagnostics::emit,
     language::{Ident, ParseTree, Test},
-    lower::{Name, NonTerminalDefinition, Term, Terminal},
+    lower::{Name, NonTerminalDef, Term, Terminal},
     parse_table::{Action, LrkParseTable},
 };
 
@@ -104,7 +104,7 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     forest.split_off(forest.len().checked_sub(alternative.terms.len()).unwrap());
                 states.truncate(states.len().checked_sub(alternative.terms.len()).unwrap());
                 let ident = match non_terminal {
-                    NonTerminalDefinition::Goal { .. } => {
+                    NonTerminalDef::Goal { .. } => {
                         if alternative.terms[0].atomic {
                             break ParseTree::Leaf {
                                 ident: nodes[0].ident().cloned(),
@@ -114,12 +114,12 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                             break nodes.into_iter().next().unwrap();
                         }
                     }
-                    NonTerminalDefinition::Named {
+                    NonTerminalDef::Named {
                         name: Name { ident, .. },
                         generics: _,
                         span: _,
                     } => ident.clone(),
-                    NonTerminalDefinition::Anonymous { .. } => Ident("anon".into()),
+                    NonTerminalDef::Anonymous { .. } => Ident("anon".into()),
                 };
 
                 let nodes = nodes

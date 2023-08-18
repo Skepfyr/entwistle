@@ -164,12 +164,12 @@ fn expression(
     rule: impl Parser<char, Rule, Error = ParseError> + Clone,
 ) -> impl Parser<char, Expression, Error = ParseError> {
     choice((
+        just('(').then(lws()).then(just(')')).to(Vec::new()),
         term(rule)
             .then(quantifier())
             .map_with_span(|(item, quantifier), span| (item, quantifier, span))
             .separated_by(lws())
             .at_least(1),
-        just("()").to(Vec::new()),
     ))
     .map_with_span(|sequence, span| Expression { sequence, span })
 }
@@ -189,7 +189,11 @@ fn term(
         quoted_string().map(Item::String),
         regex().map(Item::Regex),
         just('(')
-            .ignore_then(lookaround().then(rule.clone()))
+            .ignore_then(
+                lookaround()
+                    .padded_by(lws())
+                    .then(rule.clone().padded_by(lws())),
+            )
             .then_ignore(just(')'))
             .map(|(lookaround_type, rule)| Item::Lookaround(lookaround_type, rule)),
         just('(')

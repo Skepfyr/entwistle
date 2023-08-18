@@ -17,9 +17,7 @@ use tracing::{debug, debug_span, trace};
 use crate::{
     diagnostics::emit,
     language::{Ident, Language},
-    lower::{
-        production, Alternative, NonTerminalDefinition, NonTerminalUse, Term, TermKind, Terminal,
-    },
+    lower::{production, Alternative, NonTerminalDef, NonTerminalUse, Term, TermKind, Terminal},
     Span,
 };
 
@@ -72,7 +70,7 @@ impl fmt::Display for StateId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub action: Action,
-    pub goto: HashMap<NonTerminalDefinition, StateId>,
+    pub goto: HashMap<NonTerminalDef, StateId>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +82,7 @@ pub enum Action {
         eoi: HashMap<Ident, Action>,
     },
     Shift(Terminal, StateId),
-    Reduce(NonTerminalDefinition, Alternative),
+    Reduce(NonTerminalDef, Alternative),
 }
 
 impl fmt::Display for Action {
@@ -158,13 +156,13 @@ impl Eq for Action {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Item {
-    pub non_terminal: NonTerminalDefinition,
+    pub non_terminal: NonTerminalDef,
     pub alternative: Alternative,
     pub index: usize,
 }
 
 impl Item {
-    fn new(non_terminal: NonTerminalDefinition, alternative: Alternative) -> Self {
+    fn new(non_terminal: NonTerminalDef, alternative: Alternative) -> Self {
         Self {
             non_terminal,
             alternative,
@@ -201,7 +199,7 @@ impl fmt::Display for ItemIndex {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum TermDef {
     Terminal(Terminal),
-    NonTerminal(NonTerminalDefinition),
+    NonTerminal(NonTerminalDef),
 }
 
 impl TermDef {
@@ -294,7 +292,7 @@ impl Index<ItemIndex> for Lr0ParseTable {
 pub struct Lr0State {
     pub item_set: Vec<(Item, BTreeSet<ItemIndex>)>,
     pub actions: HashMap<Terminal, Lr0StateId>,
-    pub goto: HashMap<NonTerminalDefinition, Lr0StateId>,
+    pub goto: HashMap<NonTerminalDef, Lr0StateId>,
 }
 
 impl fmt::Display for Lr0State {
@@ -597,6 +595,13 @@ fn make_action(
                 .into(),
         );
     }
+    let arbitrary_resolution: Action = conflicts
+        .iter()
+        .next()
+        .expect("conflicts has at least one item")
+        .0
+        .clone()
+        .into();
 
     let mut split_info = HashMap::new();
     let mut potential_ambiguities = HashSet::new();
@@ -607,15 +612,9 @@ fn make_action(
         let span = debug_span!("extend_ambiguities", action = %action);
         let _enter = span.enter();
         let mut lane_members = HashMap::new();
-        while let Some(Ambiguity {
-            location,
-            transition,
-            history,
-            term_string,
-        }) = ambiguities.pop()
-        {
-            trace!(%location, %history, %term_string, "Investigating ambiguity");
-            for (terminal, term_string) in term_string.next(language) {
+        while let Some(ambiguity) = ambiguities.pop() {
+            trace!(%ambiguity, "Investigating ambiguity");
+            for (terminal, term_string) in ambiguity.term_string.clone().next(language) {
                 match terminal {
                     Some(terminal) => {
                         let new_action = action.with_lookahead(language, terminal.clone());
@@ -623,56 +622,26 @@ fn make_action(
                             trace!("Dropping ambiguity because negative lookahead matched");
                             continue;
                         }
-                        let mut history = history.clone();
-                        history.0.push((location, term_string.with_no_parent()));
                         next.entry(terminal)
                             .or_default()
                             .entry(new_action)
                             .or_default()
                             .push(Ambiguity {
-                                location,
-                                transition: transition.clone(),
-                                history,
                                 term_string,
+                                ..ambiguity.clone()
                             });
                     }
                     None => {
                         // term_string is empty, so we must now walk the parse table.
-                        let mut lane_heads = HashSet::new();
-                        potential_ambiguities.extend(
-                            item_lane_heads(
-                                language,
-                                lr0_parse_table,
-                                action.clone(),
-                                location,
-                                transition.clone(),
-                                &mut split_info,
-                                &mut lane_members,
-                                &mut lane_heads,
-                            )
-                            .into_iter()
-                            .map(|mut source| {
-                                source.history = history.clone();
-                                source
-                            }),
-                        );
-                        ambiguities.extend(lane_heads.into_iter().map(|(location, transition)| {
-                            trace!(%location, "Walking parse table");
-                            let item = &lr0_parse_table[location].0;
-                            Ambiguity {
-                                location,
-                                transition,
-                                history: history.clone(),
-                                term_string: TermString::new(
-                                    item.alternative
-                                        .terms
-                                        .iter()
-                                        .map(|term| term.kind.clone().into())
-                                        .collect::<Vec<_>>(),
-                                    item.index + 1,
-                                ),
-                            }
-                        }));
+                        potential_ambiguities.extend(item_lane_heads(
+                            language,
+                            lr0_parse_table,
+                            action.clone(),
+                            ambiguity.clone(),
+                            &mut split_info,
+                            &mut lane_members,
+                            &mut ambiguities,
+                        ));
                     }
                 }
             }
@@ -682,16 +651,14 @@ fn make_action(
 
     let mut splitting_occurred = false;
     for (state, split_table) in split_info {
-        let mut splits: Vec<(
-            HashSet<TermDef>,
-            HashMap<NonTerminalDefinition, ConflictedAction>,
-        )> = Vec::new();
+        let mut splits: Vec<(HashSet<TermDef>, HashMap<usize, ConflictedAction>)> = Vec::new();
         for (term, actions) in split_table {
+            let Some(term) = term else { continue };
             let (terms, split_actions) = match splits.iter_mut().find(|(_, split)| {
-                actions.iter().all(|(nt, action)| {
+                actions.iter().all(|(item, action)| {
                     split
-                        .get(nt)
-                        .map(|split_action| action == split_action)
+                        .get(item)
+                        .map(|split_action| action.0 == *split_action)
                         .unwrap_or(true)
                 })
             }) {
@@ -702,7 +669,7 @@ fn make_action(
                 }
             };
             terms.insert(term);
-            split_actions.extend(actions);
+            split_actions.extend(actions.into_iter().map(|(nt, (action, _))| (nt, action)));
         }
         if splits.len() <= 1 {
             continue;
@@ -821,7 +788,7 @@ fn make_action(
     // of lookahead by increasing the number of states.
 
     if splitting_occurred {
-        println!("{}", lr0_parse_table);
+        debug!(%lr0_parse_table, "Split");
         return None;
     }
 
@@ -833,31 +800,21 @@ fn make_action(
                 ConflictedAction::Reduce(nt, _, _) => format!("might have just read a {nt}"),
             };
             emit(
-                format!("Ambiguity {ambiguity}"),
+                format!("{}", ambiguity),
                 vec![
                     (
-                        ambiguity.conflict_a.span(),
-                        Some(string_for_conflict(&ambiguity.conflict_a)),
+                        ambiguity.conflict_a.0.span(),
+                        Some(string_for_conflict(&ambiguity.conflict_a.0)),
                     ),
                     (
-                        ambiguity.conflict_b.span(),
-                        Some(string_for_conflict(&ambiguity.conflict_b)),
+                        ambiguity.conflict_b.0.span(),
+                        Some(string_for_conflict(&ambiguity.conflict_b.0)),
                     ),
                 ],
             );
         }
         // Pick an arbitrary action to resolve the ambiguity
-        return Some(
-            next.into_iter()
-                .next()
-                .unwrap()
-                .1
-                .into_iter()
-                .next()
-                .unwrap()
-                .0
-                .into(),
-        );
+        return Some(arbitrary_resolution);
     }
 
     let mut regexes = Vec::with_capacity(next.len());
@@ -865,28 +822,6 @@ fn make_action(
     let mut actions = Vec::with_capacity(next.len());
     let mut eoi = HashMap::new();
     for (terminal, conflicts) in next {
-        let loops = conflicts
-            .values()
-            .map(|v| {
-                v.iter()
-                    .flat_map(|ambiguity| {
-                        let mut history = ambiguity.history.0.iter().rev();
-                        let first = history.next().unwrap();
-                        history
-                            .enumerate()
-                            .filter(move |&(_, entry)| entry == first)
-                            .map(|(i, _)| i)
-                    })
-                    .collect::<HashSet<_>>()
-            })
-            .collect::<Vec<_>>();
-        let contains_common_loops = loops
-            .iter()
-            .enumerate()
-            .any(|(i, set1)| loops[i + 1..].iter().any(|set2| !set1.is_disjoint(set2)));
-        if contains_common_loops {
-            panic!("I don't understand this code anymore, I think it's trying to prevent infinite loops");
-        }
         let span = debug_span!("make_action", %terminal);
         let _guard = span.enter();
         let action = make_action(
@@ -927,24 +862,18 @@ fn item_lane_heads(
     language: &Language,
     lr0_parse_table: &Lr0ParseTable,
     action: ConflictedAction,
-    location: ItemIndex,
-    transition: Option<TermDef>,
+    ambiguity: Ambiguity,
     split_info: &mut HashMap<
         Lr0StateId,
-        HashMap<TermDef, HashMap<NonTerminalDefinition, ConflictedAction>>,
+        HashMap<Option<TermDef>, HashMap<usize, (ConflictedAction, History)>>,
     >,
     visited: &mut HashMap<ItemIndex, u32>,
-    output: &mut HashSet<(ItemIndex, Option<TermDef>)>,
+    ambiguities: &mut Vec<Ambiguity>,
 ) -> HashSet<AmbiguitySource> {
-    trace!(
-        %action,
-        %location,
-        transition = transition.as_ref().map(|t| t.to_string()),
-        "Computing lane heads"
-    );
-    let (item, back_refs) = &lr0_parse_table[location];
+    trace!(%action, %ambiguity, "Computing lane heads");
+    let (item, back_refs) = &lr0_parse_table[ambiguity.location];
 
-    let num_visits = visited.entry(location).or_default();
+    let num_visits = visited.entry(ambiguity.location).or_default();
     // Allow the search to pass through nodes twice so that cycles get counted properly.
     if *num_visits >= 2 {
         return HashSet::new();
@@ -952,36 +881,33 @@ fn item_lane_heads(
     *num_visits += 1;
 
     let mut ret = HashSet::new();
-    if let Some(next_state) = &transition {
-        let existing_action = split_info
-            .entry(location.state_id)
-            .or_default()
-            .entry(next_state.clone())
-            .or_default()
-            .entry(item.non_terminal.clone());
-        match existing_action {
-            Entry::Occupied(entry) => {
-                if *entry.get() != action {
-                    ret.insert(AmbiguitySource {
-                        state: location.state_id,
-                        transition: next_state.clone(),
-                        non_terminal: item.non_terminal.clone(),
-                        conflict_a: action.clone(),
-                        conflict_b: entry.get().clone(),
-                        history: History::default(),
-                    });
-                }
+    let existing_action = split_info
+        .entry(ambiguity.location.state_id)
+        .or_default()
+        .entry(ambiguity.transition.clone())
+        .or_default()
+        .entry(ambiguity.location.item);
+    match existing_action {
+        Entry::Occupied(entry) => {
+            if entry.get().0 != action {
+                ret.insert(AmbiguitySource {
+                    location: ambiguity.location,
+                    transition: ambiguity.transition.clone(),
+                    non_terminal: item.non_terminal.clone(),
+                    conflict_a: (action.clone(), ambiguity.history.clone()),
+                    conflict_b: entry.get().clone(),
+                });
             }
-            Entry::Vacant(entry) => {
-                entry.insert(action.clone());
-            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert((action.clone(), ambiguity.history.clone()));
         }
     }
 
     if item.index != 0 {
         for item_index in back_refs.clone() {
-            let transition = if item_index.state_id == location.state_id {
-                transition.clone()
+            let transition = if item_index.state_id == ambiguity.location.state_id {
+                ambiguity.transition.clone()
             } else {
                 lr0_parse_table[item_index]
                     .0
@@ -993,17 +919,25 @@ fn item_lane_heads(
                 language,
                 lr0_parse_table,
                 action.clone(),
-                item_index,
-                transition,
+                Ambiguity {
+                    location: item_index,
+                    transition,
+                    history: {
+                        let mut history = ambiguity.history.clone();
+                        history.0.push(item_index);
+                        history
+                    },
+                    ..ambiguity.clone()
+                },
                 split_info,
                 visited,
-                output,
+                ambiguities,
             ));
         }
     } else {
         for &back_ref in back_refs {
-            let transition = if back_ref.state_id == location.state_id {
-                transition.clone()
+            let transition = if back_ref.state_id == ambiguity.location.state_id {
+                ambiguity.transition.clone()
             } else {
                 lr0_parse_table[back_ref]
                     .0
@@ -1011,7 +945,25 @@ fn item_lane_heads(
                     .as_ref()
                     .map(|t| TermDef::new(t, language))
             };
-            output.insert((back_ref, transition));
+            trace!(%back_ref, "Walking parse table");
+            let item = &lr0_parse_table[back_ref].0;
+            ambiguities.push(Ambiguity {
+                location: back_ref,
+                transition,
+                history: {
+                    let mut history = ambiguity.history.clone();
+                    history.0.push(back_ref);
+                    history
+                },
+                term_string: TermString::new(
+                    item.alternative
+                        .terms
+                        .iter()
+                        .map(|term| term.kind.clone().into())
+                        .collect::<Vec<_>>(),
+                    item.index + 1,
+                ),
+            });
         }
     }
     ret
@@ -1019,29 +971,35 @@ fn item_lane_heads(
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct AmbiguitySource {
-    state: Lr0StateId,
-    transition: TermDef,
-    non_terminal: NonTerminalDefinition,
-    conflict_a: ConflictedAction,
-    conflict_b: ConflictedAction,
-    history: History,
+    location: ItemIndex,
+    transition: Option<TermDef>,
+    non_terminal: NonTerminalDef,
+    conflict_a: (ConflictedAction, History),
+    conflict_b: (ConflictedAction, History),
 }
 
 impl fmt::Display for AmbiguitySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "\n\
-            Ambiguity for {} and {}\n\
-            in state {} for non-terminal {} and transition {}\n\
-            history: {}",
-            self.conflict_a,
-            self.conflict_b,
-            self.state,
-            self.non_terminal,
-            self.transition,
-            self.history
-        )
+            "Ambiguity for {} and {}",
+            self.conflict_a.0, self.conflict_b.0,
+        )?;
+        write!(
+            f,
+            "in {} for non-terminal {}",
+            self.location, self.non_terminal,
+        )?;
+        match &self.transition {
+            Some(transition) => writeln!(f, " and transition {}", transition),
+            None => writeln!(f),
+        }?;
+        writeln!(
+            f,
+            "history: {} and {}",
+            self.conflict_a.1, self.conflict_b.1,
+        )?;
+        Ok(())
     }
 }
 
@@ -1100,7 +1058,7 @@ fn conflicts(
                 vec![Ambiguity {
                     location,
                     transition: None,
-                    history: History::default(),
+                    history: History(vec![location]),
                     term_string: TermString::new(
                         item.alternative
                             .terms
@@ -1120,7 +1078,7 @@ fn conflicts(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
     Shift(Terminal, StateId),
-    Reduce(NonTerminalDefinition, Alternative, Vec<Arc<TermString>>),
+    Reduce(NonTerminalDef, Alternative, Vec<Arc<TermString>>),
 }
 
 impl ConflictedAction {
@@ -1210,16 +1168,16 @@ impl fmt::Display for Ambiguity {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct History(Vec<(ItemIndex, TermString)>);
+struct History(Vec<ItemIndex>);
 
 impl fmt::Display for History {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_char('[')?;
-        for (i, (location, term_string)) in self.0.iter().enumerate() {
-            write!(f, "{} ({})", location, term_string)?;
-            if i != self.0.len() - 1 {
+        for (i, location) in self.0.iter().enumerate() {
+            if i != 0 {
                 f.write_str(", ")?;
             }
+            write!(f, "{location}")?;
         }
         f.write_char(']')?;
         Ok(())
