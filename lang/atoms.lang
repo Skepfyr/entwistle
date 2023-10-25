@@ -1,0 +1,14 @@
+@keyword: /keyword\b/
+@Ident: (!>> keyword) /\w+\b/
+
+== keyword
+keyword
+==
+keyword: "keyword"
+==
+
+== Ident
+key
+==
+Ident: "key"
+==

@@ -5,18 +5,19 @@ use tracing::instrument;
 
 use crate::{
     diagnostics::emit,
-    language::{Ident, ParseTree, Test},
-    lower::{Name, NonTerminalDef, Term, Terminal},
-    parse_table::{Action, LrkParseTable},
+    language::{Ident, Language, ParseTree, Test},
+    lower::{terminal_nfa, Name, NonTerminalDef, Term},
+    parse_table::{parse_table, Action, StateId},
 };
 
-#[instrument]
-pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
-    let mut states = vec![parse_table.start_states[&test.ident]];
+#[instrument(skip_all)]
+pub fn run_test(language: &Language, test: &Test) -> Option<Vec<ParseTree>> {
+    let parse_table = parse_table(language, test.goal.clone());
+    let mut states = vec![StateId::START];
     let mut forest = vec![];
     let input = Input::new(&*test.test).anchored(Anchored::Yes);
     let mut offset = 0;
-    let tree = loop {
+    let trees = loop {
         let state = &parse_table[*states.last().unwrap()];
         let action = {
             let mut action = &state.action;
@@ -24,56 +25,51 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
             loop {
                 let Action::Ambiguous {
                     nfa,
-                    regexes,
+                    terminals,
                     actions,
-                    eoi,
                 } = action
                 else {
                     break;
                 };
-                if input.get_span().len() == offset + lookahead {
-                    action = &eoi[&test.ident];
-                    break;
-                } else {
-                    let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
-                    let Some(half_match) = pike_vm.find(
-                        &mut pike_vm.create_cache(),
-                        input.clone().range((offset + lookahead)..),
-                    ) else {
-                        let mut message = "Expected one of: ".to_string();
-                        for (i, regex) in regexes.iter().enumerate() {
-                            if i != 0 {
-                                write!(message, ", ").unwrap();
-                            }
-                            write!(message, "{regex}").unwrap();
+                let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
+                let Some(half_match) = pike_vm.find(
+                    &mut pike_vm.create_cache(),
+                    input.clone().range((offset + lookahead)..),
+                ) else {
+                    let mut message = "Expected one of: ".to_string();
+                    for (i, terminal) in terminals.iter().enumerate() {
+                        if i != 0 {
+                            write!(message, ", ").unwrap();
                         }
-                        emit(
-                            "Unable to find a match for any expected token",
-                            vec![(
-                                crate::Span {
-                                    start: offset,
-                                    end: offset,
-                                },
-                                Some(message),
-                            )],
-                        );
-                        return None;
-                    };
-                    action = &actions[half_match.pattern().as_usize()];
-                    lookahead += half_match.len();
-                }
+                        write!(message, "{terminal}").unwrap();
+                    }
+                    emit(
+                        "Unable to find a match for any expected token",
+                        vec![(
+                            crate::Span {
+                                start: offset,
+                                end: offset,
+                            },
+                            Some(message),
+                        )],
+                    );
+                    return None;
+                };
+                action = &actions[half_match.pattern().as_usize()];
+                lookahead += half_match.len();
             }
             action
         };
         match action {
             Action::Ambiguous { .. } => unreachable!(),
-            Action::Shift(Terminal::Token(nfa, regex, _), new_state) => {
-                let pike_vm = PikeVM::new_from_nfa(nfa.clone()).unwrap();
+            Action::Shift(terminal, new_state) => {
+                let regex = terminal_nfa(language, terminal);
+                let pike_vm = PikeVM::new_from_nfa(regex).unwrap();
                 let Some(half_match) =
                     pike_vm.find(&mut pike_vm.create_cache(), input.clone().range(offset..))
                 else {
                     emit(
-                        format!("Expected token: {regex}"),
+                        format!("Expected token: {}", terminal.definition(language).name()),
                         vec![(
                             crate::Span {
                                 start: test.test_span.start + offset,
@@ -85,35 +81,19 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     return None;
                 };
                 forest.push(ParseTree::Leaf {
-                    ident: None,
+                    ident: terminal.ident().cloned(),
                     data: String::from_utf8(input.haystack()[half_match.range()].to_owned())
                         .unwrap(),
                 });
                 states.push(*new_state);
                 offset = half_match.end();
             }
-            Action::Shift(Terminal::EndOfInput(_, _), new_state) => {
-                forest.push(ParseTree::Leaf {
-                    ident: None,
-                    data: String::new(),
-                });
-                states.push(*new_state);
-            }
             Action::Reduce(non_terminal, alternative) => {
                 let nodes =
                     forest.split_off(forest.len().checked_sub(alternative.terms.len()).unwrap());
                 states.truncate(states.len().checked_sub(alternative.terms.len()).unwrap());
                 let ident = match non_terminal {
-                    NonTerminalDef::Goal { .. } => {
-                        if alternative.terms[0].atomic {
-                            break ParseTree::Leaf {
-                                ident: nodes[0].ident().cloned(),
-                                data: nodes[0].data(),
-                            };
-                        } else {
-                            break nodes.into_iter().next().unwrap();
-                        }
-                    }
+                    NonTerminalDef::Goal { .. } => Ident("goal".into()),
                     NonTerminalDef::Named {
                         name: Name { ident, .. },
                         generics: _,
@@ -122,22 +102,13 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                     NonTerminalDef::Anonymous { .. } => Ident("anon".into()),
                 };
 
-                let nodes = nodes
+                let nodes: Vec<_> = nodes
                     .into_iter()
                     .zip(&alternative.terms)
                     .flat_map(|(node, term)| match term {
                         Term {
                             kind: _,
                             silent: true,
-                            atomic: true,
-                        } => vec![ParseTree::Leaf {
-                            ident: None,
-                            data: node.data(),
-                        }],
-                        Term {
-                            kind: _,
-                            silent: true,
-                            atomic: false,
                         } => match node {
                             ParseTree::Leaf { ident: _, data } => {
                                 vec![ParseTree::Leaf { ident: None, data }]
@@ -147,18 +118,18 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
                         Term {
                             kind: _,
                             silent: false,
-                            atomic: true,
-                        } => vec![ParseTree::Leaf {
-                            ident: node.ident().cloned(),
-                            data: node.data(),
-                        }],
-                        Term {
-                            kind: _,
-                            silent: false,
-                            atomic: false,
                         } => vec![node],
                     })
                     .collect();
+
+                if matches!(non_terminal, NonTerminalDef::Goal { .. }) {
+                    let mut nodes = nodes;
+                    let eoi = nodes.pop().expect("Goal node must have EOI");
+                    assert!(
+                        matches!(eoi, ParseTree::Leaf { ident: None, data } if data.is_empty())
+                    );
+                    break nodes;
+                }
 
                 forest.push(ParseTree::Node { ident, nodes });
                 let state = &parse_table[*states.last().unwrap()];
@@ -166,9 +137,9 @@ pub fn run_test(parse_table: &LrkParseTable, test: &Test) -> Option<ParseTree> {
             }
         }
     };
-    if tree == test.parse_tree {
+    if trees == test.parse_trees {
         None
     } else {
-        Some(tree)
+        Some(trees)
     }
 }

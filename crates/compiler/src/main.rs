@@ -1,10 +1,13 @@
-use std::{collections::HashSet, error::Error, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    error::Error,
+    path::Path,
+};
 
 use entwistle::{
     diagnostics::diagnostics,
-    language::Language,
+    language::{Expression, Item, Language, Mark, Quantifier, Rule},
     lower::{production, NonTerminalUse, TermKind},
-    parse_table::parse_table,
     test::run_test,
 };
 use tracing_subscriber::prelude::*;
@@ -33,10 +36,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut non_terminals = language
         .definitions
         .iter()
-        .filter(|(_, definition)| definition.generics.is_empty())
+        .filter(|(_, definition)| definition.generics.is_empty() && !definition.atomic)
         .map(|(ident, definition)| NonTerminalUse::Goal {
-            ident: ident.clone(),
-            span: definition.span,
+            rule: Rule {
+                span: definition.span,
+                alternatives: {
+                    let mut alternatives = BTreeSet::new();
+                    alternatives.insert(Expression {
+                        span: definition.span,
+                        sequence: vec![(
+                            Item::Ident {
+                                mark: Mark::This,
+                                ident: ident.clone(),
+                                generics: Vec::new(),
+                            },
+                            Quantifier::Once,
+                            definition.span,
+                        )],
+                    });
+                    alternatives
+                },
+            },
         })
         .collect::<Vec<_>>();
     let mut visited = HashSet::new();
@@ -73,23 +93,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("--------------");
 
-    let parse_table = parse_table(&language);
-
-    let diags = diagnostics();
-    if diags.is_empty() {
-        println!("{parse_table}");
-    } else {
-        for diag in diags {
-            diag.print(&input, file).unwrap();
-        }
-        return Ok(());
-    }
-
-    println!("--------------");
-
-    for test in language.tests.values().flatten() {
-        if let Some(tree) = run_test(&parse_table, test) {
-            println!("Test failed:\n{tree}");
+    for test in &language.tests {
+        if let Some(trees) = run_test(&language, test) {
+            println!("Test failed:");
+            for tree in trees {
+                println!("{}", tree);
+            }
         }
 
         let diags = diagnostics();

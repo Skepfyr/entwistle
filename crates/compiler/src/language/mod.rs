@@ -22,7 +22,7 @@ impl fmt::Display for Ident {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Language {
     pub definitions: HashMap<Ident, Definition>,
-    pub tests: HashMap<Ident, Vec<Test>>,
+    pub tests: Vec<Test>,
 }
 
 impl Language {
@@ -224,11 +224,10 @@ impl fmt::Display for Mark {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Test {
-    pub ident: Ident,
-    pub ident_span: Span,
+    pub goal: Rule,
     pub test: Arc<str>,
     pub test_span: Span,
-    pub parse_tree: ParseTree,
+    pub parse_trees: Vec<ParseTree>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

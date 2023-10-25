@@ -1,12 +1,20 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::{self, Write as _},
     hash::Hash,
+    ops::RangeInclusive,
+    sync::Arc,
 };
 
-use regex_automata::nfa::thompson::NFA;
+use regex_automata::{
+    nfa::thompson::{
+        Builder as NfaBuilder, DenseTransitions, SparseTransitions, Transition, WhichCaptures, NFA,
+    },
+    util::{look::Look, primitives::StateID, syntax},
+    PatternID,
+};
+use regex_syntax::hir::Hir;
 
 use crate::{
     diagnostics::emit,
@@ -16,47 +24,38 @@ use crate::{
 
 pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Production {
     match non_terminal {
-        &NonTerminalUse::Goal { ref ident, span } => {
-            let definition = &language.definitions[ident];
-            if !definition.generics.is_empty() {
-                emit("Goals cannot have generics", vec![(definition.span, None)]);
-                return Production {
-                    alternatives: vec![],
-                };
-            }
-
-            Production {
-                alternatives: vec![Alternative {
-                    span,
-                    terms: vec![
-                        Term {
-                            kind: TermKind::NonTerminal(NonTerminalUse::Named {
-                                name: Name {
-                                    ident: ident.clone(),
-                                    index: 0,
-                                },
-                                generics: Vec::new(),
-                                span,
-                            }),
-                            silent: definition.silent,
-                            atomic: definition.atomic,
-                        },
-                        Term {
-                            kind: TermKind::Terminal(Terminal::EndOfInput(ident.clone(), span)),
-                            silent: true,
-                            atomic: true,
-                        },
-                    ],
-                    negative_lookahead: None,
-                }],
-            }
-        }
+        NonTerminalUse::Goal { rule } => Production {
+            alternatives: vec![Alternative {
+                span: non_terminal.span(),
+                terms: vec![
+                    Term {
+                        kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
+                            rule: rule.clone(),
+                            context: None,
+                            generics: BTreeMap::new(),
+                        }),
+                        silent: true,
+                    },
+                    Term {
+                        kind: TermKind::Terminal(TerminalUse::EndOfInput {
+                            span: Span {
+                                start: non_terminal.span().end,
+                                end: non_terminal.span().end,
+                            },
+                        }),
+                        silent: true,
+                    },
+                ],
+                negative_lookahead: None,
+            }],
+        },
         NonTerminalUse::Named {
             name,
             generics: generic_parameters,
             span,
         } => {
             let definition = &language.definitions[&name.ident];
+            assert!(!definition.atomic, "Tried to make production for terminal");
             if definition.generics.len() != generic_parameters.len() {
                 emit(
                     format!(
@@ -165,7 +164,6 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                             span,
                         }),
                         silent: true,
-                        atomic: false,
                     }],
                     negative_lookahead: None,
                 });
@@ -217,7 +215,6 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                             Term {
                                 kind: TermKind::NonTerminal(non_terminal.clone()),
                                 silent: true,
-                                atomic: false,
                             },
                             term,
                         ],
@@ -308,7 +305,6 @@ fn lower_term(
                 generics.clone(),
             )),
             silent: true,
-            atomic: false,
         };
     }
 
@@ -321,23 +317,8 @@ fn lower_term(
             Some(nt) => Term {
                 kind: TermKind::NonTerminal(nt.clone()),
                 silent: true,
-                atomic: false,
             },
             None => {
-                let name = match current_name {
-                    Some(current_name) if ident == &current_name.ident => Name {
-                        ident: current_name.ident.clone(),
-                        index: match mark {
-                            Mark::Super => 0,
-                            Mark::This => current_name.index,
-                            Mark::Sub => current_name.index + 1,
-                        },
-                    },
-                    _ => Name {
-                        ident: ident.clone(),
-                        index: 0,
-                    },
-                };
                 let definition = match language.definitions.get(ident) {
                     Some(definition) => definition,
                     None => {
@@ -352,36 +333,68 @@ fn lower_term(
                                 generics: BTreeMap::new(),
                             }),
                             silent: true,
-                            atomic: false,
                         };
                     }
                 };
-                let generic_parameters = generic_arguments
-                    .iter()
-                    .map(|arg| {
-                        NonTerminalUse::new_anonymous(arg.clone(), current_name, generics.clone())
+                let kind = if definition.atomic {
+                    TermKind::Terminal(TerminalUse::Named {
+                        ident: ident.clone(),
+                        span,
                     })
-                    .collect();
-                Term {
-                    kind: TermKind::NonTerminal(NonTerminalUse::Named {
+                } else {
+                    let name = match current_name {
+                        Some(current_name) if ident == &current_name.ident => Name {
+                            ident: current_name.ident.clone(),
+                            index: match mark {
+                                Mark::Super => 0,
+                                Mark::This => current_name.index,
+                                Mark::Sub => current_name.index + 1,
+                            },
+                        },
+                        _ => Name {
+                            ident: ident.clone(),
+                            index: 0,
+                        },
+                    };
+                    let generic_parameters = generic_arguments
+                        .iter()
+                        .map(|arg| {
+                            NonTerminalUse::new_anonymous(
+                                arg.clone(),
+                                current_name,
+                                generics.clone(),
+                            )
+                        })
+                        .collect();
+                    TermKind::NonTerminal(NonTerminalUse::Named {
                         name,
                         generics: generic_parameters,
                         span,
-                    }),
+                    })
+                };
+                Term {
+                    kind,
                     silent: definition.silent,
-                    atomic: definition.atomic,
                 }
             }
         },
         Item::String(data) => Term {
-            kind: TermKind::Terminal(Terminal::new_token(regex_syntax::escape(data), span)),
+            kind: TermKind::Terminal(TerminalUse::Anonymous {
+                name: Arc::from(&**data),
+                regex: NFA::compiler()
+                    .build_from_hir(&Hir::literal(data.as_bytes()))
+                    .unwrap(),
+                span,
+            }),
             silent: false,
-            atomic: true,
         },
         Item::Regex(regex) => Term {
-            kind: TermKind::Terminal(Terminal::new_token(regex.clone(), span)),
+            kind: TermKind::Terminal(TerminalUse::Anonymous {
+                name: Arc::from(&**regex),
+                regex: regex_nfa(regex),
+                span,
+            }),
             silent: false,
-            atomic: true,
         },
         Item::Group(rule) => Term {
             kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
@@ -390,7 +403,6 @@ fn lower_term(
                 generics.clone(),
             )),
             silent: true,
-            atomic: false,
         },
         Item::Lookaround(_, _) => {
             emit(
@@ -407,17 +419,694 @@ fn lower_term(
                     generics: BTreeMap::new(),
                 }),
                 silent: true,
-                atomic: false,
             }
         }
     }
 }
 
+pub fn terminal_nfa(language: &Language, terminal: &TerminalUse) -> NFA {
+    let nfa = match terminal {
+        TerminalUse::Named { ident, span } => {
+            ident_nfa(language, ident, *span, &mut HashSet::new())
+        }
+        TerminalUse::Anonymous { regex, .. } => regex.clone(),
+        TerminalUse::EndOfInput { .. } => NFA::compiler()
+            .build_from_hir(&Hir::look(regex_syntax::hir::Look::End))
+            .unwrap(),
+    };
+    if !matches!(terminal, TerminalUse::EndOfInput { .. }) && nfa.has_empty() {
+        emit(
+            "Tokens must not match the empty string",
+            vec![(terminal.span(), None)],
+        );
+    }
+    nfa
+}
+
+fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashSet<Ident>) -> NFA {
+    if !visited.insert(ident.clone()) {
+        emit(
+            "Recursive atomic rules are not (yet) supported",
+            vec![(span, None)],
+        );
+        return NFA::never_match();
+    }
+    let Some(definition) = language.definitions.get(ident) else {
+        emit("Definition not found", vec![(span, None)]);
+        return NFA::never_match();
+    };
+    assert!(definition.atomic, "Tried to get regex for non-terminal");
+    if !definition.generics.is_empty() {
+        emit(
+            "Generics are not supported on atomic rules",
+            vec![(definition.span, None)],
+        );
+        return NFA::never_match();
+    }
+
+    let nfa = alternation(
+        definition
+            .rules
+            .iter()
+            .map(|rule| rule_nfa(language, rule, visited)),
+    );
+    visited.remove(ident);
+    nfa
+}
+
+fn rule_nfa(language: &Language, rule: &Rule, visited: &mut HashSet<Ident>) -> NFA {
+    alternation(
+        rule.alternatives
+            .iter()
+            .map(|expression| sequence_nfa(language, &expression.sequence, visited)),
+    )
+}
+
+fn alternation(alternatives: impl Iterator<Item = NFA>) -> NFA {
+    let mut builder = NfaBuilder::new();
+    builder.set_utf8(true);
+    builder.start_pattern().unwrap();
+    let mat = builder.add_match().unwrap();
+    let end = builder.add_capture_end(mat, 0).unwrap();
+    let alternates = alternatives
+        .map(|nfa| prepend_nfa(&mut builder, end, &nfa))
+        .collect();
+    let alt_start = builder.add_union(alternates).unwrap();
+    let start = builder.add_capture_start(alt_start, 0, None).unwrap();
+    builder.finish_pattern(start).unwrap();
+    builder.build(start, start).unwrap()
+}
+
+fn sequence_nfa(
+    language: &Language,
+    sequence: &[(Item, Quantifier, Span)],
+    visited: &mut HashSet<Ident>,
+) -> NFA {
+    let mut builder = NfaBuilder::new();
+    builder.set_utf8(true);
+    builder.start_pattern().unwrap();
+    let mat = builder.add_match().unwrap();
+    let mut start = builder.add_capture_end(mat, 0).unwrap();
+    for (item, quantifier, span) in sequence.iter().rev() {
+        let item = match item {
+            Item::Ident {
+                mark,
+                ident,
+                generics,
+            } => {
+                if *mark != Mark::This {
+                    emit(
+                        "Marks are not supported in atomic rules",
+                        vec![(*span, None)],
+                    );
+                }
+                if !generics.is_empty() {
+                    emit(
+                        "Generics are not supported in atomic rules",
+                        vec![(*span, None)],
+                    );
+                }
+                ident_nfa(language, ident, *span, visited)
+            }
+            Item::String(string) => NFA::compiler()
+                .build_from_hir(&Hir::literal(string.as_bytes()))
+                .unwrap(),
+            Item::Regex(regex) => regex_nfa(regex),
+            Item::Group(rule) => rule_nfa(language, rule, visited),
+            Item::Lookaround(lookaround_type, rule) => {
+                if !lookaround_type.ahead || lookaround_type.positive {
+                    emit(
+                        "Only negative lookahead is supported",
+                        vec![(lookaround_type.span, None)],
+                    );
+                    continue;
+                }
+
+                start = builder.add_capture_start(start, 0, None).unwrap();
+                builder.finish_pattern(start).unwrap();
+                let tail = builder.build(start, start).unwrap();
+                // Restart the builder from the beginning
+                builder = NfaBuilder::new();
+                builder.set_utf8(true);
+                builder.start_pattern().unwrap();
+                let mat = builder.add_match().unwrap();
+                start = builder.add_capture_end(mat, 0).unwrap();
+                let rule = rule_nfa(language, rule, visited);
+                subtract_nfa(&tail, &rule)
+            }
+        };
+        match quantifier {
+            Quantifier::Once => {
+                start = prepend_nfa(&mut builder, start, &item);
+            }
+            Quantifier::AtMostOnce => {
+                let end = start;
+                start = prepend_nfa(&mut builder, start, &item);
+                start = builder.add_union(vec![start, end]).unwrap();
+            }
+            Quantifier::AtLeastOnce => {
+                let repeat_end = builder.add_union(vec![start]).unwrap();
+                start = prepend_nfa(&mut builder, repeat_end, &item);
+                builder.patch(repeat_end, start).unwrap();
+            }
+            Quantifier::Any => {
+                let end = start;
+                let repeat_end = builder.add_union(vec![start]).unwrap();
+                let repeat_start = prepend_nfa(&mut builder, repeat_end, &item);
+                builder.patch(repeat_end, repeat_start).unwrap();
+                start = builder.add_union(vec![repeat_start, end]).unwrap();
+            }
+        }
+    }
+    let start = builder.add_capture_start(start, 0, None).unwrap();
+    builder.finish_pattern(start).unwrap();
+    builder.build(start, start).unwrap()
+}
+
+fn prepend_nfa(builder: &mut NfaBuilder, start: StateID, nfa: &NFA) -> StateID {
+    use regex_automata::nfa::thompson::State;
+    let mut state_map: HashMap<StateID, StateID> = HashMap::new();
+    let map_state = |builder: &mut NfaBuilder,
+                     state_map: &mut HashMap<StateID, StateID>,
+                     state: StateID|
+     -> StateID {
+        *state_map.entry(state).or_insert_with_key(|state| {
+            match nfa.state(*state) {
+                State::ByteRange { trans } => builder
+                    .add_range(Transition {
+                        start: trans.start,
+                        end: trans.end,
+                        next: StateID::MAX,
+                    })
+                    .unwrap(),
+                State::Sparse(_) | State::Dense(_) => {
+                    // Sparse states can't be patched so indirect though an empty state
+                    builder.add_empty().unwrap()
+                }
+                State::Look { look, .. } => builder.add_look(StateID::MAX, *look).unwrap(),
+                State::Union { alternates } => builder
+                    .add_union(Vec::with_capacity(alternates.len()))
+                    .unwrap(),
+                State::BinaryUnion { .. } => builder.add_union(Vec::with_capacity(2)).unwrap(),
+                State::Capture { .. } => {
+                    // Ignore capture states as they'll conflict with this NFA's captures.
+                    builder.add_empty().unwrap()
+                }
+                State::Fail => builder.add_fail().unwrap(),
+                State::Match { pattern_id } => {
+                    if *pattern_id != PatternID::ZERO {
+                        panic!("Terminal regexes shouldn't use patterns")
+                    }
+                    start
+                }
+            }
+        })
+    };
+    for (old_id, state) in nfa.states().iter().enumerate().rev() {
+        let new_id = map_state(builder, &mut state_map, StateID::new(old_id).unwrap());
+        match state {
+            State::ByteRange { trans } => {
+                let next = map_state(builder, &mut state_map, trans.next);
+                builder.patch(new_id, next).unwrap()
+            }
+            State::Sparse(SparseTransitions { transitions }) => {
+                let transitions = transitions
+                    .iter()
+                    .map(|trans| Transition {
+                        start: trans.start,
+                        end: trans.end,
+                        next: map_state(builder, &mut state_map, trans.next),
+                    })
+                    .collect();
+                let state = builder.add_sparse(transitions).unwrap();
+                builder.patch(new_id, state).unwrap();
+            }
+            State::Dense(DenseTransitions { transitions }) => {
+                let transitions = transitions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, state)| Transition {
+                        start: i as u8,
+                        end: i as u8,
+                        next: map_state(builder, &mut state_map, *state),
+                    })
+                    .collect();
+                let state = builder.add_sparse(transitions).unwrap();
+                builder.patch(new_id, state).unwrap();
+            }
+            State::Look { next, .. } => {
+                let next = map_state(builder, &mut state_map, *next);
+                builder.patch(new_id, next).unwrap()
+            }
+            State::Union { alternates } => {
+                for state in alternates.iter() {
+                    let alternate = map_state(builder, &mut state_map, *state);
+                    builder.patch(new_id, alternate).unwrap()
+                }
+            }
+            State::BinaryUnion { alt1, alt2 } => {
+                let alt1 = map_state(builder, &mut state_map, *alt1);
+                let alt2 = map_state(builder, &mut state_map, *alt2);
+                builder.patch(new_id, alt1).unwrap();
+                builder.patch(new_id, alt2).unwrap();
+            }
+            State::Capture { next, .. } => {
+                let next = map_state(builder, &mut state_map, *next);
+                builder.patch(new_id, next).unwrap();
+            }
+            State::Fail => {}
+            State::Match { .. } => {}
+        }
+    }
+    state_map[&nfa.start_anchored()]
+}
+
+fn subtract_nfa(a: &NFA, b: &NFA) -> NFA {
+    let mut builder = NfaBuilder::new();
+    builder.set_utf8(true);
+    builder.start_pattern().unwrap();
+    let start = builder.add_capture_start(StateID::MAX, 0, None).unwrap();
+
+    let mut state_map = HashMap::<(StateID, (BTreeSet<StateID>, bool)), StateID>::new();
+    let mut states = BTreeSet::new();
+    states.insert(b.start_anchored());
+
+    build_subtracted_nfa(
+        &mut state_map,
+        &mut builder,
+        start,
+        a,
+        a.start_anchored(),
+        b,
+        states,
+        false,
+    );
+
+    builder.finish_pattern(start).unwrap();
+    builder.build(start, start).unwrap()
+}
+
+fn build_subtracted_nfa(
+    state_map: &mut HashMap<(StateID, (BTreeSet<StateID>, bool)), StateID>,
+    builder: &mut NfaBuilder,
+    prev_loc: StateID,
+    a: &NFA,
+    a_loc: StateID,
+    b: &NFA,
+    b_loc: BTreeSet<StateID>,
+    b_match: bool,
+) {
+    let mut closure = HashMap::new();
+    closure.insert(None, Default::default());
+    let mut visited = HashSet::new();
+    for loc in b_loc {
+        nfa_epsilon_closure(&mut visited, b, loc, &mut closure, None);
+    }
+
+    let closures = match closure.len() {
+        0 => unreachable!(),
+        1 => {
+            let mut b_loc = closure.remove(&None).unwrap();
+            b_loc.1 |= b_match;
+            vec![(b_loc, prev_loc)]
+        }
+        2 => {
+            let mut no_look = closure.remove(&None).unwrap();
+            no_look.1 |= b_match;
+            let (look, mut loc) = closure.into_iter().next().unwrap();
+            loc.0.extend(&no_look.0);
+            loc.1 |= no_look.1;
+            let positive_look = Look::from_repr(look.unwrap()).unwrap();
+            let positive_state = builder.add_look(StateID::MAX, positive_look).unwrap();
+            let split_state = builder.add_union(vec![positive_state]).unwrap();
+            builder.patch(prev_loc, split_state).unwrap();
+            let negative_state = match positive_look {
+                Look::Start
+                | Look::End
+                | Look::StartLF
+                | Look::EndLF
+                | Look::StartCRLF
+                | Look::EndCRLF
+                | Look::WordStartHalfAscii
+                | Look::WordEndHalfAscii
+                | Look::WordStartHalfUnicode
+                | Look::WordEndHalfUnicode => todo!("Unclear how to negate these"),
+                Look::WordAscii => {
+                    let state = builder
+                        .add_look(StateID::MAX, Look::WordAsciiNegate)
+                        .unwrap();
+                    builder.patch(split_state, state).unwrap();
+                    state
+                }
+                Look::WordAsciiNegate => {
+                    let state = builder.add_look(StateID::MAX, Look::WordAscii).unwrap();
+                    builder.patch(split_state, state).unwrap();
+                    state
+                }
+                Look::WordUnicode => {
+                    let state = builder
+                        .add_look(StateID::MAX, Look::WordUnicodeNegate)
+                        .unwrap();
+                    builder.patch(split_state, state).unwrap();
+                    state
+                }
+                Look::WordUnicodeNegate => {
+                    let state = builder.add_look(StateID::MAX, Look::WordUnicode).unwrap();
+                    builder.patch(split_state, state).unwrap();
+                    state
+                }
+                Look::WordStartAscii => {
+                    // The opposite of the start of a word is the end of a word or not a word boundary.
+                    let state = builder.add_empty().unwrap();
+                    let word_ascii_negate = builder.add_look(state, Look::WordAsciiNegate).unwrap();
+                    builder.patch(word_ascii_negate, state).unwrap();
+                    let word_end_ascii = builder.add_look(state, Look::WordEndAscii).unwrap();
+                    builder.patch(word_end_ascii, state).unwrap();
+                    state
+                }
+                Look::WordEndAscii => {
+                    // The opposite of the end of a word is the start of a word or not a word boundary.
+                    let state = builder.add_empty().unwrap();
+                    let word_ascii_negate = builder.add_look(state, Look::WordAsciiNegate).unwrap();
+                    builder.patch(word_ascii_negate, state).unwrap();
+                    let word_start_ascii = builder.add_look(state, Look::WordStartAscii).unwrap();
+                    builder.patch(word_start_ascii, state).unwrap();
+                    state
+                }
+                Look::WordStartUnicode => {
+                    // The opposite of the start of a word is the end of a word or not a word boundary.
+                    let state = builder.add_empty().unwrap();
+                    let word_unicode_negate =
+                        builder.add_look(state, Look::WordUnicodeNegate).unwrap();
+                    builder.patch(word_unicode_negate, state).unwrap();
+                    let word_end_unicode = builder.add_look(state, Look::WordEndUnicode).unwrap();
+                    builder.patch(word_end_unicode, state).unwrap();
+                    state
+                }
+                Look::WordEndUnicode => {
+                    // The opposite of the end of a word is the start of a word or not a word boundary.
+                    let state = builder.add_empty().unwrap();
+                    let word_unicode_negate =
+                        builder.add_look(state, Look::WordUnicodeNegate).unwrap();
+                    builder.patch(word_unicode_negate, state).unwrap();
+                    let word_start_unicode =
+                        builder.add_look(state, Look::WordStartUnicode).unwrap();
+                    builder.patch(word_start_unicode, state).unwrap();
+                    state
+                }
+            };
+            vec![(loc, positive_state), (no_look, negative_state)]
+        }
+        _ => {
+            panic!("Only one form of lookaround supported at once in atomic negation");
+        }
+    };
+
+    for ((b_loc, b_match), prev_loc) in closures {
+        use std::collections::hash_map::Entry;
+        let loc = match state_map.entry((a_loc, (b_loc.clone(), b_match))) {
+            Entry::Occupied(entry) => {
+                builder.patch(prev_loc, *entry.get()).unwrap();
+                // The state has already been built so skip.
+                continue;
+            }
+            Entry::Vacant(entry) => {
+                let loc = builder.add_empty().unwrap();
+                entry.insert(loc);
+                builder.patch(prev_loc, loc).unwrap();
+                loc
+            }
+        };
+        use regex_automata::nfa::thompson::State;
+        let implementation = match a.state(a_loc) {
+            State::ByteRange { trans } => {
+                let transitions = transition(b, &b_loc, trans.start..=trans.end)
+                    .map(|(b_loc, range)| {
+                        let next = builder.add_empty().unwrap();
+                        build_subtracted_nfa(
+                            state_map, builder, next, a, trans.next, b, b_loc, false,
+                        );
+                        Transition {
+                            start: *range.start(),
+                            end: *range.end(),
+                            next,
+                        }
+                    })
+                    .collect();
+                builder.add_sparse(transitions).unwrap()
+            }
+            State::Sparse(SparseTransitions { transitions }) => {
+                let transitions = transitions
+                    .iter()
+                    .flat_map(|trans| {
+                        transition(b, &b_loc, trans.start..=trans.end)
+                            .map(|(b_loc, range)| (trans.next, b_loc, range))
+                    })
+                    .map(|(a_loc, b_loc, range)| {
+                        let next = builder.add_empty().unwrap();
+                        build_subtracted_nfa(state_map, builder, next, a, a_loc, b, b_loc, false);
+                        Transition {
+                            start: *range.start(),
+                            end: *range.end(),
+                            next,
+                        }
+                    })
+                    .collect();
+                builder.add_sparse(transitions).unwrap()
+            }
+            State::Dense(DenseTransitions { transitions }) => {
+                let transitions = transitions
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, next)| {
+                        let i = i.try_into().unwrap();
+                        transition(b, &b_loc, i..=i).map(|(b_loc, range)| (*next, b_loc, range))
+                    })
+                    .map(|(a_loc, b_loc, range)| {
+                        let next = builder.add_empty().unwrap();
+                        build_subtracted_nfa(state_map, builder, next, a, a_loc, b, b_loc, false);
+                        Transition {
+                            start: *range.start(),
+                            end: *range.end(),
+                            next,
+                        }
+                    })
+                    .collect();
+                builder.add_sparse(transitions).unwrap()
+            }
+            State::Look { look, next } => {
+                let implementation = builder.add_look(StateID::MAX, *look).unwrap();
+                build_subtracted_nfa(
+                    state_map,
+                    builder,
+                    implementation,
+                    a,
+                    *next,
+                    b,
+                    b_loc,
+                    b_match,
+                );
+                implementation
+            }
+            State::Union { alternates } => {
+                let implementation = builder.add_union(Vec::with_capacity(2)).unwrap();
+                for &a_alt in &**alternates {
+                    let alt = builder.add_empty().unwrap();
+                    build_subtracted_nfa(
+                        state_map,
+                        builder,
+                        alt,
+                        a,
+                        a_alt,
+                        b,
+                        b_loc.clone(),
+                        b_match,
+                    );
+                    builder.patch(implementation, alt).unwrap();
+                }
+                implementation
+            }
+            State::BinaryUnion { alt1, alt2 } => {
+                let implementation = builder.add_union(Vec::with_capacity(2)).unwrap();
+                for &a_alt in [alt1, alt2] {
+                    let alt = builder.add_empty().unwrap();
+                    build_subtracted_nfa(
+                        state_map,
+                        builder,
+                        alt,
+                        a,
+                        a_alt,
+                        b,
+                        b_loc.clone(),
+                        b_match,
+                    );
+                    builder.patch(implementation, alt).unwrap();
+                }
+                implementation
+            }
+            State::Capture {
+                next,
+                pattern_id: _,
+                group_index: _,
+                slot: _,
+            } => {
+                let new = builder.add_empty().unwrap();
+                build_subtracted_nfa(state_map, builder, new, a, *next, b, b_loc, b_match);
+                new
+            }
+            State::Fail => builder.add_fail().unwrap(),
+            State::Match { pattern_id: _ } => {
+                if b_match {
+                    builder.add_fail().unwrap()
+                } else {
+                    let match_state = builder.add_match().unwrap();
+                    builder.add_capture_end(match_state, 0).unwrap()
+                }
+            }
+        };
+        builder.patch(loc, implementation).unwrap();
+    }
+}
+
+fn nfa_epsilon_closure(
+    visited: &mut HashSet<StateID>,
+    nfa: &NFA,
+    state: StateID,
+    closure: &mut HashMap<Option<u32>, (BTreeSet<StateID>, bool)>,
+    look: Option<Look>,
+) {
+    use regex_automata::nfa::thompson::State;
+
+    if !visited.insert(state) {
+        return;
+    }
+
+    match nfa.state(state) {
+        State::Look {
+            look: new_look,
+            next,
+        } => match (look, new_look) {
+            (None, look) => nfa_epsilon_closure(visited, nfa, *next, closure, Some(*look)),
+            (Some(look), new_look) if look == *new_look => {
+                nfa_epsilon_closure(visited, nfa, *next, closure, Some(look))
+            }
+            (Some(look), new_look) => {
+                panic!(
+                    "Atomic negation doesn't (yet) support simultaneous {} and {}",
+                    look.as_char(),
+                    new_look.as_char()
+                );
+            }
+        },
+        State::Capture { next, .. } => nfa_epsilon_closure(visited, nfa, *next, closure, look),
+        State::Union { alternates } => {
+            for state in alternates.iter() {
+                nfa_epsilon_closure(visited, nfa, *state, closure, look)
+            }
+        }
+        State::BinaryUnion { alt1, alt2 } => {
+            nfa_epsilon_closure(visited, nfa, *alt1, closure, look);
+            nfa_epsilon_closure(visited, nfa, *alt2, closure, look);
+        }
+        State::Fail => {}
+        State::ByteRange { .. } | State::Sparse(_) | State::Dense(_) => {
+            closure
+                .entry(look.map(Look::as_repr))
+                .or_default()
+                .0
+                .insert(state);
+        }
+        State::Match { .. } => {
+            closure.entry(look.map(Look::as_repr)).or_default().1 = true;
+        }
+    }
+}
+
+fn transition(
+    nfa: &NFA,
+    loc: &BTreeSet<StateID>,
+    bytes: RangeInclusive<u8>,
+) -> impl Iterator<Item = (BTreeSet<StateID>, RangeInclusive<u8>)> {
+    let mut locs = BTreeMap::new();
+    locs.insert(*bytes.start(), (BTreeSet::new(), bytes));
+    for &state in loc {
+        use regex_automata::nfa::thompson::State;
+        let transitions = match nfa.state(state) {
+            State::ByteRange { trans } => vec![*trans],
+            State::Sparse(SparseTransitions { transitions }) => transitions.to_vec(),
+            State::Dense(DenseTransitions { transitions }) => transitions
+                .iter()
+                .enumerate()
+                .map(|(i, trans)| {
+                    let i = i.try_into().unwrap();
+                    Transition {
+                        start: i,
+                        end: i,
+                        next: *trans,
+                    }
+                })
+                .collect(),
+            State::Look { .. }
+            | State::Union { .. }
+            | State::BinaryUnion { .. }
+            | State::Capture { .. }
+            | State::Fail
+            | State::Match { .. } => panic!("Only non-epsilon states expected"),
+        };
+        for transition in transitions {
+            let start = match locs.range(..=transition.start).next_back() {
+                Some((_, (_, range))) => {
+                    let range = range.clone();
+                    if *range.start() < transition.start && transition.start <= *range.end() {
+                        let (loc, range) = locs.remove(range.start()).unwrap();
+                        locs.insert(
+                            *range.start(),
+                            (loc.clone(), *range.start()..=transition.start - 1),
+                        );
+                        locs.insert(transition.start, (loc, transition.start..=*range.end()));
+                    }
+                    transition.start
+                }
+                None => *locs.keys().next().unwrap(),
+            };
+            let end = match locs.range(..=transition.end).next_back() {
+                Some((_, (_, range))) => {
+                    let range = range.clone();
+                    if *range.start() <= transition.end && transition.end < *range.end() {
+                        let (loc, range) = locs.remove(range.start()).unwrap();
+                        locs.insert(
+                            *range.start(),
+                            (loc.clone(), *range.start()..=transition.end),
+                        );
+                        locs.insert(transition.end + 1, (loc, transition.end + 1..=*range.end()));
+                    }
+                    transition.end
+                }
+                None => continue,
+            };
+            for (_, (loc, _)) in locs.range_mut(start..=end) {
+                loc.insert(transition.next);
+            }
+        }
+    }
+    locs.into_values()
+}
+
+fn regex_nfa(regex: &str) -> NFA {
+    NFA::compiler()
+        .configure(NFA::config().which_captures(WhichCaptures::Implicit))
+        .syntax(syntax::Config::default().unicode(false))
+        .build(regex)
+        .unwrap_or_else(|err| {
+            emit(format!("Invalid regex: {}", err), vec![]);
+            NFA::never_match()
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NonTerminalDef {
     Goal {
-        ident: Ident,
-        span: Span,
+        rule: Rule,
     },
     Named {
         name: Name,
@@ -432,7 +1121,7 @@ pub enum NonTerminalDef {
 impl NonTerminalDef {
     pub fn span(&self) -> Span {
         match self {
-            &NonTerminalDef::Goal { span, .. } => span,
+            NonTerminalDef::Goal { rule, .. } => rule.span,
             &NonTerminalDef::Named { span, .. } => span,
             NonTerminalDef::Anonymous { rule, .. } => rule.span,
         }
@@ -442,8 +1131,8 @@ impl NonTerminalDef {
 impl fmt::Display for NonTerminalDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NonTerminalDef::Goal { ident, span: _ } => {
-                write!(f, "Goal({ident})")?;
+            NonTerminalDef::Goal { rule } => {
+                write!(f, "Goal({rule})")?;
             }
             NonTerminalDef::Named {
                 name,
@@ -473,8 +1162,7 @@ impl fmt::Display for NonTerminalDef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NonTerminalUse {
     Goal {
-        ident: Ident,
-        span: Span,
+        rule: Rule,
     },
     Named {
         name: Name,
@@ -517,10 +1205,7 @@ impl NonTerminalUse {
 
     pub fn definition(&self, language: &Language) -> NonTerminalDef {
         match self {
-            NonTerminalUse::Goal { ident, span } => NonTerminalDef::Goal {
-                ident: ident.clone(),
-                span: *span,
-            },
+            NonTerminalUse::Goal { rule } => NonTerminalDef::Goal { rule: rule.clone() },
             NonTerminalUse::Named {
                 name,
                 generics,
@@ -540,13 +1225,21 @@ impl NonTerminalUse {
             } => NonTerminalDef::Anonymous { rule: rule.clone() },
         }
     }
+
+    pub fn span(&self) -> Span {
+        match self {
+            NonTerminalUse::Goal { rule, .. } => rule.span,
+            NonTerminalUse::Named { span, .. } => *span,
+            NonTerminalUse::Anonymous { rule, .. } => rule.span,
+        }
+    }
 }
 
 impl fmt::Display for NonTerminalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NonTerminalUse::Goal { ident, span: _ } => {
-                write!(f, "Goal({ident})")?;
+            NonTerminalUse::Goal { rule } => {
+                write!(f, "Goal({rule})")?;
             }
             NonTerminalUse::Named {
                 name,
@@ -606,99 +1299,281 @@ impl fmt::Display for Name {
     }
 }
 
-#[derive(Clone)]
-pub enum Terminal {
-    Token(NFA, String, Span),
-    EndOfInput(Ident, Span),
+#[derive(Debug, Clone)]
+pub enum TerminalUse {
+    Named {
+        ident: Ident,
+        span: Span,
+    },
+    Anonymous {
+        name: Arc<str>,
+        regex: NFA,
+        span: Span,
+    },
+    EndOfInput {
+        span: Span,
+    },
 }
 
-impl Terminal {
-    fn new_token(regex: String, span: Span) -> Self {
-        let nfa = match NFA::compiler()
-            .configure(NFA::config().shrink(true))
-            .build(&regex)
-        {
-            Ok(nfa) => nfa,
-            Err(error) => {
-                let mut message = error.to_string();
-                let mut error: &dyn Error = &error;
-                while let Some(source) = error.source() {
-                    error = source;
-                    write!(message, ": {}", error).unwrap();
-                }
-                emit("Failed to parse regex", vec![(span, Some(message))]);
-                return Self::Token(NFA::never_match(), regex, span);
-            }
-        };
-        if nfa.has_empty() {
-            emit("Tokens must not match the empty string", vec![(span, None)]);
-        }
-        Self::Token(nfa, regex, span)
-    }
-
+impl TerminalUse {
     pub fn span(&self) -> Span {
+        match *self {
+            Self::Named { span, .. }
+            | Self::Anonymous { span, .. }
+            | Self::EndOfInput { span, .. } => span,
+        }
+    }
+
+    pub fn definition(&self, language: &Language) -> TerminalDef {
         match self {
-            Self::Token(_, _, span) => *span,
-            Self::EndOfInput(_, span) => *span,
+            Self::Named { ident, .. } => TerminalDef::Named {
+                ident: ident.clone(),
+                span: language.definitions[ident].span,
+            },
+            Self::Anonymous { name, regex, span } => TerminalDef::Anonymous {
+                name: name.clone(),
+                regex: regex.clone(),
+                span: *span,
+            },
+            Self::EndOfInput { .. } => TerminalDef::EndOfInput,
+        }
+    }
+
+    pub fn ident(&self) -> Option<&Ident> {
+        match self {
+            TerminalUse::Named { ident, .. } => Some(ident),
+            TerminalUse::Anonymous { .. } | TerminalUse::EndOfInput { .. } => None,
         }
     }
 }
 
-impl fmt::Debug for Terminal {
+impl fmt::Display for TerminalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Token(_, regex, span) => f.debug_tuple("Token").field(regex).field(span).finish(),
-            Self::EndOfInput(ident, span) => f
-                .debug_tuple("EndOfInput")
-                .field(ident)
-                .field(span)
-                .finish(),
+            TerminalUse::Named { ident, .. } => write!(f, "@{ident}"),
+            TerminalUse::Anonymous { name, .. } => write!(f, "@'{name}'"),
+            TerminalUse::EndOfInput { .. } => write!(f, "$"),
         }
     }
 }
 
-impl fmt::Display for Terminal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Terminal::Token(_, regex, _) => write!(f, "/{regex}/"),
-            Terminal::EndOfInput(goal, _) => write!(f, "EoI({goal})"),
-        }
-    }
-}
-
-impl PartialEq for Terminal {
+impl PartialEq for TerminalUse {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Token(_, this, _), Self::Token(_, other, _)) => this.as_str() == other.as_str(),
-            (Self::EndOfInput(this, _), Self::EndOfInput(other, _)) => this == other,
+            (
+                Self::Named {
+                    ident: this,
+                    span: this_span,
+                },
+                Self::Named {
+                    ident: other,
+                    span: other_span,
+                },
+            ) => this == other && this_span == other_span,
+            (
+                Self::Anonymous {
+                    name: this,
+                    regex: _,
+                    span: this_span,
+                },
+                Self::Anonymous {
+                    name: other,
+                    regex: _,
+                    span: other_span,
+                },
+            ) => {
+                // If we were being efficient we could probably only compare the spans
+                this == other && this_span == other_span
+            }
+            (Self::EndOfInput { span: this }, Self::EndOfInput { span: other }) => this == other,
             _ => false,
         }
     }
 }
-impl Eq for Terminal {}
-impl PartialOrd for Terminal {
+impl Eq for TerminalUse {}
+impl PartialOrd for TerminalUse {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for Terminal {
+impl Ord for TerminalUse {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Self::Token(_, this, _), Self::Token(_, other, _)) => {
-                this.as_str().cmp(other.as_str())
+            (
+                Self::Named {
+                    ident: this,
+                    span: this_span,
+                },
+                Self::Named {
+                    ident: other,
+                    span: other_span,
+                },
+            ) => this.cmp(other).then_with(|| this_span.cmp(other_span)),
+            (
+                Self::Anonymous {
+                    name: this,
+                    regex: _,
+                    span: this_span,
+                },
+                Self::Anonymous {
+                    name: other,
+                    regex: _,
+                    span: other_span,
+                },
+            ) => {
+                // If we were being efficient we could probably only compare the spans
+                this.cmp(other).then_with(|| this_span.cmp(other_span))
             }
-            (Self::EndOfInput(this, _), Self::EndOfInput(other, _)) => this.cmp(other),
-            (Self::Token(_, _, _), _) => Ordering::Less,
-            (_, Self::Token(_, _, _)) => Ordering::Greater,
+            (Self::EndOfInput { span: this }, Self::EndOfInput { span: other }) => this.cmp(other),
+            (Self::Named { .. }, _) => Ordering::Greater,
+            (_, Self::Named { .. }) => Ordering::Less,
+            (Self::Anonymous { .. }, _) => Ordering::Greater,
+            (_, Self::Anonymous { .. }) => Ordering::Less,
         }
     }
 }
-impl Hash for Terminal {
+impl Hash for TerminalUse {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
-            Self::Token(_, regex, _) => regex.as_str().hash(state),
-            Self::EndOfInput(goal, _) => goal.hash(state),
+            Self::Named { ident, span } => {
+                ident.hash(state);
+                span.hash(state);
+            }
+            Self::Anonymous {
+                name,
+                regex: _,
+                span,
+            } => {
+                name.hash(state);
+                span.hash(state);
+            }
+            Self::EndOfInput { span } => span.hash(state),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminalDef {
+    Named {
+        ident: Ident,
+        span: Span,
+    },
+    Anonymous {
+        name: Arc<str>,
+        regex: NFA,
+        span: Span,
+    },
+    EndOfInput,
+}
+
+impl TerminalDef {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Named { ident, .. } => &ident.0,
+            Self::Anonymous { name, .. } => name,
+            Self::EndOfInput => "$",
+        }
+    }
+}
+
+impl fmt::Display for TerminalDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TerminalDef::Named { ident, .. } => write!(f, "@{ident}"),
+            TerminalDef::Anonymous { name, .. } => write!(f, "@'{name}'"),
+            TerminalDef::EndOfInput => write!(f, "$"),
+        }
+    }
+}
+impl PartialEq for TerminalDef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Named {
+                    ident: this_name,
+                    span: this_span,
+                },
+                Self::Named {
+                    ident: other_name,
+                    span: other_span,
+                },
+            ) => this_name == other_name && this_span == other_span,
+            (
+                Self::Anonymous {
+                    name: this,
+                    regex: _,
+                    span: this_span,
+                },
+                Self::Anonymous {
+                    name: other,
+                    regex: _,
+                    span: other_span,
+                },
+            ) => this == other && this_span == other_span,
+            (Self::EndOfInput, Self::EndOfInput) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for TerminalDef {}
+impl PartialOrd for TerminalDef {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TerminalDef {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (
+                Self::Named {
+                    ident: this_name,
+                    span: this_span,
+                },
+                Self::Named {
+                    ident: other_name,
+                    span: other_span,
+                },
+            ) => this_name
+                .cmp(other_name)
+                .then_with(|| this_span.cmp(other_span)),
+            (
+                Self::Anonymous {
+                    name: this,
+                    regex: _,
+                    span: this_span,
+                },
+                Self::Anonymous {
+                    name: other,
+                    regex: _,
+                    span: other_span,
+                },
+            ) => this.cmp(other).then_with(|| this_span.cmp(other_span)),
+            (Self::EndOfInput, Self::EndOfInput) => Ordering::Equal,
+            (Self::Named { .. }, _) => Ordering::Greater,
+            (_, Self::Named { .. }) => Ordering::Less,
+            (Self::Anonymous { .. }, _) => Ordering::Greater,
+            (_, Self::Anonymous { .. }) => Ordering::Less,
+        }
+    }
+}
+impl Hash for TerminalDef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Named { ident, span } => {
+                ident.hash(state);
+                span.hash(state);
+            }
+            Self::Anonymous {
+                name,
+                regex: _,
+                span,
+            } => {
+                name.hash(state);
+                span.hash(state);
+            }
+            Self::EndOfInput => {}
         }
     }
 }
@@ -746,7 +1621,6 @@ impl fmt::Display for Alternative {
 pub struct Term {
     pub kind: TermKind,
     pub silent: bool,
-    pub atomic: bool,
 }
 
 impl fmt::Display for Term {
@@ -754,16 +1628,13 @@ impl fmt::Display for Term {
         if self.silent {
             f.write_char('-')?;
         }
-        if self.atomic {
-            f.write_char('@')?;
-        }
         <TermKind as fmt::Display>::fmt(&self.kind, f)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TermKind {
-    Terminal(Terminal),
+    Terminal(TerminalUse),
     NonTerminal(NonTerminalUse),
 }
 

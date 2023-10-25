@@ -9,15 +9,21 @@ use std::{
 
 use indenter::indented;
 use regex_automata::{
-    nfa::thompson::{State as NfaState, NFA},
+    nfa::thompson::{
+        Builder as NfaBuilder, DenseTransitions, SparseTransitions, State as NfaState, Transition,
+        NFA,
+    },
     PatternID,
 };
 use tracing::{debug, debug_span, trace};
 
 use crate::{
     diagnostics::emit,
-    language::{Ident, Language},
-    lower::{production, Alternative, NonTerminalDef, NonTerminalUse, Term, TermKind, Terminal},
+    language::{Language, Rule},
+    lower::{
+        production, terminal_nfa, Alternative, NonTerminalDef, NonTerminalUse, Term, TermKind,
+        TerminalDef, TerminalUse,
+    },
     Span,
 };
 
@@ -27,16 +33,13 @@ mod term_string;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LrkParseTable {
-    pub start_states: HashMap<Ident, StateId>,
+    pub goal: NonTerminalUse,
     pub states: Vec<State>,
 }
 
 impl fmt::Display for LrkParseTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Start states:")?;
-        for (ident, state) in &self.start_states {
-            writeln!(f, "  {ident} => {state}")?;
-        }
+        writeln!(f, "Goal: {}", self.goal)?;
         for (i, state) in self.states.iter().enumerate() {
             writeln!(f, "State {i}:")?;
             writeln!(f, "  Actions:")?;
@@ -61,6 +64,10 @@ impl Index<StateId> for LrkParseTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StateId(usize);
 
+impl StateId {
+    pub const START: StateId = StateId(0);
+}
+
 impl fmt::Display for StateId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
@@ -77,11 +84,10 @@ pub struct State {
 pub enum Action {
     Ambiguous {
         nfa: NFA,
-        regexes: Vec<String>,
+        terminals: Vec<TerminalUse>,
         actions: Vec<Action>,
-        eoi: HashMap<Ident, Action>,
     },
-    Shift(Terminal, StateId),
+    Shift(TerminalUse, StateId),
     Reduce(NonTerminalDef, Alternative),
 }
 
@@ -95,17 +101,11 @@ impl fmt::Display for Action {
             match action {
                 Action::Ambiguous {
                     nfa: _,
-                    regexes,
+                    terminals: regexes,
                     actions,
-                    eoi,
                 } => {
                     for (terminal, action) in regexes.iter().zip(actions) {
-                        lookahead.push(terminal.clone());
-                        display(action, f, lookahead)?;
-                        lookahead.pop();
-                    }
-                    for (ident, action) in eoi {
-                        lookahead.push(format!("EOI({})", ident));
+                        lookahead.push(terminal.to_string());
                         display(action, f, lookahead)?;
                         lookahead.pop();
                     }
@@ -135,17 +135,15 @@ impl PartialEq for Action {
             (
                 Self::Ambiguous {
                     nfa: _,
-                    regexes: l_regexes,
+                    terminals: l_regexes,
                     actions: l_actions,
-                    eoi: l_eoi,
                 },
                 Self::Ambiguous {
                     nfa: _,
-                    regexes: r_regexes,
+                    terminals: r_regexes,
                     actions: r_actions,
-                    eoi: r_eoi,
                 },
-            ) => l_regexes == r_regexes && l_actions == r_actions && l_eoi == r_eoi,
+            ) => l_regexes == r_regexes && l_actions == r_actions,
             (Self::Shift(l0, l1), Self::Shift(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Reduce(l0, l1), Self::Reduce(r0, r1)) => l0 == r0 && l1 == r1,
             _ => false,
@@ -198,14 +196,14 @@ impl fmt::Display for ItemIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum TermDef {
-    Terminal(Terminal),
+    Terminal(TerminalDef),
     NonTerminal(NonTerminalDef),
 }
 
 impl TermDef {
     fn new(term: &Term, language: &Language) -> Self {
         match &term.kind {
-            TermKind::Terminal(t) => Self::Terminal(t.clone()),
+            TermKind::Terminal(t) => Self::Terminal(t.definition(language)),
             TermKind::NonTerminal(nt) => Self::NonTerminal(nt.definition(language)),
         }
     }
@@ -220,11 +218,14 @@ impl fmt::Display for TermDef {
     }
 }
 
-pub fn first_set(language: &Language, non_terminal: &NonTerminalUse) -> (bool, HashSet<Terminal>) {
+pub fn first_set(
+    language: &Language,
+    non_terminal: &NonTerminalUse,
+) -> (bool, HashSet<TerminalUse>) {
     production(language, non_terminal)
         .alternatives
         .iter()
-        .map(|alternative| alternative.terms.get(0))
+        .map(|alternative| alternative.terms.first())
         .fold(
             (false, HashSet::new()),
             |(contains_null, mut set), term| match term {
@@ -254,16 +255,12 @@ pub fn first_set(language: &Language, non_terminal: &NonTerminalUse) -> (bool, H
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lr0ParseTable {
-    pub start_states: HashMap<Ident, Lr0StateId>,
+    pub goal: NonTerminalUse,
     pub states: Vec<Lr0State>,
 }
 
 impl fmt::Display for Lr0ParseTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Start states:")?;
-        for (ident, state) in &self.start_states {
-            writeln!(f, "  {ident} => {state}")?;
-        }
         for (i, state) in self.states.iter().enumerate() {
             writeln!(f, "State {i}:")?;
             writeln!(indented(f).with_str("  "), "{state}")?;
@@ -291,7 +288,7 @@ impl Index<ItemIndex> for Lr0ParseTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lr0State {
     pub item_set: Vec<(Item, BTreeSet<ItemIndex>)>,
-    pub actions: HashMap<Terminal, Lr0StateId>,
+    pub actions: HashMap<TerminalDef, Lr0StateId>,
     pub goto: HashMap<NonTerminalDef, Lr0StateId>,
 }
 
@@ -328,30 +325,20 @@ pub struct ItemSet {
     items: Vec<(Item, BTreeSet<ItemIndex>)>,
 }
 
-pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
+pub fn lr0_parse_table(language: &Language, goal: Rule) -> Lr0ParseTable {
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
-    let mut start_states = HashMap::new();
-    for (ident, definition) in &language.definitions {
-        if !definition.generics.is_empty() {
-            continue;
-        }
-        let goal = NonTerminalUse::Goal {
-            ident: ident.clone(),
-            span: definition.span,
-        };
-        let mut root_item_set = BTreeSet::new();
-        for alternative in &production(language, &goal).alternatives {
-            // There should only be one but doesn't hurt to add them "all"
-            root_item_set.insert(Item::new(
-                goal.clone().definition(language),
-                alternative.clone(),
-            ));
-        }
-        let new_state = add_state(language, &mut states, &root_item_set);
-        start_states.insert(ident.clone(), new_state);
+    let goal = NonTerminalUse::Goal { rule: goal };
+    let mut root_item_set = BTreeSet::new();
+    for alternative in &production(language, &goal).alternatives {
+        // There should only be one but doesn't hurt to add them "all"
+        root_item_set.insert(Item::new(
+            goal.clone().definition(language),
+            alternative.clone(),
+        ));
     }
+    add_state(language, &mut states, &root_item_set);
 
     let mut state_id = 0;
     while state_id < states.len() {
@@ -411,10 +398,7 @@ pub fn lr0_parse_table(language: &Language) -> Lr0ParseTable {
         state_id += 1;
     }
 
-    Lr0ParseTable {
-        start_states,
-        states,
-    }
+    Lr0ParseTable { goal, states }
 }
 
 fn add_state(
@@ -481,8 +465,8 @@ fn closure(
     state
 }
 
-pub fn parse_table(language: &Language) -> LrkParseTable {
-    let lr0_parse_table = lr0_parse_table(language);
+pub fn parse_table(language: &Language, goal: Rule) -> LrkParseTable {
+    let lr0_parse_table = lr0_parse_table(language, goal);
     debug!(%lr0_parse_table, "Generated LR(0) parse table");
     build_lrk_parse_table(language, lr0_parse_table)
 }
@@ -568,11 +552,7 @@ fn build_lrk_parse_table(language: &Language, mut lr0_parse_table: Lr0ParseTable
         states[lr0_state_id] = State { action, goto };
     }
     LrkParseTable {
-        start_states: lr0_parse_table
-            .start_states
-            .into_iter()
-            .map(|(k, v)| (k, StateId(v.0)))
-            .collect(),
+        goal: lr0_parse_table.goal,
         states,
     }
 }
@@ -605,7 +585,7 @@ fn make_action(
 
     let mut split_info = HashMap::new();
     let mut potential_ambiguities = HashSet::new();
-    let mut next: HashMap<Terminal, HashMap<ConflictedAction, Vec<Ambiguity>>> = HashMap::new();
+    let mut next: HashMap<TerminalUse, HashMap<ConflictedAction, Vec<Ambiguity>>> = HashMap::new();
 
     // Extend ambiguities to next lookahead item
     for (action, mut ambiguities) in conflicts {
@@ -818,9 +798,8 @@ fn make_action(
     }
 
     let mut regexes = Vec::with_capacity(next.len());
-    let mut spans = Vec::with_capacity(next.len());
+    let mut terminals = Vec::with_capacity(next.len());
     let mut actions = Vec::with_capacity(next.len());
-    let mut eoi = HashMap::new();
     for (terminal, conflicts) in next {
         let span = debug_span!("make_action", %terminal);
         let _guard = span.enter();
@@ -831,30 +810,128 @@ fn make_action(
             conflicts,
             invalidate_state,
         )?;
-        match terminal {
-            Terminal::Token(_, regex, span) => {
-                regexes.push(regex);
-                spans.push(span);
-                actions.push(action);
-            }
-            Terminal::EndOfInput(ident, _) => {
-                eoi.insert(ident, action);
-            }
-        };
+        regexes.push(terminal_nfa(language, &terminal));
+        terminals.push(terminal);
+        actions.push(action);
     }
 
-    let nfa = NFA::compiler()
-        .configure(NFA::config().shrink(true))
-        .build_many(&regexes)
+    let mut builder = NfaBuilder::new();
+    let start = builder
+        .add_union(Vec::with_capacity(terminals.len()))
         .unwrap();
+    for regex in &regexes {
+        builder.start_pattern().unwrap();
+        let pattern_start = builder
+            .add_capture_start(regex_automata::util::primitives::StateID::MAX, 0, None)
+            .unwrap();
+        builder.patch(start, pattern_start).unwrap();
 
-    validate_nfa(&nfa, &regexes, &spans);
+        let mut id_map = HashMap::new();
+        id_map.insert(regex.start_anchored(), pattern_start);
+        let mut to_add = vec![regex.start_anchored()];
+        while let Some(id) = to_add.pop() {
+            let new = match regex.state(id) {
+                NfaState::ByteRange { trans } => {
+                    let next = *id_map.entry(trans.next).or_insert_with_key(|id| {
+                        to_add.push(*id);
+                        builder.add_empty().unwrap()
+                    });
+                    builder
+                        .add_range(Transition {
+                            start: trans.start,
+                            end: trans.end,
+                            next,
+                        })
+                        .unwrap()
+                }
+                NfaState::Sparse(SparseTransitions { transitions }) => {
+                    let transitions = transitions
+                        .iter()
+                        .map(|trans| Transition {
+                            start: trans.start,
+                            end: trans.end,
+                            next: *id_map.entry(trans.next).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            }),
+                        })
+                        .collect();
+                    builder.add_sparse(transitions).unwrap()
+                }
+                NfaState::Dense(DenseTransitions { transitions }) => {
+                    let transitions = transitions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, next)| Transition {
+                            start: i.try_into().unwrap(),
+                            end: i.try_into().unwrap(),
+                            next: *id_map.entry(*next).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            }),
+                        })
+                        .collect();
+                    builder.add_sparse(transitions).unwrap()
+                }
+                NfaState::Look { look, next } => {
+                    let next = *id_map.entry(*next).or_insert_with_key(|id| {
+                        to_add.push(*id);
+                        builder.add_empty().unwrap()
+                    });
+                    builder.add_look(next, *look).unwrap()
+                }
+                NfaState::Union { alternates } => {
+                    let alternates = alternates
+                        .iter()
+                        .map(|alt| {
+                            *id_map.entry(*alt).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            })
+                        })
+                        .collect();
+                    builder.add_union(alternates).unwrap()
+                }
+                NfaState::BinaryUnion { alt1, alt2 } => {
+                    let alternates = [alt1, alt2]
+                        .into_iter()
+                        .map(|alt| {
+                            *id_map.entry(*alt).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            })
+                        })
+                        .collect();
+                    builder.add_union(alternates).unwrap()
+                }
+                // Ignore capture groups because we only care about whether there's a match.
+                NfaState::Capture {
+                    next,
+                    pattern_id: _,
+                    group_index: _,
+                    slot: _,
+                } => *id_map
+                    .entry(*next)
+                    .or_insert_with(|| builder.add_empty().unwrap()),
+                NfaState::Fail => builder.add_fail().unwrap(),
+                NfaState::Match { pattern_id: _ } => {
+                    let match_state = builder.add_match().unwrap();
+                    builder.add_capture_end(match_state, 0).unwrap()
+                }
+            };
+            builder.patch(id_map[&id], new).unwrap();
+        }
+
+        builder.finish_pattern(pattern_start).unwrap();
+    }
+    let nfa = builder.build(start, start).unwrap();
+
+    validate_nfa(&nfa, &terminals);
 
     Some(Action::Ambiguous {
         nfa,
-        regexes,
+        terminals,
         actions,
-        eoi,
     })
 }
 
@@ -1022,7 +1099,7 @@ fn conflicts(
                     kind: TermKind::Terminal(terminal),
                     ..
                 }) => {
-                    let next_state = StateId(next_state.actions[&terminal].0);
+                    let next_state = StateId(next_state.actions[&terminal.definition(language)].0);
                     ConflictedAction::Shift(terminal, next_state)
                 }
                 None => {
@@ -1077,12 +1154,12 @@ fn conflicts(
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
-    Shift(Terminal, StateId),
+    Shift(TerminalUse, StateId),
     Reduce(NonTerminalDef, Alternative, Vec<Arc<TermString>>),
 }
 
 impl ConflictedAction {
-    fn with_lookahead(&self, language: &Language, terminal: Terminal) -> ConflictedAction {
+    fn with_lookahead(&self, language: &Language, terminal: TerminalUse) -> ConflictedAction {
         match self {
             ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
                 let new_negative_lookahead = remaining_negative_lookahead
@@ -1219,7 +1296,7 @@ impl NormalNonTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalTerm {
-    Terminal(Terminal),
+    Terminal(TerminalUse),
     NonTerminal(NormalNonTerminal),
 }
 
@@ -1400,8 +1477,7 @@ fn can_be_empty(language: &Language, term: &TermKind) -> bool {
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.
-fn validate_nfa(nfa: &NFA, regexes: &[String], spans: &[Span]) {
-    assert!(nfa.pattern_len() == regexes.len());
+fn validate_nfa(nfa: &NFA, terminals: &[TerminalUse]) {
     let mut start = BTreeSet::new();
     start.insert(nfa.start_anchored());
     let mut to_visit = vec![(start, None::<(PatternID, Vec<u8>)>, Vec::new())];
@@ -1452,8 +1528,8 @@ fn validate_nfa(nfa: &NFA, regexes: &[String], spans: &[Span]) {
                                 String::from_utf8_lossy(&string)
                             ),
                             vec![
-                                (spans[other_colour.as_usize()], None),
-                                (spans[this_colour.as_usize()], None),
+                                (terminals[other_colour.as_usize()].span(), None),
+                                (terminals[this_colour.as_usize()].span(), None),
                             ],
                         );
                     }
@@ -1470,14 +1546,14 @@ fn validate_nfa(nfa: &NFA, regexes: &[String], spans: &[Span]) {
                     "Tokens conflict as one matches the prefix of the other",
                     vec![
                         (
-                            spans[intrinsic_colour.as_usize()],
+                            terminals[intrinsic_colour.as_usize()].span(),
                             Some(format!(
                                 "matches the string {:?}",
                                 String::from_utf8_lossy(&string)
                             )),
                         ),
                         (
-                            spans[new_colour.as_usize()],
+                            terminals[new_colour.as_usize()].span(),
                             Some(format!(
                                 "matches the prefix {:?}",
                                 String::from_utf8_lossy(prefix)

@@ -6,8 +6,9 @@ use std::{
 use tracing::trace;
 
 use crate::{
-    lower::Terminal,
-    parse_table::{normal_production, NormalTerm}, language::Language,
+    language::Language,
+    lower::TerminalUse,
+    parse_table::{normal_production, NormalTerm},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,7 +80,7 @@ impl<'a> Iter<'a> {
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (Option<Terminal>, Arc<TermString>);
+    type Item = (Option<TerminalUse>, Arc<TermString>);
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(mut term_string) = self.stack.pop() {

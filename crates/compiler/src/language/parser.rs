@@ -92,11 +92,7 @@ fn file() -> impl Parser<char, Language, Error = ParseError> {
                         }
                     }
                     RuleOrTest::Test(test) => {
-                        language
-                            .tests
-                            .entry(test.ident.clone())
-                            .or_default()
-                            .push(test);
+                        language.tests.push(test);
                     }
                 }
                 language
@@ -257,26 +253,22 @@ fn test() -> impl Parser<char, Test, Error = ParseError> {
     lws()
         .ignore_then(just('=').repeated().at_least(1).map(|equals| equals.len()))
         .then_with(|equals: usize| {
-            ident()
-                .map_with_span(|ident, span| (ident, span))
+            rule()
                 .padded_by(lws())
                 .then_ignore(newline())
                 .then(test_body(equals).map_with_span(|body, span| (body, span)))
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
-                .then(parse_tree())
+                .then(parse_trees())
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
         })
-        .map(
-            |(((ident, ident_span), (test, test_span)), parse_tree)| Test {
-                ident,
-                ident_span,
-                test: test.into(),
-                test_span,
-                parse_tree,
-            },
-        )
+        .map(|((goal, (test, test_span)), parse_trees)| Test {
+            goal,
+            test: test.into(),
+            test_span,
+            parse_trees,
+        })
 }
 
 fn test_body(equals: usize) -> impl Parser<char, String, Error = ParseError> {
@@ -293,7 +285,7 @@ fn test_body(equals: usize) -> impl Parser<char, String, Error = ParseError> {
         })
 }
 
-fn parse_tree() -> impl Parser<char, ParseTree, Error = ParseError> {
+fn parse_trees() -> impl Parser<char, Vec<ParseTree>, Error = ParseError> {
     lws()
         .then(
             ident()
@@ -304,41 +296,37 @@ fn parse_tree() -> impl Parser<char, ParseTree, Error = ParseError> {
         )
         .repeated()
         .validate(|lines, span, emit| {
-            let mut trees: Vec<(String, Ident, Vec<ParseTree>)> = Vec::new();
+            let mut trees: Vec<(String, Ident, Vec<ParseTree>)> =
+                vec![("".into(), Ident("".into()), Vec::new())];
             for (indent, tree_info) in lines {
                 while trees
                     .last()
                     .map(|(i, _, _)| i.as_str().len() >= indent.len())
                     .unwrap_or(false)
+                    && trees.len() > 1
                 {
                     let (old_indent, old_ident, old_nodes) = trees.pop().unwrap();
                     let old_parse_tree = ParseTree::Node {
                         ident: old_ident,
                         nodes: old_nodes,
                     };
-                    let Some((_, _, top_nodes)) = trees.last_mut() else {
-                        emit(ParseError::custom(
-                            span,
-                            "Only one top level parse tree is allowed.",
-                        ));
-                        return old_parse_tree;
-                    };
+                    let (_, _, top_nodes) = trees.last_mut().expect("Above top-level?");
                     if !old_indent.starts_with(&indent) {
                         emit(ParseError::custom(
                             span,
                             "Parse tree indentation must be consistent.",
                         ));
-                        return old_parse_tree;
+                        return vec![old_parse_tree];
                     }
                     top_nodes.push(old_parse_tree);
                 }
                 match tree_info {
                     (ident, Some(data)) => {
                         let new_item = ParseTree::Leaf { ident, data };
-                        match trees.last_mut() {
-                            Some((_, _, nodes)) => nodes.push(new_item),
-                            None => return new_item,
-                        }
+                        let (_, _, nodes) = trees
+                            .last_mut()
+                            .expect("There should always be a top-level tree");
+                        nodes.push(new_item);
                     }
                     (Some(ident), None) => {
                         trees.push((indent, ident, Vec::new()));
@@ -357,13 +345,10 @@ fn parse_tree() -> impl Parser<char, ParseTree, Error = ParseError> {
                     .push(ParseTree::Node { ident, nodes });
             }
             match trees.pop() {
-                Some((_, ident, nodes)) => ParseTree::Node { ident, nodes },
+                Some((_, _, nodes)) => nodes,
                 None => {
                     emit(ParseError::custom(span, "No parse tree found."));
-                    ParseTree::Leaf {
-                        ident: None,
-                        data: String::new(),
-                    }
+                    vec![]
                 }
             }
         })
