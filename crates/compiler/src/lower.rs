@@ -429,23 +429,23 @@ fn lower_term(
 }
 
 #[instrument(skip_all, fields(%terminal))]
-pub fn terminal_nfa(language: &Language, terminal: &TerminalUse) -> NFA {
-    let nfa = match terminal {
-        TerminalUse::Named { ident, span } => {
-            ident_nfa(language, ident, *span, &mut HashSet::new())
+pub fn terminal_nfa(language: &Language, terminal: &TerminalDef) -> NFA {
+    match terminal {
+        TerminalDef::Named { ident, span } => {
+            let nfa = ident_nfa(language, ident, *span, &mut HashSet::new());
+            if nfa.has_empty() {
+                emit(
+                    "Tokens must not match the empty string",
+                    vec![(*span, None)],
+                );
+            }
+            nfa
         }
-        TerminalUse::Anonymous { regex, .. } => regex.clone(),
-        TerminalUse::EndOfInput { .. } => NFA::compiler()
+        TerminalDef::Anonymous { regex, .. } => regex.clone(),
+        TerminalDef::EndOfInput => NFA::compiler()
             .build_from_hir(&Hir::look(regex_syntax::hir::Look::End))
             .unwrap(),
-    };
-    if !matches!(terminal, TerminalUse::EndOfInput { .. }) && nfa.has_empty() {
-        emit(
-            "Tokens must not match the empty string",
-            vec![(terminal.span(), None)],
-        );
     }
-    nfa
 }
 
 #[instrument(skip_all, fields(%ident))]
@@ -1105,7 +1105,7 @@ fn transition(
 
 #[instrument(skip_all, fields(%regex))]
 fn regex_nfa(regex: &str, span: Span) -> NFA {
-    NFA::compiler()
+    let nfa = NFA::compiler()
         .configure(NFA::config().which_captures(WhichCaptures::Implicit))
         .syntax(syntax::Config::default().unicode(true))
         .build(regex)
@@ -1121,7 +1121,12 @@ fn regex_nfa(regex: &str, span: Span) -> NFA {
             }
             emit(reason, vec![(span, None)]);
             NFA::never_match()
-        })
+        });
+
+    if nfa.has_empty() {
+        emit("Tokens must not match the empty string", vec![(span, None)]);
+    }
+    nfa
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1351,19 +1356,11 @@ impl TerminalUse {
                 ident: ident.clone(),
                 span: language.definitions[ident].span,
             },
-            Self::Anonymous { name, regex, span } => TerminalDef::Anonymous {
+            Self::Anonymous { name, regex, .. } => TerminalDef::Anonymous {
                 name: name.clone(),
                 regex: regex.clone(),
-                span: *span,
             },
             Self::EndOfInput { .. } => TerminalDef::EndOfInput,
-        }
-    }
-
-    pub fn ident(&self) -> Option<&Ident> {
-        match self {
-            TerminalUse::Named { ident, .. } => Some(ident),
-            TerminalUse::Anonymous { .. } | TerminalUse::EndOfInput { .. } => None,
         }
     }
 }
@@ -1476,15 +1473,8 @@ impl Hash for TerminalUse {
 
 #[derive(Debug, Clone)]
 pub enum TerminalDef {
-    Named {
-        ident: Ident,
-        span: Span,
-    },
-    Anonymous {
-        name: Arc<str>,
-        regex: NFA,
-        span: Span,
-    },
+    Named { ident: Ident, span: Span },
+    Anonymous { name: Arc<str>, regex: NFA },
     EndOfInput,
 }
 
@@ -1494,6 +1484,13 @@ impl TerminalDef {
             Self::Named { ident, .. } => &ident.0,
             Self::Anonymous { name, .. } => name,
             Self::EndOfInput => "$",
+        }
+    }
+
+    pub fn ident(&self) -> Option<&Ident> {
+        match self {
+            Self::Named { ident, .. } => Some(ident),
+            Self::Anonymous { .. } | Self::EndOfInput { .. } => None,
         }
     }
 }
@@ -1524,14 +1521,12 @@ impl PartialEq for TerminalDef {
                 Self::Anonymous {
                     name: this,
                     regex: _,
-                    span: this_span,
                 },
                 Self::Anonymous {
                     name: other,
                     regex: _,
-                    span: other_span,
                 },
-            ) => this == other && this_span == other_span,
+            ) => this == other,
             (Self::EndOfInput, Self::EndOfInput) => true,
             _ => false,
         }
@@ -1562,14 +1557,12 @@ impl Ord for TerminalDef {
                 Self::Anonymous {
                     name: this,
                     regex: _,
-                    span: this_span,
                 },
                 Self::Anonymous {
                     name: other,
                     regex: _,
-                    span: other_span,
                 },
-            ) => this.cmp(other).then_with(|| this_span.cmp(other_span)),
+            ) => this.cmp(other),
             (Self::EndOfInput, Self::EndOfInput) => Ordering::Equal,
             (Self::Named { .. }, _) => Ordering::Greater,
             (_, Self::Named { .. }) => Ordering::Less,
@@ -1586,13 +1579,8 @@ impl Hash for TerminalDef {
                 ident.hash(state);
                 span.hash(state);
             }
-            Self::Anonymous {
-                name,
-                regex: _,
-                span,
-            } => {
+            Self::Anonymous { name, regex: _ } => {
                 name.hash(state);
-                span.hash(state);
             }
             Self::EndOfInput => {}
         }
@@ -1642,6 +1630,15 @@ impl fmt::Display for Alternative {
 pub struct Term {
     pub kind: TermKind,
     pub silent: bool,
+}
+
+impl Term {
+    pub fn span(&self) -> Span {
+        match &self.kind {
+            TermKind::Terminal(terminal) => terminal.span(),
+            TermKind::NonTerminal(non_terminal) => non_terminal.span(),
+        }
+    }
 }
 
 impl fmt::Display for Term {

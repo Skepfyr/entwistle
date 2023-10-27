@@ -15,6 +15,7 @@ use regex_automata::{
         Builder as NfaBuilder, DenseTransitions, SparseTransitions, State as NfaState, Transition,
         NFA,
     },
+    util::look::Look,
     PatternID,
 };
 use tracing::{debug, debug_span, instrument, trace};
@@ -86,10 +87,10 @@ pub struct State {
 pub enum Action {
     Ambiguous {
         nfa: NFA,
-        terminals: Vec<TerminalUse>,
+        terminals: Vec<TerminalDef>,
         actions: Vec<Action>,
     },
-    Shift(TerminalUse, StateId),
+    Shift(TerminalDef, StateId),
     Reduce(NonTerminalDef, Alternative),
 }
 
@@ -587,7 +588,7 @@ fn make_action(
 
     let mut split_info = HashMap::new();
     let mut potential_ambiguities = HashSet::new();
-    let mut next: HashMap<TerminalUse, HashMap<ConflictedAction, Vec<Ambiguity>>> = HashMap::new();
+    let mut next: HashMap<TerminalDef, HashMap<ConflictedAction, Vec<Ambiguity>>> = HashMap::new();
 
     // Extend ambiguities to next lookahead item
     for (action, mut ambiguities) in conflicts {
@@ -599,6 +600,7 @@ fn make_action(
             for (terminal, term_string) in ambiguity.term_string.clone().next(language) {
                 match terminal {
                     Some(terminal) => {
+                        let terminal = terminal.definition(language);
                         let new_action = action.with_lookahead(language, terminal.clone());
                         if new_action.contains_finished_lookahead(language) {
                             trace!("Dropping ambiguity because negative lookahead matched");
@@ -651,7 +653,7 @@ fn make_action(
                 }
             };
             terms.insert(term);
-            split_actions.extend(actions.into_iter().map(|(nt, (action, _))| (nt, action)));
+            split_actions.extend(actions.into_iter().map(|(nt, (action, _, _))| (nt, action)));
         }
         if splits.len() <= 1 {
             continue;
@@ -785,11 +787,11 @@ fn make_action(
                 format!("{}", ambiguity),
                 vec![
                     (
-                        ambiguity.conflict_a.0.span(),
+                        ambiguity.conflict_a.1,
                         Some(string_for_conflict(&ambiguity.conflict_a.0)),
                     ),
                     (
-                        ambiguity.conflict_b.0.span(),
+                        ambiguity.conflict_b.1,
                         Some(string_for_conflict(&ambiguity.conflict_b.0)),
                     ),
                 ],
@@ -801,10 +803,14 @@ fn make_action(
 
     let mut regexes = Vec::with_capacity(next.len());
     let mut terminals = Vec::with_capacity(next.len());
+    let mut spans = Vec::with_capacity(next.len());
     let mut actions = Vec::with_capacity(next.len());
     for (terminal, conflicts) in next {
-        let span = debug_span!("make_action", %terminal);
-        let _guard = span.enter();
+        let tracing_span = debug_span!("make_action", %terminal);
+        let _guard = tracing_span.enter();
+        let span = conflicts.values().next().expect("Conflicts is not empty")[0]
+            .span
+            .expect("Ambiguity conflict will be resolved");
         let action = make_action(
             language,
             lr0_parse_table,
@@ -814,6 +820,7 @@ fn make_action(
         )?;
         regexes.push(terminal_nfa(language, &terminal));
         terminals.push(terminal);
+        spans.push(span);
         actions.push(action);
     }
 
@@ -912,9 +919,10 @@ fn make_action(
                     pattern_id: _,
                     group_index: _,
                     slot: _,
-                } => *id_map
-                    .entry(*next)
-                    .or_insert_with(|| builder.add_empty().unwrap()),
+                } => *id_map.entry(*next).or_insert_with_key(|id| {
+                    to_add.push(*id);
+                    builder.add_empty().unwrap()
+                }),
                 NfaState::Fail => builder.add_fail().unwrap(),
                 NfaState::Match { pattern_id: _ } => {
                     let match_state = builder.add_match().unwrap();
@@ -928,7 +936,7 @@ fn make_action(
     }
     let nfa = builder.build(start, start).unwrap();
 
-    validate_nfa(&nfa, &terminals);
+    validate_nfa(&nfa, &spans);
 
     Some(Action::Ambiguous {
         nfa,
@@ -944,7 +952,7 @@ fn item_lane_heads(
     ambiguity: Ambiguity,
     split_info: &mut HashMap<
         Lr0StateId,
-        HashMap<Option<TermDef>, HashMap<usize, (ConflictedAction, History)>>,
+        HashMap<Option<TermDef>, HashMap<usize, (ConflictedAction, Option<Span>, History)>>,
     >,
     visited: &mut HashMap<ItemIndex, u32>,
     ambiguities: &mut Vec<Ambiguity>,
@@ -969,17 +977,28 @@ fn item_lane_heads(
     match existing_action {
         Entry::Occupied(entry) => {
             if entry.get().0 != action {
+                let (conflict_b, b_span, b_history) = entry.get().clone();
                 ret.insert(AmbiguitySource {
                     location: ambiguity.location,
                     transition: ambiguity.transition.clone(),
                     non_terminal: item.non_terminal.clone(),
-                    conflict_a: (action.clone(), ambiguity.history.clone()),
-                    conflict_b: entry.get().clone(),
+                    conflict_a: (
+                        action.clone(),
+                        ambiguity
+                            .span
+                            .expect("Ambiguity span should have been populated"),
+                        ambiguity.history.clone(),
+                    ),
+                    conflict_b: (
+                        conflict_b,
+                        b_span.expect("Ambiguity span should have been populated"),
+                        b_history,
+                    ),
                 });
             }
         }
         Entry::Vacant(entry) => {
-            entry.insert((action.clone(), ambiguity.history.clone()));
+            entry.insert((action.clone(), ambiguity.span, ambiguity.history.clone()));
         }
     }
 
@@ -1026,7 +1045,22 @@ fn item_lane_heads(
             };
             trace!(%back_ref, "Walking parse table");
             let item = &lr0_parse_table[back_ref].0;
+            let term_string = TermString::new(
+                item.alternative
+                    .terms
+                    .iter()
+                    .map(|term| term.kind.clone().into())
+                    .collect::<Vec<_>>(),
+                item.index + 1,
+            );
             ambiguities.push(Ambiguity {
+                span: ambiguity.span.or_else(|| {
+                    term_string
+                        .clone()
+                        .next(language)
+                        .find_map(|(terminal, _)| terminal)
+                        .map(|terminal| terminal.span())
+                }),
                 location: back_ref,
                 transition,
                 history: {
@@ -1034,14 +1068,7 @@ fn item_lane_heads(
                     history.0.push(back_ref);
                     history
                 },
-                term_string: TermString::new(
-                    item.alternative
-                        .terms
-                        .iter()
-                        .map(|term| term.kind.clone().into())
-                        .collect::<Vec<_>>(),
-                    item.index + 1,
-                ),
+                term_string,
             });
         }
     }
@@ -1053,8 +1080,8 @@ struct AmbiguitySource {
     location: ItemIndex,
     transition: Option<TermDef>,
     non_terminal: NonTerminalDef,
-    conflict_a: (ConflictedAction, History),
-    conflict_b: (ConflictedAction, History),
+    conflict_a: (ConflictedAction, Span, History),
+    conflict_b: (ConflictedAction, Span, History),
 }
 
 impl fmt::Display for AmbiguitySource {
@@ -1076,7 +1103,7 @@ impl fmt::Display for AmbiguitySource {
         writeln!(
             f,
             "history: {} and {}",
-            self.conflict_a.1, self.conflict_b.1,
+            self.conflict_a.2, self.conflict_b.2,
         )?;
         Ok(())
     }
@@ -1092,7 +1119,7 @@ fn conflicts(
         .iter()
         .enumerate()
         .filter_map(|(item_idx, (item, _))| {
-            let conflict = match item.next() {
+            let (conflict, span) = match item.next() {
                 Some(Term {
                     kind: TermKind::NonTerminal(_),
                     ..
@@ -1102,7 +1129,10 @@ fn conflicts(
                     ..
                 }) => {
                     let next_state = StateId(next_state.actions[&terminal.definition(language)].0);
-                    ConflictedAction::Shift(terminal, next_state)
+                    (
+                        ConflictedAction::Shift(terminal.definition(language), next_state),
+                        Some(terminal.span()),
+                    )
                 }
                 None => {
                     let remaining_negative_lookahead: Vec<_> = item
@@ -1117,10 +1147,13 @@ fn conflicts(
                         })
                         .into_iter()
                         .collect();
-                    ConflictedAction::Reduce(
-                        item.non_terminal.clone(),
-                        item.alternative.clone(),
-                        remaining_negative_lookahead,
+                    (
+                        ConflictedAction::Reduce(
+                            item.non_terminal.clone(),
+                            item.alternative.clone(),
+                            remaining_negative_lookahead,
+                        ),
+                        None,
                     )
                 }
             };
@@ -1135,6 +1168,7 @@ fn conflicts(
             Some((
                 conflict,
                 vec![Ambiguity {
+                    span,
                     location,
                     transition: None,
                     history: History(vec![location]),
@@ -1156,12 +1190,12 @@ fn conflicts(
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
-    Shift(TerminalUse, StateId),
+    Shift(TerminalDef, StateId),
     Reduce(NonTerminalDef, Alternative, Vec<Arc<TermString>>),
 }
 
 impl ConflictedAction {
-    fn with_lookahead(&self, language: &Language, terminal: TerminalUse) -> ConflictedAction {
+    fn with_lookahead(&self, language: &Language, terminal: TerminalDef) -> ConflictedAction {
         match self {
             ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
                 let new_negative_lookahead = remaining_negative_lookahead
@@ -1170,7 +1204,7 @@ impl ConflictedAction {
                     .filter(|(t, _)| {
                         // Cannot be None because the action should have already
                         // been removed in that case
-                        t.as_ref().unwrap() == &terminal
+                        t.as_ref().unwrap().definition(language) == terminal
                     })
                     .map(|(_, term_string)| term_string)
                     .collect();
@@ -1192,13 +1226,6 @@ impl ConflictedAction {
                     .iter()
                     .any(|term_string| term_string.clone().next(language).any(|(t, _)| t.is_none()))
             }
-        }
-    }
-
-    fn span(&self) -> Span {
-        match self {
-            ConflictedAction::Shift(terminal, _) => terminal.span(),
-            ConflictedAction::Reduce(_, alternative, _) => alternative.span,
         }
     }
 }
@@ -1234,6 +1261,7 @@ impl From<ConflictedAction> for Action {
 
 #[derive(Debug, Clone)]
 struct Ambiguity {
+    span: Option<Span>,
     location: ItemIndex,
     transition: Option<TermDef>,
     history: History,
@@ -1486,7 +1514,7 @@ fn can_be_empty(language: &Language, term: &TermKind) -> bool {
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.
-fn validate_nfa(nfa: &NFA, terminals: &[TerminalUse]) {
+fn validate_nfa(nfa: &NFA, spans: &[Span]) {
     let mut start = BTreeSet::new();
     start.insert(nfa.start_anchored());
     let mut to_visit = vec![(start, None::<(PatternID, Vec<u8>)>, Vec::new())];
@@ -1496,9 +1524,13 @@ fn validate_nfa(nfa: &NFA, terminals: &[TerminalUse]) {
             let mut to_add = Vec::new();
             for &id in &states {
                 match nfa.state(id) {
-                    // This is overzealous and will flag word boundaries etc as
-                    // clashing when they actually aren't.
-                    &NfaState::Look { look: _, next } => to_add.push(next),
+                    &NfaState::Look { look, next } => {
+                        // This is overzealous and will flag word boundaries etc as
+                        // clashing when they actually aren't.
+                        if look != Look::End {
+                            to_add.push(next);
+                        }
+                    }
                     NfaState::Union { alternates } => to_add.extend(alternates.iter().copied()),
                     &NfaState::BinaryUnion { alt1, alt2 } => {
                         to_add.push(alt1);
@@ -1537,8 +1569,8 @@ fn validate_nfa(nfa: &NFA, terminals: &[TerminalUse]) {
                                 String::from_utf8_lossy(&string)
                             ),
                             vec![
-                                (terminals[other_colour.as_usize()].span(), None),
-                                (terminals[this_colour.as_usize()].span(), None),
+                                (spans[other_colour.as_usize()], None),
+                                (spans[this_colour.as_usize()], None),
                             ],
                         );
                     }
@@ -1555,14 +1587,14 @@ fn validate_nfa(nfa: &NFA, terminals: &[TerminalUse]) {
                     "Tokens conflict as one matches the prefix of the other",
                     vec![
                         (
-                            terminals[intrinsic_colour.as_usize()].span(),
+                            spans[intrinsic_colour.as_usize()],
                             Some(format!(
                                 "matches the string {:?}",
                                 String::from_utf8_lossy(&string)
                             )),
                         ),
                         (
-                            terminals[new_colour.as_usize()].span(),
+                            spans[new_colour.as_usize()],
                             Some(format!(
                                 "matches the prefix {:?}",
                                 String::from_utf8_lossy(prefix)

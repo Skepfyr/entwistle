@@ -8,6 +8,7 @@ use entwistle::{
     diagnostics::diagnostics,
     language::{Expression, Item, Language, Mark, Quantifier, Rule},
     lower::{production, NonTerminalUse, TermKind},
+    parse_table::parse_table,
     test::run_test,
 };
 use tracing_subscriber::prelude::*;
@@ -96,6 +97,8 @@ fn main() -> Result<()> {
     println!("--------------");
 
     for test in &language.tests {
+        let parse_table = parse_table(&language, test.goal.clone());
+        println!("Parse table: {}", parse_table);
         if let Some(trees) = run_test(&language, test) {
             println!("Test failed:");
             for tree in trees {

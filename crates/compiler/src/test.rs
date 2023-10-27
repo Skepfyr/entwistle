@@ -41,14 +41,14 @@ pub fn run_test(language: &Language, test: &Test) -> Option<Vec<ParseTree>> {
                         if i != 0 {
                             write!(message, ", ").unwrap();
                         }
-                        write!(message, "{terminal}").unwrap();
+                        write!(message, "{}", terminal.name()).unwrap();
                     }
                     emit(
                         "Unable to find a match for any expected token",
                         vec![(
                             crate::Span {
-                                start: offset,
-                                end: offset,
+                                start: test.test_span.start + offset,
+                                end: test.test_span.start + offset,
                             },
                             Some(message),
                         )],
@@ -69,7 +69,7 @@ pub fn run_test(language: &Language, test: &Test) -> Option<Vec<ParseTree>> {
                     pike_vm.find(&mut pike_vm.create_cache(), input.clone().range(offset..))
                 else {
                     emit(
-                        format!("Expected token: {}", terminal.definition(language).name()),
+                        format!("Expected token: {}", terminal.name()),
                         vec![(
                             crate::Span {
                                 start: test.test_span.start + offset,

@@ -1,31 +1,49 @@
 Book: String+
 String: Hashes '"' Char* '"' Hashes
-@Char: /[^"#]/ | '#' | '"' (!>> Hashes)
-@Hashes: '#' '#'
+Char: /[^"#]/ | '#' | '"' (!>> Hashes)
+Hashes: '#' '#'
 
 == Book
 ##"""####""#"####"##""##
 ==
 Book:
   String:
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
     '"'
-    Char: '"'
+    Char:
+      '"'
     '"'
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
   String:
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
     '"'
-    Char: '"'
-    Char: '#'
+    Char:
+      '"'
+    Char:
+      '#'
     '"'
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
   String:
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
     '"'
-    Char: '#'
-    Char: '#'
-    Char: '"'
+    Char:
+      '#'
+    Char:
+      '#'
+    Char:
+      '"'
     '"'
-    Hashes: '##'
+    Hashes:
+      '#'
+      '#'
 ==
