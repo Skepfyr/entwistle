@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeSet, HashSet},
-    error::Error,
     path::Path,
 };
 
+use color_eyre::Result;
 use entwistle::{
     diagnostics::diagnostics,
     language::{Expression, Item, Language, Mark, Quantifier, Rule},
@@ -12,10 +12,12 @@ use entwistle::{
 };
 use tracing_subscriber::prelude::*;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().pretty())
         .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_error::ErrorLayer::default())
         .init();
     let file = std::env::args().nth(1).unwrap();
     let file = Path::new(&file);

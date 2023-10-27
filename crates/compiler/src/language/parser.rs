@@ -1,11 +1,10 @@
-use std::ops::Range;
+use std::{fmt::Write as _, ops::Range};
 
 use chumsky::{
     prelude::*,
     text::{newline, Character},
     Stream,
 };
-use tracing::error;
 
 use crate::{diagnostics::emit, util::Interner, Span};
 
@@ -34,7 +33,20 @@ pub(super) fn parse_grammar(input: &str) -> Language {
         Ok(grammar) => grammar,
         Err(errors) => {
             for error in errors {
-                error!(?error, "Failed to parse");
+                let mut reason = "Expected one of: ".to_string();
+                for (i, expected) in error.expected().enumerate() {
+                    if i != 0 {
+                        reason.push_str(", ");
+                    }
+                    match expected {
+                        Some(expected) => write!(reason, "{:?}", expected).unwrap(),
+                        None => reason.push_str("EOI"),
+                    }
+                }
+                emit(
+                    "Failed to parse",
+                    vec![(error.span(), Some(reason))],
+                );
             }
             Language::default()
         }
@@ -364,7 +376,7 @@ fn ident() -> impl Parser<char, Ident, Error = ParseError> {
 fn quoted_string() -> impl Parser<char, String, Error = ParseError> {
     let string = |delimiter| {
         just(delimiter)
-            .ignore_then(none_of(delimiter).repeated().collect())
+            .ignore_then(none_of([delimiter, '\n']).repeated().collect())
             .then_ignore(just(delimiter))
     };
     string('"').or(string('\''))

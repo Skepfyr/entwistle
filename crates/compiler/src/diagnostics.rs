@@ -60,6 +60,7 @@ impl<'a> ariadne::Cache<()> for NamedSource<'a> {
 }
 
 pub fn emit(message: impl Into<String>, labels: Vec<(Span, Option<String>)>) {
+    assert!(!labels.is_empty());
     DIAGNOSTICS.lock().insert(Diagnostic {
         message: message.into(),
         labels,

@@ -8,6 +8,8 @@ use std::{
 };
 
 use indenter::indented;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use regex_automata::{
     nfa::thompson::{
         Builder as NfaBuilder, DenseTransitions, SparseTransitions, State as NfaState, Transition,
@@ -15,7 +17,7 @@ use regex_automata::{
     },
     PatternID,
 };
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, instrument, trace};
 
 use crate::{
     diagnostics::emit,
@@ -1453,7 +1455,12 @@ fn proper_left_corners(language: &Language, non_terminal: &NonTerminalUse) -> Ha
     left_corners
 }
 
+#[instrument(skip_all, fields(%term))]
 fn can_be_empty(language: &Language, term: &TermKind) -> bool {
+    static CAN_BE_EMPTY: Lazy<Mutex<HashMap<TermKind, bool>>> = Lazy::new(Default::default);
+    if let Some(can_be_empty) = CAN_BE_EMPTY.lock().get(term) {
+        return *can_be_empty;
+    }
     fn inner(language: &Language, term: &TermKind, visited: &mut HashSet<TermKind>) -> bool {
         let TermKind::NonTerminal(nt) = term else {
             return false;
@@ -1473,7 +1480,9 @@ fn can_be_empty(language: &Language, term: &TermKind) -> bool {
                 })
             })
     }
-    inner(language, term, &mut HashSet::new())
+    let result = inner(language, term, &mut HashSet::new());
+    CAN_BE_EMPTY.lock().insert(term.clone(), result);
+    result
 }
 
 /// Check if any of the regexes are prefixes of any of the other regexes.

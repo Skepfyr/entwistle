@@ -52,7 +52,7 @@
 @try: /try\b/
 
 @union: /union\b/
-@StaticLifetime: /'static\b/
+@StaticLifetime: "'" static
 
 @StrictKeyword:
   as
@@ -113,24 +113,36 @@
   union
   StaticLifetime
 
+@Keyword: StrictKeyword | ReservedKeyword | WeakKeyword
 @IdentifierOrKeyword: /[a-zA-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+\b/
-
 @RawIdentifierName: (!>> crate | self | super | Self) IdentifierOrKeyword
-
 @RawIdentifier: "r#" RawIdentifierName
-
 @NonKeywordIdentifier: (!>> StrictKeyword | ReservedKeyword) IdentifierOrKeyword
-
 @Identifier:
   NonKeywordIdentifier
   RawIdentifier
 
-# TODO: think about comments
 -_:
-  Whitespace+
-  Whitespace* Comment Whitespace*
+  Whitespace
+  Whitespace? Comment Whitespace?
 
-@Whitespace: /\s/
+Comment:
+  LineComment
+  BlockComment
+LineComment: '//' /([^\/!\n]|\/\/)[^\n]*/? '\n'
+BlockComment:
+  '/*' (/[^*!]/ | '**' | BlockCommentOrDoc) (BlockCommentOrDoc | (/[^*]/ | '*' (!>> '/')))* '*' '/'
+  '/*' '*' '/'
+  '/*' '*' '*' '/'
+
+InnerLineDoc: '//' '!' /[^\r\n]*/ Newline
+InnerBlockDoc: '/*' '!' (BlockCommentOrDoc | (/[^*\r]/ | '*' (!>> '/') | '\r' '\n'))* '*/'
+OuterLineDoc: '//' '/' /[^\/\r\n][^\r\n]*/? Newline
+OuterBlockDoc: '/*' '*' (/[^*]/ | BlockCommentOrDoc) (BlockCommentOrDoc | (/[^*\r]/ | '*' (!>> '/') | '\r' '\n'))* '*/'
+
+BlockCommentOrDoc: BlockComment | InnerBlockDoc | OuterBlockDoc
+
+@Whitespace: /\s+/
 
 @EscapedNewline: "\\n"
 @EscapedCarriageReturn: "\\r"
@@ -185,8 +197,12 @@ Character: "'" NonSingleQuoteStringChar "'"
 -@NonDoubleQuoteStringChar: (!>> '"') (StringChar | StringContinue)
 String: '"' NonDoubleQuoteStringChar* '"'
 
-@RawStringContents<Hashes>: (!>> Hashes) /\P{C}/
-RawString: /r#{N}"/ RawStringContents</#{N}/> /"#{N}/
+-@RawStringChar: /[\P{C}[^"#]]/
+RawStringContents<Hashes>: (RawStringChar | '#' | '"' (!>> Hashes))*
+RawString:
+  'r' '"' RawStringContents<> '"'
+  'r' '"' RawStringContents<'#'> '"'
+  'r' '#' '#' '"' RawStringContents<'#' '#'> '"' '#' '#'
 
 
 -@NonSingleQuoteByteChar: (!>> "'") ByteChar
@@ -195,33 +211,92 @@ Byte: "b'" NonSingleQuoteByteChar "'"
 -@NonDoubleQuoteByteChar: (!>>'"') ByteChar
 ByteString: 'b"'# NonDoubleQuoteByteChar* '"'
 
-@RawByteStringContents<Hashes>: (!>> Hashes) /[ -~]/
-RawByteString: /br#{N}"/ RawStringContents</#{N}/> /"#{N}/
+-@RawByteStringChar: /[[:ascii:][^"#]]/
+RawByteStringContents<Hashes>: (RawByteStringChar | '#' | '"' (!>> Hashes))*
+RawByteString:
+  'br' '"' RawStringContents<> '"'
+  'br' '#' '"' RawStringContents<'#'> '"' '#'
+  'br' '#' '#' '"' RawStringContents<'#' '#'> '"' '#' '#'
 
 @Integer:
   /[0-9_]+/
   /0x[0-9a-fA-F_]+/
   /0o[0-7_]+/
   /0b[01_]+/
-
 @Float: /[0-9_]+(.[0-9_]+)?((e|E)(\+|-)[0-9_]+)?/
-
 @Number: Integer | Float
 
 TupleIndex: Integer
 
 @Bool: "true" | "false"
 
-@LifetimeToken: "'_" | "'" IdentifierOrKeyword
-@Lifetime: "'" NonKeywordIdentifier
-@Label: "'" NonKeywordIdentifier
+@LifetimeToken: "'" IdentifierOrKeyword
+@LifetimeOrLabel: "'" NonKeywordIdentifier
 
-# TODO: Macros?
+# These have been carefully ordered so that prefixes come second.
+@PunctuationNoDollarOrDelimitersOrMacroRepOp:
+  '+=' | '-=' | '*=' | '/=' | '%=' | '^=' | '&=' | '|=' | '<<=' | '>>='
+  '&&' | '||' | '<<' | '>>'
+  '==' | '!=' | '<=' | '<' | '>=' | '>'
+  '@' | '_' | '.' | '..' | '...' | ',' | ';' | ':' | '::' | '->' | '=>'
+  '#' | '~' | '=' | '+' | '-' | '/' | '%' | '^' | '!' | '&' | '|'
+@PunctuationNoDelimitersOrMacroRepOp: PunctuationNoDollarOrDelimitersOrMacroRepOp | '$'
+@PunctuationNoDollarOrDelimiters: PunctuationNoDelimitersOrMacroRepOp | '$' | '*' | '+' | '?'
+@PunctuationNoDelimiters: PunctuationNoDollarOrDelimiters | '$'
+
+TokenNoPunctuation:
+  Keyword
+  Identifier
+  LiteralExpression
+  LifetimeToken
+
+TokenNoDelimitersOrMacroRepOp: TokenNoPunctuation | PunctuationNoDelimitersOrMacroRepOp
+TokenNoDelimiters: TokenNoPunctuation | PunctuationNoDelimiters
+TokenNoDollarOrDelimiters: TokenNoPunctuation | PunctuationNoDollarOrDelimiters
+
+MacroInvocation: SimplePath _ '!' _ DelimTokenTree
+DelimTokenTree:
+  '(' _ (TokenTree _)* ')'
+  '[' _ (TokenTree _)* ']'
+  '{' _ (TokenTree _)* '}'
+TokenTree: TokenNoDelimiters | DelimTokenTree
+MacroInvocationSemi:
+  SimplePath _ '!' _ '(' _ (TokenTree _)* ')' _ ';'
+  SimplePath _ '!' _ '[' _ (TokenTree _)* ']' _ ';'
+  SimplePath _ '!' _ '{' _ (TokenTree _)* '}'
+
+MacroRulesDefinition: /macro_rules\b/ _ '!' _ Identifier _ MacroRulesDef
+MacroRulesDef:
+  '(' _ (MacroRule _)* ')' _ ';'
+  '[' _ (MacroRule _)* ']' _ ';'
+  '{' _ (MacroRule _)* '}'
+MacroRules: MacroRule (_ ';' _ MacroRule)* (_ ';')?
+MacroRule: MacroMatcher _ '=>' _ MacroTranscriber
+MacroMatcher:
+  '(' _ (MacroMatch _)* ')'
+  '[' _ (MacroMatch _)* ']'
+  '{' _ (MacroMatch _)* '}'
+MacroMatch:
+  TokenNoDollarOrDelimiters
+  MacroMatcher
+  '$' _ (IdentifierOrKeywordNoCrate | RawIdentifier | '_') _ ':' _ MacroFragSpec
+  '$' _ '(' _ (MacroMatch _)+ ')' _ (MacroRepSep _)? MacroRepOp
+@IdentifierOrKeywordNoCrate: (!>> crate) IdentifierOrKeyword
+MacroFragSpec:
+  'block' | 'expr' | 'ident' | 'item' | 'lifetime' | 'literal' | 'meta'
+  'pat' | 'pat_param' | 'path' | 'stmt' | 'tt' | 'ty' | 'vis'
+MacroRepSep: TokenNoDelimitersOrMacroRepOp
+@MacroRepOp: '*' | '+' | '?'
+MacroTranscriber: DelimTokenTree
 
 Crate: Utf8Bom? (Shebang Newline)? _ (InnerAttribute _)* (Item _)*
 
+== Crate
+==
+==
+
 @Utf8Bom: "\uFEFF"
-@Shebang: "#!" Whitespace* BlockComment? Whitespace* (/[^\[\n\r]/ /[^\n\r]/+)?
+Shebang: "#!" Whitespace* BlockComment? Whitespace* (/[^\[\n\r]/ /[^\n\r]/+)?
 
 -CommaSeparated<Item>: Item (_ "," _ Item)? (_ ",")?
 
@@ -299,14 +374,14 @@ StructStruct: struct _ Identifier _ GenericParams? WhereClause? ("{" _ (StructFi
 TupleStruct: struct _ Identifier _ GenericParams? "(" _ TupleFields? ")" WhereClause? ";"
 
 StructFields: CommaSeparated<StructField>
-StructField: OuterAttribute* Visibility? Identifier ":" _ Type
+StructField: (OuterAttribute _)* Visibility? Identifier ":" _ Type
 
 TupleFields: CommaSeparated<TupleField>
-TupleField: OuterAttribute* Visibility? Type
+TupleField: (OuterAttribute _)* Visibility? Type
 
-Enumeration: enum _ Identifier _ GenericParams? _ WhereClause? _ "{" _ EnumItems? _ "}"
+Enumeration: enum _ Identifier _ (GenericParams _)? (WhereClause _)? "{" _ EnumItems? _ "}"
 EnumItems: CommaSeparated<EnumItem>
-EnumItem: OuterAttribute* _ Visibility? _ Identifier _ (EnumItemTuple | EnumItemStruct | EnumItemDiscriminant)?
+EnumItem: (OuterAttribute _)* Visibility? _ Identifier _ (EnumItemTuple | EnumItemStruct | EnumItemDiscriminant)?
 EnumItemTuple: "(" _ TupleFields? _ ")"
 EnumItemStruct: "{" _ StructFields? _ "}"
 EnumItemDiscriminant: "=" Expression
@@ -322,11 +397,11 @@ InherentImpl: impl _ GenericParams? Type _ WhereClause? "{" InnerAttribute* Asso
 TraitImpl: (unsafe _)? impl _ GenericParams? "!"? _ TypePath _ for _ Type _ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
 
 ExternBlock: (unsafe _)? extern _ Abi? _ "{" InnerAttribute* ExternalItem* "}"
-ExternalItem: OuterAttribute* (MacroInvocationSemi | ((Visibility _)? (StaticItem | Function)))
+ExternalItem: (OuterAttribute _)* (MacroInvocationSemi | ((Visibility _)? (StaticItem | Function)))
 
 GenericParams: "<" CommaSeparated<GenericParam>? ">"
-GenericParam: OuterAttribute* (LifetimeParam | TypeParam | ConstParam)
-LifetimeParam: Lifetime (_ ":" _ LifetimeBounds)?
+GenericParam: (OuterAttribute _)* (LifetimeParam | TypeParam | ConstParam)
+LifetimeParam: LifetimeOrLabel (_ ":" _ LifetimeBounds)?
 TypeParam: Identifier (_ ":" _ TypeParamBounds?)? (_ "=" _ Type)?
 ConstParam: const _ Identifier _ ":" _ Type
 
@@ -334,13 +409,12 @@ WhereClause: where _ CommaSeparated<WhereClauseItem>
 WhereClauseItem: LifetimeWhereClauseItem | TypeBoundWhereClauseItem
 LifetimeWhereClauseItem: Lifetime _ ":" _ LifetimeBounds
 TypeBoundWhereClauseItem: (ForLifetimes _)? Type _ ":" (_ TypeParamBounds)?
-ForLifetimes: for _ GenericParams
 
-AssociatedItem: OuterAttribute* (MacroInvocationSemi | ((Visibility _)? (TypeAlias | ConstantItem | Function)))
+AssociatedItem: (OuterAttribute _)* (MacroInvocationSemi | ((Visibility _)? (TypeAlias | ConstantItem | Function)))
 
 
-InnerAttribute: "#![" _ Attr _ "]"
-OuterAttribute: "#[" _ Attr _ "]"
+InnerAttribute: "#![" _ Attr _ "]" | InnerLineDoc | InnerBlockDoc
+OuterAttribute: "#[" _ Attr _ "]" | OuterLineDoc | OuterBlockDoc
 Attr: SimplePath (_ AttrInput)?
 AttrInput: DelimTokenTree | "=" _ LiteralExpression
 
@@ -365,14 +439,13 @@ Statement:
   LetStatement
   ExpressionStatement
   MacroInvocationSemi
-LetStatement: OuterAttribute* let _ Pattern _ (":" _ Type _)? ("=" _ Expression)? ";"
+LetStatement: (OuterAttribute _)* let _ Pattern _ (":" _ Type _)? ("=" _ Expression)? ";"
 ExpressionStatement:
   ExpressionWithoutBlock ";"
   ExpressionWithBlock ";"?
 
-Expression: OuterAttribute* (ExpressionWithoutBlock | ExpressionWithBlock)
+Expression: (OuterAttribute _)* (ExpressionWithoutBlock | ExpressionWithBlock)
 ExpressionWithoutBlock:
-  (ReturnExpression | BreakExpression | ContinueExpression | ClosureExpression)
 
   ~ExpressionWithoutBlock _ ("=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=") _ ExpressionWithoutBlock
 
@@ -411,6 +484,8 @@ ExpressionWithoutBlock:
   GroupedExpression
   LiteralExpression
   MacroInvocation
+  (ReturnExpression | BreakExpression | ContinueExpression | ClosureExpression)
+
 
 ExpressionWithBlock:
   BlockExpression
@@ -421,7 +496,7 @@ ExpressionWithBlock:
   IfLetExpression
   MatchExpression
 
-LiteralExpression: Char | String | RawString | Byte | ByteString | Number | Bool
+LiteralExpression: Character | String | RawString | Byte | ByteString | Number | Bool
 PathExpression: PathInExpression | QualifiedPathInExpression
 BlockExpression: "{" _ (InnerAttribute _)* Statements _ "}"
 Statements:
@@ -472,15 +547,15 @@ ClosureParameters: CommaSeparated<ClosureParam>
 ClosureParam: (OuterAttribute _)* Pattern (_ ":" _ Type)?
 
 LoopExpression: (LoopLabel _)? (InfiniteLoopExpression | PredicateLoopExpression | PredicatePatternLoopExpression | IteratorLoopExpression)
-LoopLabel: Label _ ":"
+LoopLabel: LifetimeOrLabel _ ":"
 InfiniteLoopExpression: loop _ BlockExpression
 PredicateLoopExpression: while _ Expression _ BlockExpression
 # TODO: This expression shouldn't be able to be a struct or lazy boolean
 PredicatePatternLoopExpression: while _ let _ MatchArmPatterns "=" Expression _ BlockExpression
 IteratorLoopExpression: for _ Pattern _ in _ Expression _ BlockExpression
 
-BreakExpression: break (_ Label)? (_ Expression)?
-ContinueExpression: continue (_ Label)?
+BreakExpression: break (_ LifetimeOrLabel)? (_ Expression)?
+ContinueExpression: continue (_ LifetimeOrLabel)?
 
 IfExpression: if _ Expression _ BlockExpression (_ else _ (BlockExpression | IfExpression | IfLetExpression))?
 # TODO: This expression shouldn't be able to be a struct or lazy boolean
@@ -493,3 +568,113 @@ MatchArmPatterns: ("|" _)? Pattern (_ "|" _ Pattern)*
 MatchArmGuard: if _ Expression
 
 ReturnExpression: return (_ Expression)?
+
+Pattern: '|'? PatternNoTopAlt ('|' PatternNoTopAlt)*
+PatternNoTopAlt: PatternWithoutRange | RangePattern
+PatternWithoutRange:
+  LiteralPattern
+  (ref _)? (mut _)? Identifier (_ '@' _ PatternNoTopAlt)?
+  '_'
+  '..'
+  ('&' | '&&') _ (mut _)? PatternWithoutRange
+  StructPattern
+  TupleStructPattern
+  TuplePattern
+  '(' Pattern ')'
+  '[' _ (CommaSeparated<Pattern> _)? ']'
+  PathExpression
+  MacroInvocation
+
+LiteralPattern:
+  true | false
+  Character
+  Byte
+  String
+  RawString
+  ByteString
+  RawByteString
+  ('-' _)? Integer
+  ('-' _)? Float
+RangePattern:
+  RangePatternBound _ '..=' _ RangePatternBound
+  RangePatternBound _ '..'
+  '..=' _ RangePatternBound
+  RangePatternBound '...' RangePatternBound
+RangePatternBound: Character | Byte | ('-' _)? Integer | ('-' _)? Float | PathExpression
+StructPattern: PathInExpression _ '{' _ (StructPatternElements _)? '}'
+StructPatternElements:
+  StructPatternFields (_ ',')?
+  (StructPatternFields _ ',' _)? (OuterAttribute _)* '..'
+# Can't use CommaSeparated here as we've been finicky with the trailing comma above.
+StructPatternFields: StructPatternField (_ ',' _ StructPatternField)*
+StructPatternField: (OuterAttribute _)* (TupleIndex _ ':' _ Pattern | Identifier _ ':' _ Pattern | (ref _)? (mut _)? Identifier)
+TupleStructPattern: PathInExpression '(' _ (CommaSeparated<Pattern> _)? ')'
+TuplePattern: '..' | Pattern _ ',' (_ CommaSeparated<Pattern>)?
+
+Type:
+  TypeNoBounds
+  impl _ TypeParamBounds
+  (dyn _)? TypeParamBounds
+TypeNoBounds:
+  '(' _ Type _ ')'
+  impl _ TraitBound
+  (dyn _)? TraitBound
+  TypePath
+  TupleType
+  NeverType
+  RawPointerType
+  ReferenceType
+  ArrayType
+  SliceType
+  InferredType
+  QualifiedPathInType
+  BareFunctionType
+  MacroInvocation
+TupleType: '(' ')' | '(' _ Type _ ',' _ (CommaSeparated<Type> _)? ')'
+NeverType: '!'
+RawPointerType: '*' _ (mut | const) _ TypeNoBounds
+ReferenceType: '&' _ (Lifetime _)? (mut _)? TypeNoBounds
+ArrayType: '[' _ Type _ ';' _ Expression _ ']'
+SliceType: '[' _ Type _ ']'
+InferredType: '_'
+BareFunctionType: (ForLifetimes _)? FunctionTypeQualifiers _ fn _ '(' _ (FunctionParametersMaybeNamedVariadic _)? ')' (_ BareFunctionReturnType)?
+FunctionTypeQualifiers: unsafe? (_ extern (_ Abi)?)?
+BareFunctionReturnType: "->" _ TypeNoBounds
+FunctionParametersMaybeNamedVariadic:
+  CommaSeparated<MaybeNamedParam>
+  (MaybeNamedParam _ "," _)+ (OuterAttribute _)* "..."
+MaybeNamedParam: (OuterAttribute _)* ((Identifier | '_') _ ':' _)? Type
+
+TypeParamBounds: TypeParamBound (_ '+' _ TypeParamBound)* (_ '+')?
+TypeParamBound: Lifetime | TraitBound
+TraitBound:
+  ('?' _)? (ForLifetimes _)? TypePath
+  '(' ('?' _)? (ForLifetimes _)? TypePath ')'
+LifetimeBounds: (Lifetime _ '+' _)* Lifetime?
+Lifetime: LifetimeOrLabel | StaticLifetime | "'_"
+ForLifetimes: for _ GenericParams
+
+
+SimplePath: ('::' _)? SimplePathSegment (_ '::' _ SimplePathSegment)*
+SimplePathSegment: Identifier | super | self | crate | '$crate'
+
+PathInExpression: ('::' _)? PathExprSegment (_ '::' _ PathExprSegment)*
+PathExprSegment: PathIdentSegment (_ '::' _ GenericArgs)?
+PathIdentSegment: Identifier | super | self | Self | crate | '$crate'
+GenericArgs:
+  '<' '>'
+  '<' _ CommaSeparated<GenericArg> _ '>'
+GenericArg: Lifetime | Type | GenericArgsConst | GenericArgsBinding
+GenericArgsConst: BlockExpression | LiteralExpression | '-' _ LiteralExpression | SimplePathSegment
+GenericArgsBinding: Identifier _ '=' _ Type
+
+QualifiedPathInExpression: QualifiedPathType (_ '::' _ PathExprSegment)+
+QualifiedPathType: '<' _ Type _ (as _ TypePath _)? '>'
+QualifiedPathInType: QualifiedPathType (_ '::' _ TypePathSegment)+
+
+TypePath: ('::' _)? TypePathSegment (_ '::' _ TypePathSegment)*
+TypePathSegment: PathIdentSegment ((_ '::')? _ (GenericArgs | TypePathFn))?
+TypePathFn: '(' _ (CommaSeparated<Type> _)? ')' ('->' Type)?
+
+
+Visibility: pub ( _ '(' _ (crate | self | super | in SimplePath) _ ')')?

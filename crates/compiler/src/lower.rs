@@ -15,6 +15,7 @@ use regex_automata::{
     PatternID,
 };
 use regex_syntax::hir::Hir;
+use tracing::instrument;
 
 use crate::{
     diagnostics::emit,
@@ -22,6 +23,7 @@ use crate::{
     Span,
 };
 
+#[instrument(skip_all, fields(%non_terminal))]
 pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Production {
     match non_terminal {
         NonTerminalUse::Goal { rule } => Production {
@@ -229,6 +231,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
     }
 }
 
+#[instrument(skip_all, fields(%rule, ?current_name, ?generics))]
 fn lower_rule(
     language: &Language,
     rule: &Rule,
@@ -284,6 +287,7 @@ fn lower_rule(
     }
 }
 
+#[instrument(skip_all, fields(%item, %quantifier, %span, ?current_name, ?generics))]
 fn lower_term(
     language: &Language,
     generics: &BTreeMap<Ident, NonTerminalUse>,
@@ -391,7 +395,7 @@ fn lower_term(
         Item::Regex(regex) => Term {
             kind: TermKind::Terminal(TerminalUse::Anonymous {
                 name: Arc::from(&**regex),
-                regex: regex_nfa(regex),
+                regex: regex_nfa(regex, span),
                 span,
             }),
             silent: false,
@@ -424,6 +428,7 @@ fn lower_term(
     }
 }
 
+#[instrument(skip_all, fields(%terminal))]
 pub fn terminal_nfa(language: &Language, terminal: &TerminalUse) -> NFA {
     let nfa = match terminal {
         TerminalUse::Named { ident, span } => {
@@ -443,6 +448,7 @@ pub fn terminal_nfa(language: &Language, terminal: &TerminalUse) -> NFA {
     nfa
 }
 
+#[instrument(skip_all, fields(%ident))]
 fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashSet<Ident>) -> NFA {
     if !visited.insert(ident.clone()) {
         emit(
@@ -455,7 +461,10 @@ fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashS
         emit("Definition not found", vec![(span, None)]);
         return NFA::never_match();
     };
-    assert!(definition.atomic, "Tried to get regex for non-terminal");
+    if !definition.atomic {
+        emit("Non-atomic rule used by atomic rule", vec![(span, None)]);
+        return NFA::never_match();
+    }
     if !definition.generics.is_empty() {
         emit(
             "Generics are not supported on atomic rules",
@@ -474,11 +483,12 @@ fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashS
     nfa
 }
 
+#[instrument(skip_all, fields(%rule))]
 fn rule_nfa(language: &Language, rule: &Rule, visited: &mut HashSet<Ident>) -> NFA {
     alternation(
         rule.alternatives
             .iter()
-            .map(|expression| sequence_nfa(language, &expression.sequence, visited)),
+            .map(|expression| expression_nfa(language, expression, visited)),
     )
 }
 
@@ -497,9 +507,10 @@ fn alternation(alternatives: impl Iterator<Item = NFA>) -> NFA {
     builder.build(start, start).unwrap()
 }
 
-fn sequence_nfa(
+#[instrument(skip_all, fields(%expression))]
+fn expression_nfa(
     language: &Language,
-    sequence: &[(Item, Quantifier, Span)],
+    expression: &Expression,
     visited: &mut HashSet<Ident>,
 ) -> NFA {
     let mut builder = NfaBuilder::new();
@@ -507,7 +518,7 @@ fn sequence_nfa(
     builder.start_pattern().unwrap();
     let mat = builder.add_match().unwrap();
     let mut start = builder.add_capture_end(mat, 0).unwrap();
-    for (item, quantifier, span) in sequence.iter().rev() {
+    for (item, quantifier, span) in expression.sequence.iter().rev() {
         let item = match item {
             Item::Ident {
                 mark,
@@ -531,7 +542,7 @@ fn sequence_nfa(
             Item::String(string) => NFA::compiler()
                 .build_from_hir(&Hir::literal(string.as_bytes()))
                 .unwrap(),
-            Item::Regex(regex) => regex_nfa(regex),
+            Item::Regex(regex) => regex_nfa(regex, *span),
             Item::Group(rule) => rule_nfa(language, rule, visited),
             Item::Lookaround(lookaround_type, rule) => {
                 if !lookaround_type.ahead || lookaround_type.positive {
@@ -1092,13 +1103,23 @@ fn transition(
     locs.into_values()
 }
 
-fn regex_nfa(regex: &str) -> NFA {
+#[instrument(skip_all, fields(%regex))]
+fn regex_nfa(regex: &str, span: Span) -> NFA {
     NFA::compiler()
         .configure(NFA::config().which_captures(WhichCaptures::Implicit))
-        .syntax(syntax::Config::default().unicode(false))
+        .syntax(syntax::Config::default().unicode(true))
         .build(regex)
         .unwrap_or_else(|err| {
-            emit(format!("Invalid regex: {}", err), vec![]);
+            let mut reason = err.to_string();
+            let mut err = &err as &dyn std::error::Error;
+            loop {
+                err = match err.source() {
+                    Some(err) => err,
+                    None => break,
+                };
+                write!(reason, ": {}", err).unwrap();
+            }
+            emit(reason, vec![(span, None)]);
             NFA::never_match()
         })
 }
