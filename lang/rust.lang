@@ -135,7 +135,7 @@ BlockComment:
   '/*' '*' '/'
   '/*' '*' '*' '/'
 
-InnerLineDoc: '//' '!' /[^\r\n]*/ Newline
+InnerLineDoc: '//' '!' /[^\r\n]+/? Newline
 InnerBlockDoc: '/*' '!' (BlockCommentOrDoc | (/[^*\r]/ | '*' (!>> '/') | '\r' '\n'))* '*/'
 OuterLineDoc: '//' '/' /[^\/\r\n][^\r\n]*/? Newline
 OuterBlockDoc: '/*' '*' (/[^*]/ | BlockCommentOrDoc) (BlockCommentOrDoc | (/[^*\r]/ | '*' (!>> '/') | '\r' '\n'))* '*/'

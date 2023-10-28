@@ -15,48 +15,56 @@ use regex_automata::{
     PatternID,
 };
 use regex_syntax::hir::Hir;
+use salsa::DebugWithDb;
 use tracing::instrument;
 
 use crate::{
     diagnostics::emit,
     language::{Expression, Ident, Item, Language, Mark, Quantifier, Rule},
-    Span,
+    util::DisplayWithDb,
+    Db, Span,
 };
 
-#[instrument(skip_all, fields(%non_terminal))]
-pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Production {
-    match non_terminal {
-        NonTerminalUse::Goal { rule } => Production {
-            alternatives: vec![Alternative {
-                span: non_terminal.span(),
-                terms: vec![
+#[instrument(skip_all, fields(non_terminal = %non_terminal.display(db)))]
+#[salsa::tracked]
+pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminalUse) -> Production {
+    match non_terminal.inner(db) {
+        NonTerminalUseInner::Goal { rule } => Production::new(
+            db,
+            vec![Alternative::new(
+                db,
+                non_terminal.span(db),
+                vec![
                     Term {
-                        kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
-                            rule: rule.clone(),
-                            context: None,
-                            generics: BTreeMap::new(),
-                        }),
+                        kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                            db,
+                            rule.clone(),
+                            None,
+                            BTreeMap::new(),
+                        )),
                         silent: true,
                     },
                     Term {
                         kind: TermKind::Terminal(TerminalUse::EndOfInput {
                             span: Span {
-                                start: non_terminal.span().end,
-                                end: non_terminal.span().end,
+                                start: non_terminal.span(db).end,
+                                end: non_terminal.span(db).end,
                             },
                         }),
                         silent: true,
                     },
                 ],
-                negative_lookahead: None,
-            }],
-        },
-        NonTerminalUse::Named {
+                None,
+            )],
+        ),
+        NonTerminalUseInner::Named {
             name,
             generics: generic_parameters,
             span,
         } => {
-            let definition = &language.definitions[&name.ident];
+            let Some(definition) = language.definition(db, name.ident, *span) else {
+                return Production::new(db, Vec::new());
+            };
             assert!(!definition.atomic, "Tried to make production for terminal");
             if definition.generics.len() != generic_parameters.len() {
                 emit(
@@ -67,9 +75,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                     ),
                     vec![(*span, None)],
                 );
-                return Production {
-                    alternatives: vec![],
-                };
+                return Production::new(db, Vec::new());
             }
             let generics = std::iter::Iterator::zip(
                 definition.generics.iter().cloned(),
@@ -80,13 +86,12 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                 if name.index > 0 {
                     // ICE
                     panic!(
-                        "Unexpected index {} for empty definition for {}",
-                        name.index, name.ident
+                        "Unexpected index {} for empty definition for {:?}",
+                        name.index,
+                        name.ident.debug(db)
                     );
                 }
-                return Production {
-                    alternatives: vec![],
-                };
+                return Production::new(db, Vec::new());
             }
             fn contains_this_sub(this: &Ident, rule: &Rule) -> (bool, bool) {
                 let mut contains_this = false;
@@ -143,36 +148,47 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
             }
             if index > 0 {
                 // ICE
-                panic!("Index {} out of bounds for {}", name.index, name.ident);
+                panic!(
+                    "Index {} out of bounds for {:?}",
+                    name.index,
+                    name.ident.debug(db)
+                );
             }
             let mut alternatives: Vec<_> = definition.rules[first..last]
                 .iter()
-                .flat_map(|rule| lower_rule(language, rule, Some(name), &generics).alternatives)
+                .flat_map(|rule| {
+                    lower_rule(db, language, rule, Some(name), &generics)
+                        .alternatives(db)
+                        .iter()
+                        .cloned()
+                })
                 .collect();
             if last != definition.rules.len() {
                 let span = Span {
                     start: definition.rules[first].span.start,
                     end: definition.rules[last - 1].span.end,
                 };
-                alternatives.push(Alternative {
+                alternatives.push(Alternative::new(
+                    db,
                     span,
-                    terms: vec![Term {
-                        kind: TermKind::NonTerminal(NonTerminalUse::Named {
-                            name: Name {
-                                ident: name.ident.clone(),
+                    vec![Term {
+                        kind: TermKind::NonTerminal(NonTerminalUse::new_named(
+                            db,
+                            Name {
+                                ident: name.ident,
                                 index: name.index + 1,
                             },
-                            generics: generic_parameters.clone(),
+                            generic_parameters.clone(),
                             span,
-                        }),
+                        )),
                         silent: true,
                     }],
-                    negative_lookahead: None,
-                });
+                    None,
+                ));
             }
-            Production { alternatives }
+            Production::new(db, alternatives)
         }
-        NonTerminalUse::Anonymous {
+        NonTerminalUseInner::Anonymous {
             rule,
             context,
             generics,
@@ -183,6 +199,7 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                 let &(ref item, ref quantifier, span) =
                     &rule.alternatives.iter().next().unwrap().sequence[0];
                 let term = lower_term(
+                    db,
                     language,
                     generics,
                     item,
@@ -193,54 +210,48 @@ pub fn production(language: &Language, non_terminal: &NonTerminalUse) -> Product
                 let mut alternatives: Vec<Alternative> = Vec::new();
                 // Zero times
                 if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
-                    alternatives.push(Alternative {
-                        span,
-                        terms: vec![],
-                        negative_lookahead: None,
-                    });
+                    alternatives.push(Alternative::new(db, span, vec![], None));
                 }
                 // One time
                 if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce | Quantifier::Once =
                     quantifier
                 {
-                    alternatives.push(Alternative {
-                        span,
-                        terms: vec![term.clone()],
-                        negative_lookahead: None,
-                    });
+                    alternatives.push(Alternative::new(db, span, vec![term.clone()], None));
                 }
                 // Many times
                 if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-                    alternatives.push(Alternative {
+                    alternatives.push(Alternative::new(
+                        db,
                         span,
-                        terms: vec![
+                        vec![
                             Term {
-                                kind: TermKind::NonTerminal(non_terminal.clone()),
+                                kind: TermKind::NonTerminal(non_terminal),
                                 silent: true,
                             },
                             term,
                         ],
-                        negative_lookahead: None,
-                    });
+                        None,
+                    ));
                 }
-                Production { alternatives }
+                Production::new(db, alternatives)
             } else {
-                lower_rule(language, rule, context.as_ref(), generics)
+                lower_rule(db, language, rule, context.as_ref(), generics)
             }
         }
     }
 }
 
-#[instrument(skip_all, fields(%rule, ?current_name, ?generics))]
+#[instrument(skip_all, fields(rule = %rule.display(db), ?current_name, ?generics))]
 fn lower_rule(
-    language: &Language,
+    db: &dyn Db,
+    language: Language,
     rule: &Rule,
     current_name: Option<&Name>,
     generics: &BTreeMap<Ident, NonTerminalUse>,
 ) -> Production {
-    Production {
-        alternatives: rule
-            .alternatives
+    Production::new(
+        db,
+        rule.alternatives
             .iter()
             .map(|expression| {
                 let (sequence, lookahead) = match expression.sequence.last() {
@@ -262,6 +273,7 @@ fn lower_rule(
                             (
                                 sequence,
                                 Some(NonTerminalUse::new_anonymous(
+                                    db,
                                     rule.clone(),
                                     current_name,
                                     generics.clone(),
@@ -274,22 +286,27 @@ fn lower_rule(
                 let terms = sequence
                     .iter()
                     .map(|(term, quantifier, span)| {
-                        lower_term(language, generics, term, *quantifier, *span, current_name)
+                        lower_term(
+                            db,
+                            language,
+                            generics,
+                            term,
+                            *quantifier,
+                            *span,
+                            current_name,
+                        )
                     })
                     .collect::<Vec<_>>();
-                Alternative {
-                    span: expression.span,
-                    terms,
-                    negative_lookahead: lookahead,
-                }
+                Alternative::new(db, expression.span, terms, lookahead)
             })
             .collect(),
-    }
+    )
 }
 
-#[instrument(skip_all, fields(%item, %quantifier, %span, ?current_name, ?generics))]
+#[instrument(skip_all, fields(item = %item.display(db), %quantifier, %span, ?current_name, ?generics))]
 fn lower_term(
-    language: &Language,
+    db: &dyn Db,
+    language: Language,
     generics: &BTreeMap<Ident, NonTerminalUse>,
     item: &Item,
     quantifier: Quantifier,
@@ -304,6 +321,7 @@ fn lower_term(
         });
         return Term {
             kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                db,
                 Rule { alternatives, span },
                 current_name,
                 generics.clone(),
@@ -319,36 +337,36 @@ fn lower_term(
             generics: generic_arguments,
         } => match generics.get(ident) {
             Some(nt) => Term {
-                kind: TermKind::NonTerminal(nt.clone()),
+                kind: TermKind::NonTerminal(*nt),
                 silent: true,
             },
             None => {
-                let definition = match language.definitions.get(ident) {
+                let definition = match language.definition(db, *ident, span) {
                     Some(definition) => definition,
                     None => {
-                        emit("This identifier is not defined", vec![(span, None)]);
                         return Term {
-                            kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
-                                rule: Rule {
+                            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                                db,
+                                Rule {
                                     span,
                                     alternatives: BTreeSet::new(),
                                 },
-                                context: None,
-                                generics: BTreeMap::new(),
-                            }),
+                                None,
+                                BTreeMap::new(),
+                            )),
                             silent: true,
                         };
                     }
                 };
                 let kind = if definition.atomic {
                     TermKind::Terminal(TerminalUse::Named {
-                        ident: ident.clone(),
+                        ident: *ident,
                         span,
                     })
                 } else {
                     let name = match current_name {
                         Some(current_name) if ident == &current_name.ident => Name {
-                            ident: current_name.ident.clone(),
+                            ident: current_name.ident,
                             index: match mark {
                                 Mark::Super => 0,
                                 Mark::This => current_name.index,
@@ -356,7 +374,7 @@ fn lower_term(
                             },
                         },
                         _ => Name {
-                            ident: ident.clone(),
+                            ident: *ident,
                             index: 0,
                         },
                     };
@@ -364,17 +382,19 @@ fn lower_term(
                         .iter()
                         .map(|arg| {
                             NonTerminalUse::new_anonymous(
+                                db,
                                 arg.clone(),
                                 current_name,
                                 generics.clone(),
                             )
                         })
                         .collect();
-                    TermKind::NonTerminal(NonTerminalUse::Named {
+                    TermKind::NonTerminal(NonTerminalUse::new_named(
+                        db,
                         name,
-                        generics: generic_parameters,
+                        generic_parameters,
                         span,
-                    })
+                    ))
                 };
                 Term {
                     kind,
@@ -402,6 +422,7 @@ fn lower_term(
         },
         Item::Group(rule) => Term {
             kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                db,
                 rule.clone(),
                 current_name,
                 generics.clone(),
@@ -414,30 +435,28 @@ fn lower_term(
                 vec![(span, None)],
             );
             Term {
-                kind: TermKind::NonTerminal(NonTerminalUse::Anonymous {
-                    rule: Rule {
+                kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                    db,
+                    Rule {
                         span,
                         alternatives: BTreeSet::new(),
                     },
-                    context: None,
-                    generics: BTreeMap::new(),
-                }),
+                    None,
+                    BTreeMap::new(),
+                )),
                 silent: true,
             }
         }
     }
 }
 
-#[instrument(skip_all, fields(%terminal))]
-pub fn terminal_nfa(language: &Language, terminal: &TerminalDef) -> NFA {
+#[instrument(skip_all, fields(terminal = %terminal.display(db)))]
+pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: &TerminalDef) -> NFA {
     match terminal {
-        TerminalDef::Named { ident, span } => {
-            let nfa = ident_nfa(language, ident, *span, &mut HashSet::new());
+        &TerminalDef::Named { ident, span } => {
+            let nfa = ident_nfa(db, language, ident, span, &mut HashSet::new());
             if nfa.has_empty() {
-                emit(
-                    "Tokens must not match the empty string",
-                    vec![(*span, None)],
-                );
+                emit("Tokens must not match the empty string", vec![(span, None)]);
             }
             nfa
         }
@@ -448,17 +467,22 @@ pub fn terminal_nfa(language: &Language, terminal: &TerminalDef) -> NFA {
     }
 }
 
-#[instrument(skip_all, fields(%ident))]
-fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashSet<Ident>) -> NFA {
-    if !visited.insert(ident.clone()) {
+#[instrument(skip_all, fields(ident = %ident.display(db)))]
+fn ident_nfa(
+    db: &dyn Db,
+    language: Language,
+    ident: Ident,
+    span: Span,
+    visited: &mut HashSet<Ident>,
+) -> NFA {
+    if !visited.insert(ident) {
         emit(
             "Recursive atomic rules are not (yet) supported",
             vec![(span, None)],
         );
         return NFA::never_match();
     }
-    let Some(definition) = language.definitions.get(ident) else {
-        emit("Definition not found", vec![(span, None)]);
+    let Some(definition) = language.definition(db, ident, span) else {
         return NFA::never_match();
     };
     if !definition.atomic {
@@ -477,18 +501,18 @@ fn ident_nfa(language: &Language, ident: &Ident, span: Span, visited: &mut HashS
         definition
             .rules
             .iter()
-            .map(|rule| rule_nfa(language, rule, visited)),
+            .map(|rule| rule_nfa(db, language, rule, visited)),
     );
-    visited.remove(ident);
+    visited.remove(&ident);
     nfa
 }
 
-#[instrument(skip_all, fields(%rule))]
-fn rule_nfa(language: &Language, rule: &Rule, visited: &mut HashSet<Ident>) -> NFA {
+#[instrument(skip_all, fields(rule = %rule.display(db)))]
+fn rule_nfa(db: &dyn Db, language: Language, rule: &Rule, visited: &mut HashSet<Ident>) -> NFA {
     alternation(
         rule.alternatives
             .iter()
-            .map(|expression| expression_nfa(language, expression, visited)),
+            .map(|expression| expression_nfa(db, language, expression, visited)),
     )
 }
 
@@ -507,9 +531,10 @@ fn alternation(alternatives: impl Iterator<Item = NFA>) -> NFA {
     builder.build(start, start).unwrap()
 }
 
-#[instrument(skip_all, fields(%expression))]
+#[instrument(skip_all, fields(expression = %expression.display(db)))]
 fn expression_nfa(
-    language: &Language,
+    db: &dyn Db,
+    language: Language,
     expression: &Expression,
     visited: &mut HashSet<Ident>,
 ) -> NFA {
@@ -537,13 +562,13 @@ fn expression_nfa(
                         vec![(*span, None)],
                     );
                 }
-                ident_nfa(language, ident, *span, visited)
+                ident_nfa(db, language, *ident, *span, visited)
             }
             Item::String(string) => NFA::compiler()
                 .build_from_hir(&Hir::literal(string.as_bytes()))
                 .unwrap(),
             Item::Regex(regex) => regex_nfa(regex, *span),
-            Item::Group(rule) => rule_nfa(language, rule, visited),
+            Item::Group(rule) => rule_nfa(db, language, rule, visited),
             Item::Lookaround(lookaround_type, rule) => {
                 if !lookaround_type.ahead || lookaround_type.positive {
                     emit(
@@ -562,7 +587,7 @@ fn expression_nfa(
                 builder.start_pattern().unwrap();
                 let mat = builder.add_match().unwrap();
                 start = builder.add_capture_end(mat, 0).unwrap();
-                let rule = rule_nfa(language, rule, visited);
+                let rule = rule_nfa(db, language, rule, visited);
                 subtract_nfa(&tail, &rule)
             }
         };
@@ -1129,8 +1154,14 @@ fn regex_nfa(regex: &str, span: Span) -> NFA {
     nfa
 }
 
+#[salsa::interned]
+pub struct NonTerminalDef {
+    #[return_ref]
+    inner: NonTerminalDefInner,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalDef {
+pub enum NonTerminalDefInner {
     Goal {
         rule: Rule,
     },
@@ -1145,48 +1176,70 @@ pub enum NonTerminalDef {
 }
 
 impl NonTerminalDef {
-    pub fn span(&self) -> Span {
-        match self {
-            NonTerminalDef::Goal { rule, .. } => rule.span,
-            &NonTerminalDef::Named { span, .. } => span,
-            NonTerminalDef::Anonymous { rule, .. } => rule.span,
+    pub fn is_goal(self, db: &dyn Db) -> bool {
+        matches!(self.inner(db), NonTerminalDefInner::Goal { .. })
+    }
+
+    pub fn ident(self, db: &dyn Db) -> Ident {
+        match self.inner(db) {
+            NonTerminalDefInner::Goal { .. } => Ident::new(db, "goal".into()),
+            NonTerminalDefInner::Named {
+                name: Name { ident, .. },
+                generics: _,
+                span: _,
+            } => *ident,
+            NonTerminalDefInner::Anonymous { .. } => Ident::new(db, "anon".into()),
+        }
+    }
+
+    pub fn span(self, db: &dyn Db) -> Span {
+        match self.inner(db) {
+            NonTerminalDefInner::Goal { rule, .. } => rule.span,
+            &NonTerminalDefInner::Named { span, .. } => span,
+            NonTerminalDefInner::Anonymous { rule, .. } => rule.span,
         }
     }
 }
 
-impl fmt::Display for NonTerminalDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NonTerminalDef::Goal { rule } => {
-                write!(f, "Goal({rule})")?;
+impl DisplayWithDb for NonTerminalDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        match self.inner(db) {
+            NonTerminalDefInner::Goal { rule } => {
+                write!(f, "Goal({})", rule.display(db))?;
             }
-            NonTerminalDef::Named {
+            NonTerminalDefInner::Named {
                 name,
                 generics,
                 span: _,
             } => {
-                write!(f, "{name}")?;
+                write!(f, "{}", name.display(db))?;
                 if !generics.is_empty() {
                     f.write_str("<")?;
                     for (i, generic) in generics.iter().enumerate() {
                         if i != 0 {
                             f.write_str(", ")?;
                         }
-                        write!(f, "{generic}")?;
+                        write!(f, "{}", generic.display(db))?;
                     }
                     f.write_str(">")?;
                 }
             }
-            NonTerminalDef::Anonymous { rule } => {
-                write!(f, "{{{rule}}}")?;
+            NonTerminalDefInner::Anonymous { rule } => {
+                write!(f, "{{{}}}", rule.display(db))?;
             }
         }
         Ok(())
     }
 }
 
+#[salsa::interned]
+pub struct NonTerminalUse {
+    #[return_ref]
+    inner: NonTerminalUseInner,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalUse {
+pub enum NonTerminalUseInner {
     Goal {
         rule: Rule,
     },
@@ -1202,8 +1255,29 @@ pub enum NonTerminalUse {
     },
 }
 
+#[salsa::tracked]
 impl NonTerminalUse {
-    fn new_anonymous(rule: Rule, context: Option<&Name>, generics: BTreeMap<Ident, Self>) -> Self {
+    pub fn new_goal(db: &dyn Db, rule: Rule) -> Self {
+        Self::new(db, NonTerminalUseInner::Goal { rule })
+    }
+
+    pub fn new_named(db: &dyn Db, name: Name, generics: Vec<Self>, span: Span) -> Self {
+        Self::new(
+            db,
+            NonTerminalUseInner::Named {
+                name,
+                generics,
+                span,
+            },
+        )
+    }
+
+    pub fn new_anonymous(
+        db: &dyn Db,
+        rule: Rule,
+        context: Option<&Name>,
+        generics: BTreeMap<Ident, Self>,
+    ) -> Self {
         fn contains_non_super_ident(rule: &Rule, context: &Ident) -> bool {
             rule.alternatives
                 .iter()
@@ -1222,76 +1296,87 @@ impl NonTerminalUse {
         let context = context
             .filter(|name| contains_non_super_ident(&rule, &name.ident))
             .cloned();
-        Self::Anonymous {
-            rule,
-            context,
-            generics,
-        }
+        Self::new(
+            db,
+            NonTerminalUseInner::Anonymous {
+                rule,
+                context,
+                generics,
+            },
+        )
     }
 
-    pub fn definition(&self, language: &Language) -> NonTerminalDef {
-        match self {
-            NonTerminalUse::Goal { rule } => NonTerminalDef::Goal { rule: rule.clone() },
-            NonTerminalUse::Named {
+    #[salsa::tracked]
+    pub fn definition(self, db: &dyn Db, language: Language) -> NonTerminalDef {
+        match self.inner(db) {
+            NonTerminalUseInner::Goal { rule } => {
+                NonTerminalDef::new(db, NonTerminalDefInner::Goal { rule: rule.clone() })
+            }
+            NonTerminalUseInner::Named {
                 name,
                 generics,
-                span: _,
-            } => NonTerminalDef::Named {
-                name: name.clone(),
-                generics: generics
-                    .iter()
-                    .map(|generic| generic.definition(language))
-                    .collect(),
-                span: language.definitions[&name.ident].span,
-            },
-            NonTerminalUse::Anonymous {
+                span,
+            } => NonTerminalDef::new(
+                db,
+                NonTerminalDefInner::Named {
+                    name: name.clone(),
+                    generics: generics
+                        .iter()
+                        .map(|generic| generic.definition(db, language))
+                        .collect(),
+                    span: language
+                        .definition(db, name.ident, *span)
+                        .map_or(*span, |def| def.span),
+                },
+            ),
+            NonTerminalUseInner::Anonymous {
                 rule,
                 context: _,
                 generics: _,
-            } => NonTerminalDef::Anonymous { rule: rule.clone() },
+            } => NonTerminalDef::new(db, NonTerminalDefInner::Anonymous { rule: rule.clone() }),
         }
     }
 
-    pub fn span(&self) -> Span {
-        match self {
-            NonTerminalUse::Goal { rule, .. } => rule.span,
-            NonTerminalUse::Named { span, .. } => *span,
-            NonTerminalUse::Anonymous { rule, .. } => rule.span,
+    pub fn span(&self, db: &dyn Db) -> Span {
+        match self.inner(db) {
+            NonTerminalUseInner::Goal { rule, .. } => rule.span,
+            NonTerminalUseInner::Named { span, .. } => *span,
+            NonTerminalUseInner::Anonymous { rule, .. } => rule.span,
         }
     }
 }
 
-impl fmt::Display for NonTerminalUse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NonTerminalUse::Goal { rule } => {
-                write!(f, "Goal({rule})")?;
+impl DisplayWithDb for NonTerminalUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        match self.inner(db) {
+            NonTerminalUseInner::Goal { rule } => {
+                write!(f, "Goal({})", rule.display(db))?;
             }
-            NonTerminalUse::Named {
+            NonTerminalUseInner::Named {
                 name,
                 generics,
                 span: _,
             } => {
-                write!(f, "{name}")?;
+                write!(f, "{}", name.display(db))?;
                 if !generics.is_empty() {
                     f.write_str("<")?;
                     for (i, generic) in generics.iter().enumerate() {
                         if i != 0 {
                             f.write_str(", ")?;
                         }
-                        write!(f, "{generic}")?;
+                        write!(f, "{}", generic.display(db))?;
                     }
                     f.write_str(">")?;
                 }
             }
-            NonTerminalUse::Anonymous {
+            NonTerminalUseInner::Anonymous {
                 rule,
                 generics,
                 context,
             } => {
                 match context {
-                    Some(context) => write!(f, "{{{rule}}}#{context}")?,
-                    None => write!(f, "{{{rule}}}")?,
+                    Some(context) => write!(f, "{{{}}}#{}", rule.display(db), context.display(db))?,
+                    None => write!(f, "{{{}}}", rule.display(db))?,
                 }
                 if !generics.is_empty() {
                     f.write_str("<")?;
@@ -1299,7 +1384,7 @@ impl fmt::Display for NonTerminalUse {
                         if i != 0 {
                             f.write_str(", ")?;
                         }
-                        write!(f, "{name}={value}")?;
+                        write!(f, "{}={}", name.display(db), value.display(db))?;
                     }
                     f.write_str(">")?;
                 }
@@ -1315,9 +1400,9 @@ pub struct Name {
     pub index: usize,
 }
 
-impl fmt::Display for Name {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.ident)?;
+impl DisplayWithDb for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        write!(f, "{}", self.ident.display(db))?;
         if self.index > 0 {
             write!(f, "#{}", self.index)?;
         }
@@ -1350,11 +1435,13 @@ impl TerminalUse {
         }
     }
 
-    pub fn definition(&self, language: &Language) -> TerminalDef {
+    pub fn definition(&self, db: &dyn Db, language: Language) -> TerminalDef {
         match self {
-            Self::Named { ident, .. } => TerminalDef::Named {
-                ident: ident.clone(),
-                span: language.definitions[ident].span,
+            &Self::Named { ident, span } => TerminalDef::Named {
+                ident,
+                span: language
+                    .definition(db, ident, span)
+                    .map_or(span, |def| def.span),
             },
             Self::Anonymous { name, regex, .. } => TerminalDef::Anonymous {
                 name: name.clone(),
@@ -1365,10 +1452,12 @@ impl TerminalUse {
     }
 }
 
-impl fmt::Display for TerminalUse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl DisplayWithDb for TerminalUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
-            TerminalUse::Named { ident, .. } => write!(f, "@{ident}"),
+            TerminalUse::Named { ident, .. } => {
+                write!(f, "@{}", ident.display(db))
+            }
             TerminalUse::Anonymous { name, .. } => write!(f, "@'{name}'"),
             TerminalUse::EndOfInput { .. } => write!(f, "$"),
         }
@@ -1479,9 +1568,9 @@ pub enum TerminalDef {
 }
 
 impl TerminalDef {
-    pub fn name(&self) -> &str {
+    pub fn name<'a>(&'a self, db: &'a dyn Db) -> &'a str {
         match self {
-            Self::Named { ident, .. } => &ident.0,
+            Self::Named { ident, .. } => ident.name(db),
             Self::Anonymous { name, .. } => name,
             Self::EndOfInput => "$",
         }
@@ -1495,10 +1584,12 @@ impl TerminalDef {
     }
 }
 
-impl fmt::Display for TerminalDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl DisplayWithDb for TerminalDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
-            TerminalDef::Named { ident, .. } => write!(f, "@{ident}"),
+            TerminalDef::Named { ident, .. } => {
+                write!(f, "@{}", ident.display(db))
+            }
             TerminalDef::Anonymous { name, .. } => write!(f, "@'{name}'"),
             TerminalDef::EndOfInput => write!(f, "$"),
         }
@@ -1587,40 +1678,42 @@ impl Hash for TerminalDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[salsa::interned]
 pub struct Production {
+    #[return_ref]
     pub alternatives: Vec<Alternative>,
 }
 
-impl fmt::Display for Production {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, alternative) in self.alternatives.iter().enumerate() {
+impl DisplayWithDb for Production {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        for (i, alternative) in self.alternatives(db).iter().enumerate() {
             if i != 0 {
                 write!(f, " | ")?;
             }
-            write!(f, "{alternative}")?;
+            write!(f, "{}", alternative.display(db))?;
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[salsa::interned]
 pub struct Alternative {
     pub span: Span,
+    #[return_ref]
     pub terms: Vec<Term>,
     pub negative_lookahead: Option<NonTerminalUse>,
 }
 
-impl fmt::Display for Alternative {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, term) in self.terms.iter().enumerate() {
+impl DisplayWithDb for Alternative {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        for (i, term) in self.terms(db).iter().enumerate() {
             if i != 0 {
                 write!(f, " ")?;
             }
-            write!(f, "{term}")?;
+            write!(f, "{}", term.display(db))?;
         }
-        if let Some(non_terminal) = &self.negative_lookahead {
-            write!(f, " (!>>{non_terminal})")?;
+        if let Some(non_terminal) = &self.negative_lookahead(db) {
+            write!(f, " (!>>{})", non_terminal.display(db))?;
         }
         Ok(())
     }
@@ -1633,20 +1726,20 @@ pub struct Term {
 }
 
 impl Term {
-    pub fn span(&self) -> Span {
+    pub fn definition(&self, db: &dyn Db, language: Language) -> TermDef {
         match &self.kind {
-            TermKind::Terminal(terminal) => terminal.span(),
-            TermKind::NonTerminal(non_terminal) => non_terminal.span(),
+            TermKind::Terminal(t) => TermDef::Terminal(t.definition(db, language)),
+            TermKind::NonTerminal(nt) => TermDef::NonTerminal(nt.definition(db, language)),
         }
     }
 }
 
-impl fmt::Display for Term {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl DisplayWithDb for Term {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         if self.silent {
             f.write_char('-')?;
         }
-        <TermKind as fmt::Display>::fmt(&self.kind, f)
+        <TermKind as DisplayWithDb>::fmt(&self.kind, f, db)
     }
 }
 
@@ -1656,11 +1749,30 @@ pub enum TermKind {
     NonTerminal(NonTerminalUse),
 }
 
-impl fmt::Display for TermKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl DisplayWithDb for TermKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
-            TermKind::Terminal(terminal) => write!(f, "{terminal}"),
-            TermKind::NonTerminal(non_terminal) => write!(f, "{non_terminal}"),
+            TermKind::Terminal(terminal) => {
+                write!(f, "{}", terminal.display(db))
+            }
+            TermKind::NonTerminal(non_terminal) => {
+                write!(f, "{}", non_terminal.display(db))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TermDef {
+    Terminal(TerminalDef),
+    NonTerminal(NonTerminalDef),
+}
+
+impl DisplayWithDb for TermDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        match self {
+            Self::Terminal(t) => write!(f, "{}", t.display(db)),
+            Self::NonTerminal(nt) => write!(f, "{}", nt.display(db)),
         }
     }
 }

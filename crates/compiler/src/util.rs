@@ -1,29 +1,22 @@
-use std::{collections::HashSet, sync::Arc};
+use std::fmt;
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use crate::Db;
 
-#[derive(Debug)]
-pub struct Interner {
-    data: Lazy<Mutex<HashSet<Arc<str>>>>,
+pub trait DisplayWithDb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result;
+
+    fn display<'a>(&'a self, db: &'a dyn Db) -> DbDisplay<'a, Self> {
+        DbDisplay { db, value: self }
+    }
 }
 
-impl Interner {
-    pub const fn new() -> Self {
-        Self {
-            data: Lazy::new(Mutex::default),
-        }
-    }
+pub struct DbDisplay<'a, T: ?Sized> {
+    db: &'a dyn Db,
+    value: &'a T,
+}
 
-    pub fn intern(&self, value: &str) -> Arc<str> {
-        let mut data = self.data.lock();
-        match data.get(value) {
-            Some(value) => value.clone(),
-            None => {
-                let value: Arc<str> = value.into();
-                data.insert(value.clone());
-                value
-            }
-        }
+impl<T: DisplayWithDb + ?Sized> fmt::Display for DbDisplay<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(f, self.db)
     }
 }

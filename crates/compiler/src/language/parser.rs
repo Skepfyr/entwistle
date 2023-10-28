@@ -1,19 +1,20 @@
-use std::{fmt::Write as _, ops::Range};
+use std::{collections::HashMap, fmt::Write as _, ops::Range};
 
 use chumsky::{
     prelude::*,
     text::{newline, Character},
     Stream,
 };
+use salsa::DebugWithDb;
 
-use crate::{diagnostics::emit, util::Interner, Span};
+use crate::{diagnostics::emit, Db, Span};
 
 use super::{
     Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
     Rule, Test,
 };
 
-pub(super) fn parse_grammar(input: &str) -> Language {
+pub(super) fn parse_grammar(db: &dyn Db, input: &str) -> Language {
     let stream = Stream::from_iter(
         Span {
             start: input.len(),
@@ -29,7 +30,7 @@ pub(super) fn parse_grammar(input: &str) -> Language {
             )
         }),
     );
-    match file().parse(stream) {
+    match file(db).parse(stream) {
         Ok(grammar) => grammar,
         Err(errors) => {
             for error in errors {
@@ -43,12 +44,9 @@ pub(super) fn parse_grammar(input: &str) -> Language {
                         None => reason.push_str("EOI"),
                     }
                 }
-                emit(
-                    "Failed to parse",
-                    vec![(error.span(), Some(reason))],
-                );
+                emit("Failed to parse", vec![(error.span(), Some(reason))]);
             }
-            Language::default()
+            Language::new(db, HashMap::new(), Vec::new())
         }
     }
 }
@@ -77,49 +75,54 @@ impl chumsky::Span for Span {
     }
 }
 
-fn file() -> impl Parser<char, Language, Error = ParseError> {
+fn file(db: &dyn Db) -> impl Parser<char, Language, Error = ParseError> + '_ {
     enum RuleOrTest {
         Rule(Definition),
         Test(Test),
     }
     choice((
-        definition().map(RuleOrTest::Rule),
-        test().map(RuleOrTest::Test),
+        definition(db).map(RuleOrTest::Rule),
+        test(db).map(RuleOrTest::Test),
     ))
     .repeated()
     .map(|items| {
-        items
-            .into_iter()
-            .fold(Language::default(), |mut language, rule_or_test| {
+        let (definitions, tests) = items.into_iter().fold(
+            (HashMap::new(), Vec::new()),
+            |(mut definitions, mut tests), rule_or_test| {
                 match rule_or_test {
                     RuleOrTest::Rule(rule) => {
-                        if let Some(rule) = language.definitions.insert(rule.ident.clone(), rule) {
+                        if let Some(rule) = definitions.insert(rule.ident, rule) {
                             emit(
                                 "Duplicate definition",
                                 vec![(
                                     rule.span,
-                                    Some(format!("Duplicate definition of {}", rule.ident)),
+                                    Some(format!(
+                                        "Duplicate definition of {:?}",
+                                        rule.ident.debug_with(db, true)
+                                    )),
                                 )],
                             );
                         }
                     }
                     RuleOrTest::Test(test) => {
-                        language.tests.push(test);
+                        tests.push(test);
                     }
                 }
-                language
-            })
+                (definitions, tests)
+            },
+        );
+        Language::new(db, definitions, tests)
     })
     .then_ignore(end())
 }
 
-fn definition() -> impl Parser<char, Definition, Error = ParseError> {
+fn definition(db: &dyn Db) -> impl Parser<char, Definition, Error = ParseError> + '_ {
     silent()
         .then(atomic())
         .then(
-            ident()
+            ident(db)
                 .map_with_span(|ident, span| (ident, span))
-                .then(generic_params().or_not()),
+                .then(generic_params(db).or_not()),
         )
         .then(
             just(':').padded_by(lws()).ignore_then(choice((
@@ -127,11 +130,11 @@ fn definition() -> impl Parser<char, Definition, Error = ParseError> {
                     filter(|c: &char| c.is_inline_whitespace())
                         .repeated()
                         .at_least(1)
-                        .ignore_then(rule())
+                        .ignore_then(rule(db))
                         .then_ignore(empty_lines())
                         .repeated(),
                 ),
-                rule().map(|r| vec![r]).then_ignore(empty_lines()),
+                rule(db).map(|r| vec![r]).then_ignore(empty_lines()),
             ))),
         )
         .map(
@@ -146,10 +149,10 @@ fn definition() -> impl Parser<char, Definition, Error = ParseError> {
         )
 }
 
-fn generic_params() -> impl Parser<char, Vec<Ident>, Error = ParseError> {
+fn generic_params(db: &dyn Db) -> impl Parser<char, Vec<Ident>, Error = ParseError> + '_ {
     just('<')
         .ignore_then(
-            ident()
+            ident(db)
                 .padded_by(lws())
                 .separated_by(just(','))
                 .allow_trailing(),
@@ -157,9 +160,9 @@ fn generic_params() -> impl Parser<char, Vec<Ident>, Error = ParseError> {
         .then_ignore(just('>'))
 }
 
-fn rule() -> impl Parser<char, Rule, Error = ParseError> + Clone {
+fn rule(db: &dyn Db) -> impl Parser<char, Rule, Error = ParseError> + Clone + '_ {
     recursive(|rule| {
-        expression(rule)
+        expression(db, rule)
             .separated_by(just('|').padded_by(lws()))
             .map_with_span(|expressions, span| Rule {
                 alternatives: expressions.into_iter().collect(),
@@ -168,12 +171,13 @@ fn rule() -> impl Parser<char, Rule, Error = ParseError> + Clone {
     })
 }
 
-fn expression(
-    rule: impl Parser<char, Rule, Error = ParseError> + Clone,
-) -> impl Parser<char, Expression, Error = ParseError> {
+fn expression<'a>(
+    db: &'a dyn Db,
+    rule: impl Parser<char, Rule, Error = ParseError> + Clone + 'a,
+) -> impl Parser<char, Expression, Error = ParseError> + 'a {
     choice((
         just('(').then(lws()).then(just(')')).to(Vec::new()),
-        term(rule)
+        term(db, rule)
             .then(quantifier())
             .map_with_span(|(item, quantifier), span| (item, quantifier, span))
             .separated_by(lws())
@@ -182,12 +186,13 @@ fn expression(
     .map_with_span(|sequence, span| Expression { sequence, span })
 }
 
-fn term(
-    rule: impl Parser<char, Rule, Error = ParseError> + Clone,
-) -> impl Parser<char, Item, Error = ParseError> {
+fn term<'a>(
+    db: &'a dyn Db,
+    rule: impl Parser<char, Rule, Error = ParseError> + Clone + 'a,
+) -> impl Parser<char, Item, Error = ParseError> + 'a {
     choice((
         mark()
-            .then(ident())
+            .then(ident(db))
             .then(generic_args(rule.clone()).or_not())
             .map(|((mark, ident), generic_args)| Item::Ident {
                 mark,
@@ -261,25 +266,22 @@ fn lookaround() -> impl Parser<char, LookaroundType, Error = ParseError> {
         })
 }
 
-fn test() -> impl Parser<char, Test, Error = ParseError> {
+fn test(db: &dyn Db) -> impl Parser<char, Test, Error = ParseError> + '_ {
     lws()
         .ignore_then(just('=').repeated().at_least(1).map(|equals| equals.len()))
         .then_with(|equals: usize| {
-            rule()
+            rule(db)
                 .padded_by(lws())
                 .then_ignore(newline())
                 .then(test_body(equals).map_with_span(|body, span| (body, span)))
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
-                .then(parse_trees())
+                .then(parse_trees(db))
                 .then_ignore(just('=').repeated().exactly(equals).padded_by(lws()))
                 .then_ignore(empty_lines())
         })
-        .map(|((goal, (test, test_span)), parse_trees)| Test {
-            goal,
-            test: test.into(),
-            test_span,
-            parse_trees,
+        .map(|((goal, (test, test_span)), parse_trees)| {
+            Test::new(db, goal, test, test_span, parse_trees)
         })
 }
 
@@ -297,10 +299,10 @@ fn test_body(equals: usize) -> impl Parser<char, String, Error = ParseError> {
         })
 }
 
-fn parse_trees() -> impl Parser<char, Vec<ParseTree>, Error = ParseError> {
+fn parse_trees(db: &dyn Db) -> impl Parser<char, Vec<ParseTree>, Error = ParseError> + '_ {
     lws()
         .then(
-            ident()
+            ident(db)
                 .then_ignore(just(':').padded_by(lws()))
                 .or_not()
                 .then(quoted_string().or_not())
@@ -309,7 +311,7 @@ fn parse_trees() -> impl Parser<char, Vec<ParseTree>, Error = ParseError> {
         .repeated()
         .validate(|lines, span, emit| {
             let mut trees: Vec<(String, Ident, Vec<ParseTree>)> =
-                vec![("".into(), Ident("".into()), Vec::new())];
+                vec![("".into(), Ident::new(db, "".into()), Vec::new())];
             for (indent, tree_info) in lines {
                 while trees
                     .last()
@@ -366,10 +368,9 @@ fn parse_trees() -> impl Parser<char, Vec<ParseTree>, Error = ParseError> {
         })
 }
 
-fn ident() -> impl Parser<char, Ident, Error = ParseError> {
-    static IDENT_INTERNER: Interner = Interner::new();
+fn ident(db: &dyn Db) -> impl Parser<char, Ident, Error = ParseError> + '_ {
     chumsky::text::ident()
-        .map(move |ident: String| Ident(IDENT_INTERNER.intern(&ident)))
+        .map(move |ident: String| Ident::new(db, ident))
         .labelled("ident")
 }
 

@@ -1,15 +1,12 @@
-use std::{
-    collections::{BTreeSet, HashSet},
-    path::Path,
-};
+use std::path::Path;
 
 use color_eyre::Result;
 use entwistle::{
     diagnostics::diagnostics,
-    language::{Expression, Item, Language, Mark, Quantifier, Rule},
-    lower::{production, NonTerminalUse, TermKind},
-    parse_table::parse_table,
+    language::{self, Source},
     test::run_test,
+    util::DisplayWithDb,
+    Database,
 };
 use tracing_subscriber::prelude::*;
 
@@ -20,96 +17,100 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_error::ErrorLayer::default())
         .init();
+
+    let db = Database::default();
+
     let file = std::env::args().nth(1).unwrap();
     let file = Path::new(&file);
 
-    let input = std::fs::read_to_string(file)?;
-    let language = Language::parse(&input);
+    let input = Source::new(&db, std::fs::read_to_string(file)?);
+    let language = language::parse(&db, input);
 
     let diags = diagnostics();
     if !diags.is_empty() {
         for diag in diags {
-            diag.print(&input, file).unwrap();
+            diag.print(input.text(&db), file).unwrap();
         }
         return Ok(());
     }
 
     println!("--------------");
 
-    let mut non_terminals = language
-        .definitions
-        .iter()
-        .filter(|(_, definition)| definition.generics.is_empty() && !definition.atomic)
-        .map(|(ident, definition)| NonTerminalUse::Goal {
-            rule: Rule {
-                span: definition.span,
-                alternatives: {
-                    let mut alternatives = BTreeSet::new();
-                    alternatives.insert(Expression {
-                        span: definition.span,
-                        sequence: vec![(
-                            Item::Ident {
-                                mark: Mark::This,
-                                ident: ident.clone(),
-                                generics: Vec::new(),
-                            },
-                            Quantifier::Once,
-                            definition.span,
-                        )],
-                    });
-                    alternatives
-                },
-            },
-        })
-        .collect::<Vec<_>>();
-    let mut visited = HashSet::new();
-    while let Some(non_terminal) = non_terminals.pop() {
-        let production = production(&language, &non_terminal);
-        println!("{non_terminal}: {production}");
-        production
-            .alternatives
-            .iter()
-            .flat_map(|expression| {
-                expression
-                    .terms
-                    .iter()
-                    .filter_map(|term| match &term.kind {
-                        TermKind::Terminal(_) => None,
-                        TermKind::NonTerminal(nt) => Some(nt),
-                    })
-                    .chain(expression.negative_lookahead.as_ref())
-            })
-            .for_each(|nt| {
-                if visited.insert(nt.clone()) {
-                    non_terminals.push(nt.clone());
-                }
-            });
-    }
+    // let mut non_terminals = language
+    //     .definitions(&db)
+    //     .iter()
+    //     .filter(|(_, definition)| definition.generics.is_empty() && !definition.atomic)
+    //     .map(|(ident, definition)| {
+    //         NonTerminalUse::new_goal(
+    //             &db,
+    //             Rule {
+    //                 span: definition.span,
+    //                 alternatives: {
+    //                     let mut alternatives = BTreeSet::new();
+    //                     alternatives.insert(Expression {
+    //                         span: definition.span,
+    //                         sequence: vec![(
+    //                             Item::Ident {
+    //                                 mark: Mark::This,
+    //                                 ident: *ident,
+    //                                 generics: Vec::new(),
+    //                             },
+    //                             Quantifier::Once,
+    //                             definition.span,
+    //                         )],
+    //                     });
+    //                     alternatives
+    //                 },
+    //             },
+    //         )
+    //     })
+    //     .collect::<Vec<_>>();
+    // let mut visited = HashSet::new();
+    // while let Some(non_terminal) = non_terminals.pop() {
+    //     let production = production(&db, language, non_terminal);
+    //     println!("{}: {}", non_terminal.display(&db), production.display(&db));
+    //     production
+    //         .alternatives
+    //         .iter()
+    //         .flat_map(|expression| {
+    //             expression
+    //                 .terms
+    //                 .iter()
+    //                 .filter_map(|term| match term.kind {
+    //                     TermKind::Terminal(_) => None,
+    //                     TermKind::NonTerminal(nt) => Some(nt),
+    //                 })
+    //                 .chain(expression.negative_lookahead)
+    //         })
+    //         .for_each(|nt| {
+    //             if visited.insert(nt) {
+    //                 non_terminals.push(nt);
+    //             }
+    //         });
+    // }
 
-    let diags = diagnostics();
-    if !diags.is_empty() {
-        for diag in diags {
-            diag.print(&input, file).unwrap();
-        }
-        return Ok(());
-    }
+    // let diags = diagnostics();
+    // if !diags.is_empty() {
+    //     for diag in diags {
+    //         diag.print(input.text(&db), file).unwrap();
+    //     }
+    //     return Ok(());
+    // }
 
     println!("--------------");
 
-    for test in &language.tests {
-        let parse_table = parse_table(&language, test.goal.clone());
-        println!("Parse table: {}", parse_table);
-        if let Some(trees) = run_test(&language, test) {
+    for &test in language.tests(&db) {
+        if let Some(trees) = run_test(&db, language, test) {
             println!("Test failed:");
             for tree in trees {
-                println!("{}", tree);
+                println!("{}", tree.display(&db));
             }
         }
 
         let diags = diagnostics();
         if !diags.is_empty() {
             for diag in diags {
-                diag.print(&input, file).unwrap();
+                diag.print(input.text(&db), file).unwrap();
             }
             return Ok(());
         }
