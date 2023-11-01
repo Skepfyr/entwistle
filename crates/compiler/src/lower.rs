@@ -27,16 +27,16 @@ use crate::{
 
 #[instrument(skip_all, fields(non_terminal = %non_terminal.display(db)))]
 #[salsa::tracked]
-pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminalUse) -> Production {
+pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) -> Production {
     match non_terminal.inner(db) {
-        NonTerminalUseInner::Goal { rule } => Production::new(
+        NonTerminalInner::Goal { rule } => Production::new(
             db,
             vec![Alternative::new(
                 db,
                 non_terminal.span(db),
                 vec![
                     Term {
-                        kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                        kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                             db,
                             rule.clone(),
                             None,
@@ -45,19 +45,14 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminalUse)
                         silent: true,
                     },
                     Term {
-                        kind: TermKind::Terminal(TerminalUse::EndOfInput {
-                            span: Span {
-                                start: non_terminal.span(db).end,
-                                end: non_terminal.span(db).end,
-                            },
-                        }),
+                        kind: TermKind::Terminal(Terminal::EndOfInput),
                         silent: true,
                     },
                 ],
                 None,
             )],
         ),
-        NonTerminalUseInner::Named {
+        NonTerminalInner::Named {
             name,
             generics: generic_parameters,
             span,
@@ -172,14 +167,14 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminalUse)
                     db,
                     span,
                     vec![Term {
-                        kind: TermKind::NonTerminal(NonTerminalUse::new_named(
+                        kind: TermKind::NonTerminal(NonTerminal::new_named(
                             db,
                             Name {
                                 ident: name.ident,
                                 index: name.index + 1,
                             },
                             generic_parameters.clone(),
-                            span,
+                            definition.span,
                         )),
                         silent: true,
                     }],
@@ -188,7 +183,7 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminalUse)
             }
             Production::new(db, alternatives)
         }
-        NonTerminalUseInner::Anonymous {
+        NonTerminalInner::Anonymous {
             rule,
             context,
             generics,
@@ -247,7 +242,7 @@ fn lower_rule(
     language: Language,
     rule: &Rule,
     current_name: Option<&Name>,
-    generics: &BTreeMap<Ident, NonTerminalUse>,
+    generics: &BTreeMap<Ident, NonTerminal>,
 ) -> Production {
     Production::new(
         db,
@@ -272,7 +267,7 @@ fn lower_rule(
                         } else {
                             (
                                 sequence,
-                                Some(NonTerminalUse::new_anonymous(
+                                Some(NonTerminal::new_anonymous(
                                     db,
                                     rule.clone(),
                                     current_name,
@@ -307,7 +302,7 @@ fn lower_rule(
 fn lower_term(
     db: &dyn Db,
     language: Language,
-    generics: &BTreeMap<Ident, NonTerminalUse>,
+    generics: &BTreeMap<Ident, NonTerminal>,
     item: &Item,
     quantifier: Quantifier,
     span: Span,
@@ -320,7 +315,7 @@ fn lower_term(
             span,
         });
         return Term {
-            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                 db,
                 Rule { alternatives, span },
                 current_name,
@@ -345,7 +340,7 @@ fn lower_term(
                     Some(definition) => definition,
                     None => {
                         return Term {
-                            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                                 db,
                                 Rule {
                                     span,
@@ -359,9 +354,9 @@ fn lower_term(
                     }
                 };
                 let kind = if definition.atomic {
-                    TermKind::Terminal(TerminalUse::Named {
+                    TermKind::Terminal(Terminal::Named {
                         ident: *ident,
-                        span,
+                        span: definition.span,
                     })
                 } else {
                     let name = match current_name {
@@ -381,7 +376,7 @@ fn lower_term(
                     let generic_parameters = generic_arguments
                         .iter()
                         .map(|arg| {
-                            NonTerminalUse::new_anonymous(
+                            NonTerminal::new_anonymous(
                                 db,
                                 arg.clone(),
                                 current_name,
@@ -389,11 +384,11 @@ fn lower_term(
                             )
                         })
                         .collect();
-                    TermKind::NonTerminal(NonTerminalUse::new_named(
+                    TermKind::NonTerminal(NonTerminal::new_named(
                         db,
                         name,
                         generic_parameters,
-                        span,
+                        definition.span,
                     ))
                 };
                 Term {
@@ -403,25 +398,23 @@ fn lower_term(
             }
         },
         Item::String(data) => Term {
-            kind: TermKind::Terminal(TerminalUse::Anonymous {
+            kind: TermKind::Terminal(Terminal::Anonymous {
                 name: Arc::from(&**data),
                 regex: NFA::compiler()
                     .build_from_hir(&Hir::literal(data.as_bytes()))
                     .unwrap(),
-                span,
             }),
             silent: false,
         },
         Item::Regex(regex) => Term {
-            kind: TermKind::Terminal(TerminalUse::Anonymous {
+            kind: TermKind::Terminal(Terminal::Anonymous {
                 name: Arc::from(&**regex),
                 regex: regex_nfa(regex, span),
-                span,
             }),
             silent: false,
         },
         Item::Group(rule) => Term {
-            kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                 db,
                 rule.clone(),
                 current_name,
@@ -435,7 +428,7 @@ fn lower_term(
                 vec![(span, None)],
             );
             Term {
-                kind: TermKind::NonTerminal(NonTerminalUse::new_anonymous(
+                kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                     db,
                     Rule {
                         span,
@@ -451,17 +444,17 @@ fn lower_term(
 }
 
 #[instrument(skip_all, fields(terminal = %terminal.display(db)))]
-pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: &TerminalDef) -> NFA {
+pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: &Terminal) -> NFA {
     match terminal {
-        &TerminalDef::Named { ident, span } => {
+        &Terminal::Named { ident, span } => {
             let nfa = ident_nfa(db, language, ident, span, &mut HashSet::new());
             if nfa.has_empty() {
                 emit("Tokens must not match the empty string", vec![(span, None)]);
             }
             nfa
         }
-        TerminalDef::Anonymous { regex, .. } => regex.clone(),
-        TerminalDef::EndOfInput => NFA::compiler()
+        Terminal::Anonymous { regex, .. } => regex.clone(),
+        Terminal::EndOfInput { .. } => NFA::compiler()
             .build_from_hir(&Hir::look(regex_syntax::hir::Look::End))
             .unwrap(),
     }
@@ -1155,116 +1148,37 @@ fn regex_nfa(regex: &str, span: Span) -> NFA {
 }
 
 #[salsa::interned]
-pub struct NonTerminalDef {
+pub struct NonTerminal {
     #[return_ref]
-    inner: NonTerminalDefInner,
+    inner: NonTerminalInner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalDefInner {
+pub enum NonTerminalInner {
     Goal {
         rule: Rule,
     },
     Named {
         name: Name,
-        generics: Vec<NonTerminalDef>,
-        span: Span,
-    },
-    Anonymous {
-        rule: Rule,
-    },
-}
-
-impl NonTerminalDef {
-    pub fn is_goal(self, db: &dyn Db) -> bool {
-        matches!(self.inner(db), NonTerminalDefInner::Goal { .. })
-    }
-
-    pub fn ident(self, db: &dyn Db) -> Ident {
-        match self.inner(db) {
-            NonTerminalDefInner::Goal { .. } => Ident::new(db, "goal".into()),
-            NonTerminalDefInner::Named {
-                name: Name { ident, .. },
-                generics: _,
-                span: _,
-            } => *ident,
-            NonTerminalDefInner::Anonymous { .. } => Ident::new(db, "anon".into()),
-        }
-    }
-
-    pub fn span(self, db: &dyn Db) -> Span {
-        match self.inner(db) {
-            NonTerminalDefInner::Goal { rule, .. } => rule.span,
-            &NonTerminalDefInner::Named { span, .. } => span,
-            NonTerminalDefInner::Anonymous { rule, .. } => rule.span,
-        }
-    }
-}
-
-impl DisplayWithDb for NonTerminalDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self.inner(db) {
-            NonTerminalDefInner::Goal { rule } => {
-                write!(f, "Goal({})", rule.display(db))?;
-            }
-            NonTerminalDefInner::Named {
-                name,
-                generics,
-                span: _,
-            } => {
-                write!(f, "{}", name.display(db))?;
-                if !generics.is_empty() {
-                    f.write_str("<")?;
-                    for (i, generic) in generics.iter().enumerate() {
-                        if i != 0 {
-                            f.write_str(", ")?;
-                        }
-                        write!(f, "{}", generic.display(db))?;
-                    }
-                    f.write_str(">")?;
-                }
-            }
-            NonTerminalDefInner::Anonymous { rule } => {
-                write!(f, "{{{}}}", rule.display(db))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[salsa::interned]
-pub struct NonTerminalUse {
-    #[return_ref]
-    inner: NonTerminalUseInner,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalUseInner {
-    Goal {
-        rule: Rule,
-    },
-    Named {
-        name: Name,
-        generics: Vec<NonTerminalUse>,
+        generics: Vec<NonTerminal>,
         span: Span,
     },
     Anonymous {
         rule: Rule,
         context: Option<Name>,
-        generics: BTreeMap<Ident, NonTerminalUse>,
+        generics: BTreeMap<Ident, NonTerminal>,
     },
 }
 
-#[salsa::tracked]
-impl NonTerminalUse {
+impl NonTerminal {
     pub fn new_goal(db: &dyn Db, rule: Rule) -> Self {
-        Self::new(db, NonTerminalUseInner::Goal { rule })
+        Self::new(db, NonTerminalInner::Goal { rule })
     }
 
     pub fn new_named(db: &dyn Db, name: Name, generics: Vec<Self>, span: Span) -> Self {
         Self::new(
             db,
-            NonTerminalUseInner::Named {
+            NonTerminalInner::Named {
                 name,
                 generics,
                 span,
@@ -1298,7 +1212,7 @@ impl NonTerminalUse {
             .cloned();
         Self::new(
             db,
-            NonTerminalUseInner::Anonymous {
+            NonTerminalInner::Anonymous {
                 rule,
                 context,
                 generics,
@@ -1306,53 +1220,38 @@ impl NonTerminalUse {
         )
     }
 
-    #[salsa::tracked]
-    pub fn definition(self, db: &dyn Db, language: Language) -> NonTerminalDef {
+    pub fn is_goal(self, db: &dyn Db) -> bool {
+        matches!(self.inner(db), NonTerminalInner::Goal { .. })
+    }
+
+    pub fn ident(self, db: &dyn Db) -> Ident {
         match self.inner(db) {
-            NonTerminalUseInner::Goal { rule } => {
-                NonTerminalDef::new(db, NonTerminalDefInner::Goal { rule: rule.clone() })
-            }
-            NonTerminalUseInner::Named {
-                name,
-                generics,
-                span,
-            } => NonTerminalDef::new(
-                db,
-                NonTerminalDefInner::Named {
-                    name: name.clone(),
-                    generics: generics
-                        .iter()
-                        .map(|generic| generic.definition(db, language))
-                        .collect(),
-                    span: language
-                        .definition(db, name.ident, *span)
-                        .map_or(*span, |def| def.span),
-                },
-            ),
-            NonTerminalUseInner::Anonymous {
-                rule,
-                context: _,
+            NonTerminalInner::Goal { .. } => Ident::new(db, "goal".into()),
+            NonTerminalInner::Named {
+                name: Name { ident, .. },
                 generics: _,
-            } => NonTerminalDef::new(db, NonTerminalDefInner::Anonymous { rule: rule.clone() }),
+                span: _,
+            } => *ident,
+            NonTerminalInner::Anonymous { .. } => Ident::new(db, "anon".into()),
         }
     }
 
     pub fn span(&self, db: &dyn Db) -> Span {
         match self.inner(db) {
-            NonTerminalUseInner::Goal { rule, .. } => rule.span,
-            NonTerminalUseInner::Named { span, .. } => *span,
-            NonTerminalUseInner::Anonymous { rule, .. } => rule.span,
+            NonTerminalInner::Goal { rule, .. } => rule.span,
+            NonTerminalInner::Named { span, .. } => *span,
+            NonTerminalInner::Anonymous { rule, .. } => rule.span,
         }
     }
 }
 
-impl DisplayWithDb for NonTerminalUse {
+impl DisplayWithDb for NonTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self.inner(db) {
-            NonTerminalUseInner::Goal { rule } => {
+            NonTerminalInner::Goal { rule } => {
                 write!(f, "Goal({})", rule.display(db))?;
             }
-            NonTerminalUseInner::Named {
+            NonTerminalInner::Named {
                 name,
                 generics,
                 span: _,
@@ -1369,7 +1268,7 @@ impl DisplayWithDb for NonTerminalUse {
                     f.write_str(">")?;
                 }
             }
-            NonTerminalUseInner::Anonymous {
+            NonTerminalInner::Anonymous {
                 rule,
                 generics,
                 context,
@@ -1410,61 +1309,60 @@ impl DisplayWithDb for Name {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum TerminalUse {
-    Named {
-        ident: Ident,
-        span: Span,
-    },
-    Anonymous {
-        name: Arc<str>,
-        regex: NFA,
-        span: Span,
-    },
-    EndOfInput {
-        span: Span,
-    },
+#[derive(Clone)]
+pub enum Terminal {
+    Named { ident: Ident, span: Span },
+    Anonymous { name: Arc<str>, regex: NFA },
+    EndOfInput,
 }
 
-impl TerminalUse {
-    pub fn span(&self) -> Span {
-        match *self {
-            Self::Named { span, .. }
-            | Self::Anonymous { span, .. }
-            | Self::EndOfInput { span, .. } => span,
-        }
-    }
-
-    pub fn definition(&self, db: &dyn Db, language: Language) -> TerminalDef {
+impl Terminal {
+    pub fn name<'a>(&'a self, db: &'a dyn Db) -> &'a str {
         match self {
-            &Self::Named { ident, span } => TerminalDef::Named {
-                ident,
-                span: language
-                    .definition(db, ident, span)
-                    .map_or(span, |def| def.span),
-            },
-            Self::Anonymous { name, regex, .. } => TerminalDef::Anonymous {
-                name: name.clone(),
-                regex: regex.clone(),
-            },
-            Self::EndOfInput { .. } => TerminalDef::EndOfInput,
+            Self::Named { ident, .. } => ident.name(db),
+            Self::Anonymous { name, .. } => name,
+            Self::EndOfInput { .. } => "$",
+        }
+    }
+
+    pub fn ident(&self) -> Option<&Ident> {
+        match self {
+            Self::Named { ident, .. } => Some(ident),
+            Self::Anonymous { .. } | Self::EndOfInput { .. } => None,
         }
     }
 }
 
-impl DisplayWithDb for TerminalUse {
+impl fmt::Debug for Terminal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Named { ident, span } => f
+                .debug_struct("Named")
+                .field("ident", ident)
+                .field("span", &format_args!("{}", span))
+                .finish(),
+            Self::Anonymous { name, regex: _ } => f
+                .debug_struct("Anonymous")
+                .field("name", name)
+                .finish_non_exhaustive(),
+            Self::EndOfInput => write!(f, "EndOfInput"),
+        }
+    }
+}
+
+impl DisplayWithDb for Terminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
-            TerminalUse::Named { ident, .. } => {
+            Self::Named { ident, .. } => {
                 write!(f, "@{}", ident.display(db))
             }
-            TerminalUse::Anonymous { name, .. } => write!(f, "@'{name}'"),
-            TerminalUse::EndOfInput { .. } => write!(f, "$"),
+            Self::Anonymous { name, .. } => write!(f, "@'{name}'"),
+            Self::EndOfInput { .. } => write!(f, "$"),
         }
     }
 }
 
-impl PartialEq for TerminalUse {
+impl PartialEq for Terminal {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1481,29 +1379,25 @@ impl PartialEq for TerminalUse {
                 Self::Anonymous {
                     name: this,
                     regex: _,
-                    span: this_span,
                 },
                 Self::Anonymous {
                     name: other,
                     regex: _,
-                    span: other_span,
                 },
-            ) => {
-                // If we were being efficient we could probably only compare the spans
-                this == other && this_span == other_span
-            }
-            (Self::EndOfInput { span: this }, Self::EndOfInput { span: other }) => this == other,
+            ) => this == other,
+
+            (Self::EndOfInput, Self::EndOfInput) => true,
             _ => false,
         }
     }
 }
-impl Eq for TerminalUse {}
-impl PartialOrd for TerminalUse {
+impl Eq for Terminal {}
+impl PartialOrd for Terminal {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for TerminalUse {
+impl Ord for Terminal {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (
@@ -1520,140 +1414,13 @@ impl Ord for TerminalUse {
                 Self::Anonymous {
                     name: this,
                     regex: _,
-                    span: this_span,
-                },
-                Self::Anonymous {
-                    name: other,
-                    regex: _,
-                    span: other_span,
-                },
-            ) => {
-                // If we were being efficient we could probably only compare the spans
-                this.cmp(other).then_with(|| this_span.cmp(other_span))
-            }
-            (Self::EndOfInput { span: this }, Self::EndOfInput { span: other }) => this.cmp(other),
-            (Self::Named { .. }, _) => Ordering::Greater,
-            (_, Self::Named { .. }) => Ordering::Less,
-            (Self::Anonymous { .. }, _) => Ordering::Greater,
-            (_, Self::Anonymous { .. }) => Ordering::Less,
-        }
-    }
-}
-impl Hash for TerminalUse {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        core::mem::discriminant(self).hash(state);
-        match self {
-            Self::Named { ident, span } => {
-                ident.hash(state);
-                span.hash(state);
-            }
-            Self::Anonymous {
-                name,
-                regex: _,
-                span,
-            } => {
-                name.hash(state);
-                span.hash(state);
-            }
-            Self::EndOfInput { span } => span.hash(state),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum TerminalDef {
-    Named { ident: Ident, span: Span },
-    Anonymous { name: Arc<str>, regex: NFA },
-    EndOfInput,
-}
-
-impl TerminalDef {
-    pub fn name<'a>(&'a self, db: &'a dyn Db) -> &'a str {
-        match self {
-            Self::Named { ident, .. } => ident.name(db),
-            Self::Anonymous { name, .. } => name,
-            Self::EndOfInput => "$",
-        }
-    }
-
-    pub fn ident(&self) -> Option<&Ident> {
-        match self {
-            Self::Named { ident, .. } => Some(ident),
-            Self::Anonymous { .. } | Self::EndOfInput { .. } => None,
-        }
-    }
-}
-
-impl DisplayWithDb for TerminalDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            TerminalDef::Named { ident, .. } => {
-                write!(f, "@{}", ident.display(db))
-            }
-            TerminalDef::Anonymous { name, .. } => write!(f, "@'{name}'"),
-            TerminalDef::EndOfInput => write!(f, "$"),
-        }
-    }
-}
-impl PartialEq for TerminalDef {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Named {
-                    ident: this_name,
-                    span: this_span,
-                },
-                Self::Named {
-                    ident: other_name,
-                    span: other_span,
-                },
-            ) => this_name == other_name && this_span == other_span,
-            (
-                Self::Anonymous {
-                    name: this,
-                    regex: _,
-                },
-                Self::Anonymous {
-                    name: other,
-                    regex: _,
-                },
-            ) => this == other,
-            (Self::EndOfInput, Self::EndOfInput) => true,
-            _ => false,
-        }
-    }
-}
-impl Eq for TerminalDef {}
-impl PartialOrd for TerminalDef {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for TerminalDef {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (
-                Self::Named {
-                    ident: this_name,
-                    span: this_span,
-                },
-                Self::Named {
-                    ident: other_name,
-                    span: other_span,
-                },
-            ) => this_name
-                .cmp(other_name)
-                .then_with(|| this_span.cmp(other_span)),
-            (
-                Self::Anonymous {
-                    name: this,
-                    regex: _,
                 },
                 Self::Anonymous {
                     name: other,
                     regex: _,
                 },
             ) => this.cmp(other),
+
             (Self::EndOfInput, Self::EndOfInput) => Ordering::Equal,
             (Self::Named { .. }, _) => Ordering::Greater,
             (_, Self::Named { .. }) => Ordering::Less,
@@ -1662,7 +1429,7 @@ impl Ord for TerminalDef {
         }
     }
 }
-impl Hash for TerminalDef {
+impl Hash for Terminal {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
@@ -1701,7 +1468,7 @@ pub struct Alternative {
     pub span: Span,
     #[return_ref]
     pub terms: Vec<Term>,
-    pub negative_lookahead: Option<NonTerminalUse>,
+    pub negative_lookahead: Option<NonTerminal>,
 }
 
 impl DisplayWithDb for Alternative {
@@ -1725,15 +1492,6 @@ pub struct Term {
     pub silent: bool,
 }
 
-impl Term {
-    pub fn definition(&self, db: &dyn Db, language: Language) -> TermDef {
-        match &self.kind {
-            TermKind::Terminal(t) => TermDef::Terminal(t.definition(db, language)),
-            TermKind::NonTerminal(nt) => TermDef::NonTerminal(nt.definition(db, language)),
-        }
-    }
-}
-
 impl DisplayWithDb for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         if self.silent {
@@ -1745,34 +1503,15 @@ impl DisplayWithDb for Term {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TermKind {
-    Terminal(TerminalUse),
-    NonTerminal(NonTerminalUse),
+    Terminal(Terminal),
+    NonTerminal(NonTerminal),
 }
 
 impl DisplayWithDb for TermKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
-            TermKind::Terminal(terminal) => {
-                write!(f, "{}", terminal.display(db))
-            }
-            TermKind::NonTerminal(non_terminal) => {
-                write!(f, "{}", non_terminal.display(db))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TermDef {
-    Terminal(TerminalDef),
-    NonTerminal(NonTerminalDef),
-}
-
-impl DisplayWithDb for TermDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            Self::Terminal(t) => write!(f, "{}", t.display(db)),
-            Self::NonTerminal(nt) => write!(f, "{}", nt.display(db)),
+            Self::Terminal(terminal) => write!(f, "{}", terminal.display(db)),
+            Self::NonTerminal(non_terminal) => write!(f, "{}", non_terminal.display(db)),
         }
     }
 }

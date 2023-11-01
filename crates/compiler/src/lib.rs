@@ -18,14 +18,24 @@ pub struct Jar(
     language::Language_direct_dependencies,
     language::Test,
     lower::production,
-    lower::NonTerminalUse,
-    lower::NonTerminalUse_definition,
-    lower::NonTerminalDef,
+    lower::NonTerminal,
     lower::Production,
     lower::Alternative,
-    parse_table::can_production_be_empty,
+    parse_table::term_string::normal_production,
+    parse_table::term_string::can_production_be_empty,
     test::run_test,
+    debug_new_non_terminal,
 );
+
+#[salsa::tracked]
+pub fn debug_new_non_terminal(db: &dyn Db, ident: language::Ident) -> lower::NonTerminal {
+    lower::NonTerminal::new_named(
+        db,
+        lower::Name { ident, index: 0 },
+        Vec::new(),
+        crate::Span { start: 0, end: 0 },
+    )
+}
 
 pub trait Db: salsa::DbWithJar<Jar> {}
 

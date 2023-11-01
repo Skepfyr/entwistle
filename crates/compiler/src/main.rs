@@ -36,6 +36,32 @@ fn main() -> Result<()> {
 
     println!("--------------");
 
+    // let pattern = *language
+    //     .definitions(&db)
+    //     .keys()
+    //     .find(|ident| ident.name(&db) == "Pattern")
+    //     .unwrap();
+    // let pattern = debug_new_non_terminal(&db, pattern);
+    // let mut visited = HashSet::new();
+    // let mut to_add = VecDeque::new();
+    // to_add.push_back(NormalNonTerminal::Original(pattern));
+    // while let Some(nt) = to_add.pop_front() {
+    //     if visited.insert(nt.clone()) {
+    //         let production = normal_production(&db, language, &nt);
+    //         println!("{}:", nt.display(&db));
+    //         for alternative in production {
+    //             print!("  ");
+    //             for term in alternative {
+    //                 if let NormalTerm::NonTerminal(nt) = &term {
+    //                     to_add.push_back(nt.clone());
+    //                 }
+    //                 print!("{} ", term.display(&db));
+    //             }
+    //             println!();
+    //         }
+    //     }
+    // }
+
     // let mut non_terminals = language
     //     .definitions(&db)
     //     .iter()

@@ -15,7 +15,7 @@ use crate::{
 #[instrument(skip_all)]
 #[salsa::tracked]
 pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<ParseTree>> {
-    let parse_table = parse_table(db, language, test.goal(db).clone());
+    let parse_table = parse_table(db, language, test.goal(db).clone(), 5);
     let mut states = vec![StateId::START];
     let mut forest = vec![];
     let input = Input::new(test.test(db)).anchored(Anchored::Yes);
@@ -92,9 +92,18 @@ pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<Parse
                 offset = half_match.end();
             }
             Action::Reduce(non_terminal, alternative) => {
-                let nodes =
-                    forest.split_off(forest.len().checked_sub(alternative.terms(db).len()).unwrap());
-                states.truncate(states.len().checked_sub(alternative.terms(db).len()).unwrap());
+                let nodes = forest.split_off(
+                    forest
+                        .len()
+                        .checked_sub(alternative.terms(db).len())
+                        .unwrap(),
+                );
+                states.truncate(
+                    states
+                        .len()
+                        .checked_sub(alternative.terms(db).len())
+                        .unwrap(),
+                );
                 let ident = non_terminal.ident(db);
 
                 let nodes: Vec<_> = nodes
