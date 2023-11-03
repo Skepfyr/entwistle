@@ -24,19 +24,13 @@ pub struct TermString {
 }
 
 impl TermString {
-    pub fn new<'a>(
-        db: &'a dyn Db,
-        language: Language,
-        terms: &'a [Term],
-    ) -> impl Iterator<Item = Arc<Self>> + 'a {
-        epsilon_free_alternatives(db, language, terms).map(move |terms| {
-            Arc::new(Self {
-                non_terminal: None,
-                terms,
-                next_term: 0,
-                parent: None,
-                terminals_yielded: 0,
-            })
+    pub fn new(terms: &[Term]) -> Arc<Self> {
+        Arc::new(Self {
+            non_terminal: None,
+            terms: terms.iter().map(|term| term.kind.clone().into()).collect(),
+            next_term: 0,
+            parent: None,
+            terminals_yielded: 0,
         })
     }
 
@@ -244,93 +238,58 @@ pub fn normal_production(
                 original_production
                     .alternatives(db)
                     .iter()
-                    .flat_map(|alternative| {
-                        epsilon_free_alternatives(db, language, alternative.terms(db))
+                    .map(|alternative| {
+                        alternative
+                            .terms(db)
+                            .iter()
+                            .map(|term| term.kind.clone().into())
+                            .collect::<Vec<_>>()
                     })
-                    .filter(|terms| !terms.is_empty())
                     .collect()
             }
         }
-        NormalNonTerminal::Minus(non_terminal, symbol) => {
+        NormalNonTerminal::Minus(non_terminal, ref symbol) => {
             assert!(left_recursive(db, language, non_terminal));
-            let symbol: NormalTerm = symbol.into();
-            let mut rules = HashSet::new();
-            // 3 - Moor00 5
-            rules.extend(
-                original_production
-                    .alternatives(db)
-                    .iter()
-                    .flat_map(|alternative| {
-                        epsilon_free_alternatives(db, language, alternative.terms(db))
-                    })
-                    .filter_map(|alternative| match alternative.as_slice() {
-                        [head, tail @ ..] if *head == symbol => Some(tail.to_vec()),
-                        _ => None,
-                    }),
-            );
-            // 2 - Moor00 5
-            rules.extend(
-                proper_left_corners(db, language, non_terminal)
-                    .into_iter()
-                    .filter_map(|term| match term {
-                        TermKind::NonTerminal(nt) if left_recursive(db, language, nt) => Some(nt),
-                        _ => None,
-                    })
-                    .flat_map(|nt| {
-                        production(db, language, nt)
-                            .alternatives(db)
-                            .iter()
-                            .flat_map(|alternative| {
-                                epsilon_free_alternatives(db, language, alternative.terms(db))
+            // 2 & 3 - Moor00 5
+            // This definitely includes non_terminal as it's left recursive.
+            proper_left_corners(db, language, non_terminal)
+                .into_iter()
+                .filter_map(|term| match term {
+                    TermKind::NonTerminal(nt) if left_recursive(db, language, nt) => Some(nt),
+                    _ => None,
+                })
+                .flat_map(|nt| {
+                    production(db, language, nt)
+                        .alternatives(db)
+                        .iter()
+                        .flat_map(|alternative| {
+                            std::iter::successors(Some(alternative.terms(db).as_slice()), |terms| {
+                                match terms {
+                                    [head, tail @ ..] => {
+                                        can_be_empty(db, language, &head.kind).then_some(tail)
+                                    }
+                                    [] => None,
+                                }
                             })
-                            .filter_map(|alternative| match alternative.as_slice() {
-                                [head, tail @ ..] if *head == symbol => Some(
-                                    tail.iter()
-                                        .cloned()
-                                        .chain(std::iter::once(NormalTerm::NonTerminal(
-                                            NormalNonTerminal::Minus(
-                                                non_terminal,
-                                                TermKind::NonTerminal(nt),
-                                            ),
-                                        )))
-                                        .collect::<Vec<_>>(),
-                                ),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-            );
-            rules
+                        })
+                        .filter_map(move |alternative| match alternative {
+                            [head, tail @ ..] if head.kind == *symbol => Some(
+                                tail.iter()
+                                    .map(|term| term.kind.clone().into())
+                                    .chain((non_terminal != nt).then_some(NormalTerm::NonTerminal(
+                                        NormalNonTerminal::Minus(
+                                            non_terminal,
+                                            TermKind::NonTerminal(nt),
+                                        ),
+                                    )))
+                                    .collect::<Vec<_>>(),
+                            ),
+                            _ => None,
+                        })
+                })
+                .collect()
         }
     }
-}
-
-fn epsilon_free_alternatives<'a>(
-    db: &'a dyn Db,
-    language: Language,
-    terms: &'a [Term],
-) -> impl Iterator<Item = Vec<NormalTerm>> + 'a {
-    let mut num_empties = 0;
-    let can_be_empty: Vec<_> = terms
-        .iter()
-        .scan(0, |state, term| {
-            if can_be_empty(db, language, &term.kind) {
-                *state += 1;
-                num_empties = *state;
-                Some(*state)
-            } else {
-                Some(0u32)
-            }
-        })
-        .collect();
-    (0..1 << num_empties).map(move |removals| {
-        terms
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| can_be_empty[*i] == 0 || removals & (1 << (can_be_empty[*i] - 1)) == 0)
-            .map(|(_, term)| term.kind.clone().into())
-            .collect::<Vec<_>>()
-    })
 }
 
 fn left_recursive(db: &dyn Db, language: Language, non_terminal: NonTerminal) -> bool {

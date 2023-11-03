@@ -8,6 +8,7 @@ use std::{
 };
 
 use indenter::indented;
+use itertools::Itertools;
 use regex_automata::{
     nfa::thompson::{
         Builder as NfaBuilder, DenseTransitions, SparseTransitions, State as NfaState, Transition,
@@ -277,8 +278,8 @@ pub struct Lr0State {
 impl DisplayWithDb for Lr0State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         writeln!(f, "Items:")?;
-        for (item, _backlinks) in &self.item_set {
-            write!(f, "    {} ->", item.non_terminal.display(db))?;
+        for (i, (item, _backlinks)) in self.item_set.iter().enumerate() {
+            write!(f, "    {i}: {} ->", item.non_terminal.display(db))?;
             for term in &item.alternative.terms(db)[..item.index] {
                 write!(f, " {}", term.display(db))?;
             }
@@ -442,7 +443,12 @@ fn closure(
     state
 }
 
-pub fn parse_table(db: &dyn Db, language: Language, goal: Rule, max_lookahead: usize) -> LrkParseTable {
+pub fn parse_table(
+    db: &dyn Db,
+    language: Language,
+    goal: Rule,
+    max_lookahead: usize,
+) -> LrkParseTable {
     let lr0_parse_table = lr0_parse_table(db, language, goal);
     debug!(lr0_parse_table = %lr0_parse_table.display(db), "Generated LR(0) parse table");
     build_lrk_parse_table(db, language, max_lookahead, lr0_parse_table)
@@ -479,7 +485,14 @@ fn build_lrk_parse_table(
         // it returns, so at worst it will convert the entire graph into a
         // tree and then exit.
         let action = loop {
-            let span = debug_span!("make_action", state = lr0_state_id);
+            let span = debug_span!(
+                "make_action",
+                state = lr0_state_id,
+                conflicts = conflicts
+                    .keys()
+                    .map(|conflict| conflict.display(db))
+                    .join(", ")
+            );
             let _enter = span.enter();
             debug!("Making top-level action");
             let make_action = make_action(
@@ -519,7 +532,14 @@ fn build_lrk_parse_table(
         // it returns, so at worst it will convert the entire graph into a
         // tree and then exit.
         let action = loop {
-            let span = debug_span!("make_action", state = lr0_state_id);
+            let span = debug_span!(
+                "make_action",
+                state = lr0_state_id,
+                conflicts = conflicts
+                    .keys()
+                    .map(|conflict| conflict.display(db))
+                    .join(", ")
+            );
             let _enter = span.enter();
             debug!("Making top-level action");
             let make_action = make_action(
@@ -791,7 +811,7 @@ fn make_action(
         for ambiguity in potential_ambiguities {
             let string_for_conflict = |conflict: &ConflictedAction| match conflict {
                 ConflictedAction::Shift(t, s) => format!(
-                    "could continue  to state {} and read this {}",
+                    "could continue to state {} and read this {}",
                     s,
                     t.display(db)
                 ),
@@ -831,7 +851,9 @@ fn make_action(
                     for start in 0.. {
                         let mut count = 0;
                         let mut history = ambiguity.term_string.self_and_parents().skip(start);
-                        let Some(nt) = history.next().and_then(|first| first.non_terminal()) else { break };
+                        let Some(nt) = history.next().and_then(|first| first.non_terminal()) else {
+                            break;
+                        };
                         for ts in history {
                             count += ts.terminals_yielded();
                             if count > 0 && ts.non_terminal() == Some(nt) {
@@ -892,7 +914,11 @@ fn make_action(
             );
             return Some(arbitrary_resolution);
         };
-        let tracing_span = debug_span!("make_action", terminal = %terminal.display(db));
+        let tracing_span = debug_span!(
+            "make_action",
+            terminal = %terminal.display(db),
+            conflicts = conflicts.keys().map(|conflict| conflict.display(db)).join(", ")
+        );
         let _guard = tracing_span.enter();
         let action = make_action(
             db,
@@ -1131,20 +1157,16 @@ fn item_lane_heads(
             };
             trace!(%back_ref, "Walking parse table");
             let item = &lr0_parse_table[back_ref].0;
-            ambiguities.extend(
-                TermString::new(db, language, &item.alternative.terms(db)[item.index + 1..]).map(
-                    |term_string| Ambiguity {
-                        location: back_ref,
-                        transition: transition.clone(),
-                        history: {
-                            let mut history = ambiguity.history.clone();
-                            history.0.push((back_ref, 0));
-                            history
-                        },
-                        term_string,
-                    },
-                ),
-            );
+            ambiguities.push(Ambiguity {
+                location: back_ref,
+                transition: transition.clone(),
+                history: {
+                    let mut history = ambiguity.history.clone();
+                    history.0.push((back_ref, 0));
+                    history
+                },
+                term_string: TermString::new(&item.alternative.terms(db)[item.index + 1..]),
+            });
         }
     }
     ret
@@ -1212,15 +1234,10 @@ fn conflicts(
                 None => {
                     let remaining_negative_lookahead: Vec<_> =
                         match item.alternative.negative_lookahead(db) {
-                            Some(negative_lookahead) => TermString::new(
-                                db,
-                                language,
-                                &[Term {
-                                    kind: TermKind::NonTerminal(negative_lookahead),
-                                    silent: false,
-                                }],
-                            )
-                            .collect(),
+                            Some(negative_lookahead) => vec![TermString::new(&[Term {
+                                kind: TermKind::NonTerminal(negative_lookahead),
+                                silent: false,
+                            }])],
                             None => Vec::new(),
                         };
 
@@ -1241,14 +1258,12 @@ fn conflicts(
             };
             Some((
                 conflict,
-                TermString::new(db, language, &item.alternative.terms(db)[item.index..])
-                    .map(|term_string| Ambiguity {
-                        location,
-                        transition: None,
-                        history: History(vec![(location, 0)]),
-                        term_string,
-                    })
-                    .collect(),
+                vec![Ambiguity {
+                    location,
+                    transition: None,
+                    history: History(vec![(location, 0)]),
+                    term_string: TermString::new(&item.alternative.terms(db)[item.index..]),
+                }],
             ))
         })
         .collect();
