@@ -580,7 +580,7 @@ PatternWithoutRange:
   StructPattern
   TupleStructPattern
   TuplePattern
-  '(' Pattern ')'
+  '(' _ Pattern _ ')'
   '[' _ (CommaSeparated<Pattern> _)? ']'
   PathExpression
   MacroInvocation

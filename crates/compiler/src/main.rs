@@ -36,6 +36,23 @@ fn main() -> Result<()> {
 
     println!("--------------");
 
+    // let pattern_ident = *language
+    //     .definitions(&db)
+    //     .keys()
+    //     .find(|ident| ident.name(&db) == "PatternNoTopAlt")
+    //     .unwrap();
+    // let pattern = debug_new_non_terminal(&db, pattern_ident);
+    // let term_string = TermString::new(&[Term {
+    //     kind: TermKind::NonTerminal(pattern),
+    //     silent: false,
+    // }]);
+    // for (terminal, next) in term_string.next(&db, language) {
+    //     match terminal {
+    //         Some(terminal) => println!("{}: {}", terminal.display(&db), next.display(&db)),
+    //         None => println!("None: {}", next.display(&db)),
+    //     }
+    // }
+
     // let pattern = *language
     //     .definitions(&db)
     //     .keys()

@@ -4,8 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use itertools::Itertools;
 use salsa::Cycle;
-use tracing::{instrument, trace, trace_span};
+use tracing::{debug, instrument, trace, trace_span};
 
 use crate::{
     language::Language,
@@ -17,10 +18,11 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TermString {
     non_terminal: Option<NormalNonTerminal>,
-    terms: Vec<NormalTerm>,
+    terms: Arc<[NormalTerm]>,
     next_term: usize,
     parent: Option<Arc<TermString>>,
     terminals_yielded: u32,
+    non_empty: bool,
 }
 
 impl TermString {
@@ -31,6 +33,7 @@ impl TermString {
             next_term: 0,
             parent: None,
             terminals_yielded: 0,
+            non_empty: false,
         })
     }
 
@@ -114,33 +117,53 @@ impl<'a> Iterator for Iter<'a> {
                 match term {
                     NormalTerm::Terminal(terminal) => {
                         new.terminals_yielded += 1;
-                        //trace!(terminal = %terminal.display(self.db), "Found terminal");
+                        trace!(terminal = %terminal.display(self.db), "Found terminal");
                         return Some((Some(terminal), term_string));
                     }
                     NormalTerm::NonTerminal(non_terminal) => {
-                        //trace!(non_terminal = %non_terminal.display(self.db), "Walking down into non-terminal");
+                        trace!(non_terminal = %non_terminal.display(self.db), "Walking down into non-terminal");
                         self.stack.extend(
                             normal_production(self.db, self.grammar, non_terminal.clone())
                                 .iter()
                                 .map(|terms| {
                                     Arc::new(TermString {
                                         non_terminal: Some(non_terminal.clone()),
-                                        terms: terms.clone(),
+                                        terms: terms.as_slice().into(),
                                         next_term: 0,
                                         parent: Some(term_string.clone()),
                                         terminals_yielded: 0,
+                                        non_empty: false,
                                     })
                                 }),
                         )
                     }
+                    NormalTerm::NonEmpty(terms) => {
+                        trace!("Walking down into non-empty");
+                        self.stack.push(Arc::new(TermString {
+                            non_terminal: term_string.non_terminal.clone(),
+                            terms: terms.clone(),
+                            next_term: 0,
+                            parent: Some(term_string),
+                            terminals_yielded: 0,
+                            non_empty: true,
+                        }));
+                    }
                 }
             } else if let Some(mut parent) = term_string.parent.as_ref().cloned() {
-                //trace!("Walking up to parent");
-                Arc::make_mut(&mut parent).terminals_yielded += term_string.terminals_yielded;
-                self.stack.push(parent);
+                if term_string.non_empty && term_string.terminals_yielded == 0 {
+                    trace!("Dropping non-empty term string that yielded nothing");
+                } else {
+                    trace!("Walking up to parent");
+                    Arc::make_mut(&mut parent).terminals_yielded += term_string.terminals_yielded;
+                    self.stack.push(parent);
+                }
             } else {
-                //trace!("Reached end of term string");
-                return Some((None, term_string));
+                trace!("Reached end of term string");
+                if term_string.non_empty && term_string.terminals_yielded == 0 {
+                    trace!("Dropping non-empty term string that yielded nothing");
+                } else {
+                    return Some((None, term_string));
+                }
             }
         }
         None
@@ -184,6 +207,7 @@ impl NormalNonTerminal {
 pub enum NormalTerm {
     Terminal(Terminal),
     NonTerminal(NormalNonTerminal),
+    NonEmpty(Arc<[NormalTerm]>),
 }
 
 impl DisplayWithDb for NormalTerm {
@@ -194,6 +218,20 @@ impl DisplayWithDb for NormalTerm {
             }
             NormalTerm::NonTerminal(non_terminal) => {
                 write!(f, "{}", non_terminal.display(db))
+            }
+            NormalTerm::NonEmpty(terms) => {
+                if terms.len() == 1 {
+                    write!(f, "{}\\ε", terms[0].display(db))
+                } else {
+                    f.write_char('(')?;
+                    for (i, term) in terms.iter().enumerate() {
+                        if i != 0 {
+                            f.write_char(' ')?;
+                        }
+                        write!(f, "{}", term.display(db))?;
+                    }
+                    f.write_str(")\\ε")
+                }
             }
         }
     }
@@ -208,6 +246,33 @@ impl From<TermKind> for NormalTerm {
     }
 }
 
+/// This is roughly based on "Removing LEft Recursion from Context-Free Grammars" by Robert C. Moore, 2000.
+///
+/// I've adjusted the rules of the LC_LR process to be more efficient and cope with empty productions and cycles,
+/// and make more sense for producing the grammar on demand like this function does.
+///
+/// Unfortunately, these changes mean that it doesn't actually produce a normal grammar, because it now contains
+/// elements of the form `β\ε` where `ℒ(β\ε) = ℒ(β)\{ε}`. This is fine for our purposes because [`TermString`]
+/// understands, but it's not a normal grammar.
+///
+/// The precise rules implemented are:
+/// ```math
+/// ℙ is our initial set of productions
+/// ℙ' is the normalised set of productions
+/// 𝕋 is the set of terminals in ℙ
+/// ℕ is the set of non-terminals in ℙ
+/// ℝ is the set of left recursive non-terminals in ℙ (ℝ ⊆ ℕ)
+/// ℂ(X) is the set of proper left corners of X (ℂ(X) ⊆ 𝕋∪ℕ)
+///
+/// 1. ∀A ∈ ℕ\ℝ, A → α ∈ ℙ ⇒ A → α ∈ ℙ'
+/// 2. ∀A ∈ ℝ, ∀X ∈ ℂ(A)\ℝ ⇒ A → X\ε A-X ∈ ℙ'
+///    TODO: this rule could be improved by restricting X to the set of direct left corners of left recursive left
+///          corners because no rules (importantly 4) generate productions for A-X where X is a left corner of a
+///          non-left recursive non-terminal.
+/// 3. ∀A ∈ ℝ, ε ∈ ℒ(A) ⇒ A → ε ∈ ℙ'
+/// 4. ∀A ∈ ℝ, ∀B ∈ ℝ∩ℂ(A), B → ν X β ∈ ℙ, ε ∈ ℒ(ν) ⇒ A-X → β\ε A-B ∈ ℙ'
+/// 5. ∀A ∈ ℝ, A-A → ε ∈ ℙ'
+/// ```
 #[instrument(skip_all, fields(non_terminal = %non_terminal.display(db)))]
 #[salsa::tracked(return_ref)]
 pub fn normal_production(
@@ -220,21 +285,24 @@ pub fn normal_production(
     match non_terminal {
         NormalNonTerminal::Original(non_terminal) => {
             if left_recursive(db, language, non_terminal) {
-                // 1 - Moor00 5
+                // 2 & 3
                 proper_left_corners(db, language, non_terminal)
-                    .into_iter()
-                    .filter(|term| {
+                    .iter()
+                    .filter(|&term| {
                         !matches!(term, TermKind::NonTerminal(nt) if left_recursive(db, language, *nt))
                     })
+                    .cloned()
                     .map(|term| {
                         vec![
-                            term.clone().into(),
+                            NormalTerm::NonEmpty([term.clone().into()].into()),
                             NormalTerm::NonTerminal(NormalNonTerminal::Minus(non_terminal, term)),
                         ]
                     })
+                    // 3
+                    .chain(can_be_empty(db, language, &TermKind::NonTerminal(non_terminal)).then_some(vec![]))
                     .collect()
             } else {
-                // 4 - Moor00 5
+                // 1
                 original_production
                     .alternatives(db)
                     .iter()
@@ -250,10 +318,10 @@ pub fn normal_production(
         }
         NormalNonTerminal::Minus(non_terminal, ref symbol) => {
             assert!(left_recursive(db, language, non_terminal));
-            // 2 & 3 - Moor00 5
-            // This definitely includes non_terminal as it's left recursive.
+            // 4 & 5
             proper_left_corners(db, language, non_terminal)
-                .into_iter()
+                .iter()
+                .cloned()
                 .filter_map(|term| match term {
                     TermKind::NonTerminal(nt) if left_recursive(db, language, nt) => Some(nt),
                     _ => None,
@@ -273,20 +341,23 @@ pub fn normal_production(
                             })
                         })
                         .filter_map(move |alternative| match alternative {
-                            [head, tail @ ..] if head.kind == *symbol => Some(
-                                tail.iter()
-                                    .map(|term| term.kind.clone().into())
-                                    .chain((non_terminal != nt).then_some(NormalTerm::NonTerminal(
-                                        NormalNonTerminal::Minus(
-                                            non_terminal,
-                                            TermKind::NonTerminal(nt),
-                                        ),
-                                    )))
-                                    .collect::<Vec<_>>(),
-                            ),
+                            [head, tail @ ..] if head.kind == *symbol => Some(vec![
+                                NormalTerm::NonEmpty(
+                                    tail.iter()
+                                        .map(|term| term.kind.clone().into())
+                                        .collect::<Vec<_>>()
+                                        .into(),
+                                ),
+                                NormalTerm::NonTerminal(NormalNonTerminal::Minus(
+                                    non_terminal,
+                                    TermKind::NonTerminal(nt),
+                                )),
+                            ]),
                             _ => None,
                         })
                 })
+                // 5
+                .chain((TermKind::NonTerminal(non_terminal) == *symbol).then_some(Vec::new()))
                 .collect()
         }
     }
@@ -296,7 +367,8 @@ fn left_recursive(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
     proper_left_corners(db, language, non_terminal).contains(&TermKind::NonTerminal(non_terminal))
 }
 
-fn proper_left_corners(
+#[salsa::tracked(return_ref)]
+pub(crate) fn proper_left_corners(
     db: &dyn Db,
     language: Language,
     non_terminal: NonTerminal,
@@ -322,9 +394,9 @@ fn proper_left_corners(
         }
     }
 
-    trace!(
+    debug!(
         non_terminal = %non_terminal.display(db),
-        left_corners = %left_corners.iter().map(|term| format!("{} ", term.display(db))).collect::<String>(),
+        left_corners = %left_corners.iter().map(|term| term.display(db)).format(" "),
         "Computed proper left corners"
     );
     left_corners
