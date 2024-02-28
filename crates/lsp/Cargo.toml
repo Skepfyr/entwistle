@@ -5,7 +5,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
-crossbeam-channel = "0.5.1"
+crossbeam-channel = "0.5.11"
 lsp-server = "0.7"
 lsp-types = "0.94"
 serde = "1"

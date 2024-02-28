@@ -21,9 +21,7 @@ pub struct Jar(
     lower::NonTerminal,
     lower::Production,
     lower::Alternative,
-    parse_table::term_string::normal_production,
-    parse_table::term_string::proper_left_corners,
-    parse_table::term_string::can_production_be_empty,
+    parse_table::lr0_parse_table,
     test::run_test,
     debug_new_non_terminal,
 );

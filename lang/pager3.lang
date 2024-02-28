@@ -7,3 +7,35 @@ U: 'a' Y Z
 Z: 'a' Q | P | ()
 P: 'b' U
 Q: 'c' | ()
+
+= G
+ebaebaeaeaa
+=
+G:
+  G:
+    G:
+      "e"
+      W:
+        P:
+          "b"
+          U:
+            "a"
+            Y:
+              X:
+                "e"
+            Z:
+              P:
+                "b"
+                U:
+                  "a"
+                  Y:
+                    X:
+                      "e"
+                  Z:
+                    "a"
+                    Q:
+      "e"
+    "a"
+  "a"
+
+=

@@ -2,3 +2,18 @@ S: A C 'a' | B C 'b'
 A: 's'
 B: 's'
 C: 'c' | 'c' C
+
+= S
+scccb
+=
+S:
+  B:
+    "s"
+  C:
+    "c"
+    C:
+      "c"
+      C:
+        "c"
+  "b"
+=

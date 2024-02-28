@@ -3,3 +3,14 @@ C: 'a' A | 'b' B
 D: 'a' B | 'b' A
 A: 'c'
 B: 'c'
+
+= S
+bcb
+=
+S:
+  D:
+    'b'
+    A:
+      'c'
+  "b"
+=

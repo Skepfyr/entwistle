@@ -52,6 +52,9 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
                 None,
             )],
         ),
+        NonTerminalInner::Internal { alternative } => {
+            Production::new(db, vec![alternative.clone()])
+        }
         NonTerminalInner::Named {
             name,
             generics: generic_parameters,
@@ -1158,6 +1161,10 @@ pub enum NonTerminalInner {
     Goal {
         rule: Rule,
     },
+    /// Used by [`TermString`](crate::parse_table::term_string::TermString)
+    Internal {
+        alternative: Alternative,
+    },
     Named {
         name: Name,
         generics: Vec<NonTerminal>,
@@ -1173,6 +1180,10 @@ pub enum NonTerminalInner {
 impl NonTerminal {
     pub fn new_goal(db: &dyn Db, rule: Rule) -> Self {
         Self::new(db, NonTerminalInner::Goal { rule })
+    }
+
+    pub fn new_internal(db: &dyn Db, alternative: Alternative) -> Self {
+        Self::new(db, NonTerminalInner::Internal { alternative })
     }
 
     pub fn new_named(db: &dyn Db, name: Name, generics: Vec<Self>, span: Span) -> Self {
@@ -1224,9 +1235,14 @@ impl NonTerminal {
         matches!(self.inner(db), NonTerminalInner::Goal { .. })
     }
 
+    pub fn is_internal(self, db: &dyn Db) -> bool {
+        matches!(self.inner(db), NonTerminalInner::Internal { .. })
+    }
+
     pub fn ident(self, db: &dyn Db) -> Ident {
         match self.inner(db) {
             NonTerminalInner::Goal { .. } => Ident::new(db, "goal".into()),
+            NonTerminalInner::Internal { .. } => Ident::new(db, "internal".into()),
             NonTerminalInner::Named {
                 name: Name { ident, .. },
                 generics: _,
@@ -1239,6 +1255,7 @@ impl NonTerminal {
     pub fn span(&self, db: &dyn Db) -> Span {
         match self.inner(db) {
             NonTerminalInner::Goal { rule, .. } => rule.span,
+            NonTerminalInner::Internal { alternative } => alternative.span(db),
             NonTerminalInner::Named { span, .. } => *span,
             NonTerminalInner::Anonymous { rule, .. } => rule.span,
         }
@@ -1250,6 +1267,9 @@ impl DisplayWithDb for NonTerminal {
         match self.inner(db) {
             NonTerminalInner::Goal { rule } => {
                 write!(f, "Goal({})", rule.display(db))?;
+            }
+            NonTerminalInner::Internal { alternative } => {
+                write!(f, "Internal({})", alternative.display(db))?;
             }
             NonTerminalInner::Named {
                 name,

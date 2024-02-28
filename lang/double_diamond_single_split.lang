@@ -5,3 +5,17 @@ P: 'a' A | 'b' A
 Q: 'a' B | 'b' B
 A: 'c'
 B: 'c'
+
+= S
+acbca
+=
+S:
+  "a"
+  I:
+    "c"
+    P:
+      "b"
+      A:
+        "c"
+  "a"
+=

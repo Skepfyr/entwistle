@@ -2,7 +2,13 @@ Number: Loop
 Loop: '0' | '0' Loop
 
 == Number
-0
+000
 ==
-Number: "0"
+Number:
+  Loop:
+    "0"
+    Loop:
+      "0"
+      Loop:
+        "0"
 ==

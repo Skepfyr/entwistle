@@ -10,9 +10,11 @@ a = b
 ==
 Statement:
   Ident: "a"
-  " "
+  _:
+    " "
   "="
-  " "
+  _:
+    " "
   Expression:
     Ident: "b"
 ==
@@ -23,7 +25,7 @@ Expression:
   ('+' | '-') Expression
   Expression '!'
   '(' _ $Expression _ ')'
-  Ident '(' CommaSeparated<$Expression> ')'
+  Ident _ '(' _ CommaSeparated<$Expression> _ ')'
   Number
   Ident
 
@@ -34,20 +36,26 @@ Expression:
   Expression:
     Expression:
       Number: "1"
-    " "
+    _:
+      " "
     "+"
-    " "
+    _:
+      " "
     Expression:
       Expression:
         Number: "2"
-      " "
+      _:
+        " "
       "*"
-      " "
+      _:
+        " "
       Expression:
         Number: "3"
-  " "
+  _:
+    " "
   "+"
-  " "
+  _:
+    " "
   Expression:
     "-"
     Expression:
@@ -59,14 +67,18 @@ log(a, 10)
 ==
 Expression:
   Ident: "log"
+  _:
   "("
+  _:
   Expression:
     Ident: "a"
-  ""
+  _:
   ","
-  " "
+  _:
+    " "
   Expression:
     Number: "10"
+  _:
   ")"
 ==
 
@@ -81,5 +93,6 @@ Expression:
 Number: "3.14159265"
 ==
 
--@_: /\s+/?
+_: whitespace?
+-@whitespace: /\s+/
 -@nl: '\n'

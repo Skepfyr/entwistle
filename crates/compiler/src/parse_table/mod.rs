@@ -236,7 +236,7 @@ pub fn first_set(
         )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lr0ParseTable {
     pub goal: NonTerminal,
     pub states: Vec<Lr0State>,
@@ -268,11 +268,11 @@ impl Index<ItemIndex> for Lr0ParseTable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lr0State {
     pub item_set: Vec<(Item, BTreeSet<ItemIndex>)>,
-    pub actions: HashMap<Terminal, Lr0StateId>,
-    pub goto: HashMap<NonTerminal, Lr0StateId>,
+    pub actions: BTreeMap<Terminal, Lr0StateId>,
+    pub goto: BTreeMap<NonTerminal, Lr0StateId>,
 }
 
 impl DisplayWithDb for Lr0State {
@@ -308,11 +308,11 @@ pub struct ItemSet {
     items: Vec<(Item, BTreeSet<ItemIndex>)>,
 }
 
-pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: Rule) -> Lr0ParseTable {
+#[salsa::tracked]
+pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Arc<Lr0ParseTable> {
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
-    let goal = NonTerminal::new_goal(db, goal);
     let mut root_item_set = BTreeSet::new();
     for alternative in production(db, language, goal).alternatives(db) {
         // There should only be one but doesn't hurt to add them "all"
@@ -375,7 +375,7 @@ pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: Rule) -> Lr0ParseT
         state_id += 1;
     }
 
-    Lr0ParseTable { goal, states }
+    Arc::new(Lr0ParseTable { goal, states })
 }
 
 fn add_state(
@@ -387,8 +387,8 @@ fn add_state(
     let new_id = Lr0StateId(states.len());
     states.push(Lr0State {
         item_set: closure(db, language, state, new_id),
-        actions: HashMap::new(),
-        goto: HashMap::new(),
+        actions: Default::default(),
+        goto: Default::default(),
     });
     new_id
 }
@@ -449,7 +449,8 @@ pub fn parse_table(
     goal: Rule,
     max_lookahead: usize,
 ) -> LrkParseTable {
-    let lr0_parse_table = lr0_parse_table(db, language, goal);
+    let goal = NonTerminal::new_goal(db, goal);
+    let lr0_parse_table = Lr0ParseTable::clone(&lr0_parse_table(db, language, goal));
     debug!(lr0_parse_table = %lr0_parse_table.display(db), "Generated LR(0) parse table");
     build_lrk_parse_table(db, language, max_lookahead, lr0_parse_table)
 }
@@ -616,30 +617,21 @@ fn make_action(
         let mut pending = ambiguities.into_iter().collect::<Vec<_>>();
         let mut ambiguities: HashMap<
             Ambiguity,
-            (
-                HashMap<Option<Terminal>, Vec<Arc<TermString>>>,
-                Arc<History>,
-            ),
+            (bool, HashMap<Terminal, HashSet<TermString>>, Arc<History>),
         > = HashMap::new();
         let mut lane_members = HashMap::new();
         while let Some((ambiguity, history)) = pending.pop() {
-            let (derivative, existing_history) = ambiguities
+            let (can_be_empty, _, existing_history) = ambiguities
                 .entry(ambiguity.clone())
                 .or_insert_with_key(|ambiguity| {
-                    let derivative: HashMap<_, Vec<_>> = ambiguity
-                        .term_string
-                        .clone()
-                        .next(db, language)
-                        .fold(HashMap::new(), |mut derivative, (t, ts)| {
-                            derivative.entry(t).or_default().push(ts);
-                            derivative
-                        });
-                    (derivative, History::new(ambiguity.location))
+                    let (can_be_empty, derivative) = ambiguity.term_string.next(db);
+                    (can_be_empty, derivative, History::new(ambiguity.location))
                 });
-            if derivative.contains_key(&None) {
+            if *can_be_empty {
                 // term_string is empty, so we must now walk the parse table.
                 potential_ambiguities.extend(item_lane_heads(
                     db,
+                    language,
                     lr0_parse_table,
                     action.clone(),
                     ambiguity.clone(),
@@ -652,11 +644,10 @@ fn make_action(
             Arc::make_mut(existing_history).merge(&history);
         }
         visited.extend(lane_members.into_keys().map(|(idx, _)| idx.state_id));
-        for (ambiguity, (derivative, history)) in ambiguities {
+        for (ambiguity, (_, derivative, history)) in ambiguities {
             for (terminal, term_strings) in derivative {
-                let Some(terminal) = terminal else { break };
-                let new_action = action.with_lookahead(db, language, terminal.clone());
-                if new_action.contains_finished_lookahead(db, language) {
+                let new_action = action.with_lookahead(db, terminal.clone());
+                if new_action.contains_finished_lookahead(db) {
                     trace!("Dropping ambiguity because negative lookahead matched");
                     continue;
                 }
@@ -671,6 +662,9 @@ fn make_action(
                             .entry(Ambiguity {
                                 term_string,
                                 ..ambiguity.clone()
+                            })
+                            .and_modify(|_| {
+                                panic!("Merging histories! This might not be hittable...")
                             })
                             .or_insert_with(|| History::new(ambiguity.location)),
                     );
@@ -720,7 +714,37 @@ fn make_action(
         }
         splitting_occurred = true;
         debug!(splits = splits.len(), ?state, "Splitting states");
-        let mut marks: HashMap<Lr0StateId, Vec<usize>> = HashMap::new();
+        trace!(splits = %SplitDisplay(&splits).display(db), "Split info");
+        struct SplitDisplay<'a>(
+            &'a [(HashSet<TermKind>, HashMap<usize, HashSet<ConflictedAction>>)],
+        );
+        impl<'a> DisplayWithDb for SplitDisplay<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+                for (terms, item_actions) in self.0 {
+                    f.write_char('{')?;
+                    for (i, term) in terms.iter().enumerate() {
+                        if i != 0 {
+                            f.write_char(',')?;
+                        }
+                        write!(f, "{}", term.display(db))?;
+                    }
+                    writeln!(f, "}}:")?;
+                    for (item, actions) in item_actions {
+                        write!(f, "  {}: ", item)?;
+                        for (j, action) in actions.iter().enumerate() {
+                            if j != 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", action.display(db))?;
+                        }
+                        writeln!(f)?;
+                    }
+                }
+
+                Ok(())
+            }
+        }
+        let mut marks: HashMap<Lr0StateId, HashSet<usize>> = HashMap::new();
         fn visit(
             parse_table: &Lr0ParseTable,
             visitable: &HashSet<Lr0StateId>,
@@ -750,12 +774,14 @@ fn make_action(
             for next in terms {
                 let next_state = match &next {
                     TermKind::Terminal(t) => lr0_parse_table[state].actions[t],
-                    TermKind::NonTerminal(nt) => lr0_parse_table[state].goto[&nt],
+                    TermKind::NonTerminal(nt) => lr0_parse_table[state].goto[nt],
                 };
                 visit(
                     lr0_parse_table,
                     &visited,
-                    &mut |id| marks.entry(id).or_default().push(mark),
+                    &mut |id| {
+                        marks.entry(id).or_default().insert(mark);
+                    },
                     next_state,
                 );
             }
@@ -875,22 +901,9 @@ fn make_action(
             HashMap::<_, HashSet<_>>::new(),
             |mut common_loops, (action, ambiguities)| {
                 for (ambiguity, history) in ambiguities {
-                    // We need to check for loops anywhere in the term string history,
-                    // due to the tree shape. This is intentionally quadratic as it's
-                    // easy and probably faster than the set based version.
-                    for start in 0.. {
-                        let mut count = 0;
-                        let mut history = ambiguity.term_string.self_and_parents().skip(start);
-                        let Some(nt) = history.next().and_then(|first| first.non_terminal()) else {
-                            break;
-                        };
-                        for ts in history {
-                            count += ts.terminals_yielded();
-                            if count > 0 && ts.non_terminal() == Some(nt) {
-                                common_loops.entry(count).or_default().insert(action);
-                            }
-                        }
-                    }
+                    ambiguity.term_string.loop_lengths(|loop_length| {
+                        common_loops.entry(loop_length).or_default().insert(action);
+                    });
                     // Reset count to 0 because we don't know how far through the state we are,
                     // the loop length is from the start of the last time we saw this item to
                     // the *start* of this item.
@@ -1096,6 +1109,7 @@ fn make_action(
 
 fn item_lane_heads(
     db: &dyn Db,
+    language: Language,
     lr0_parse_table: &Lr0ParseTable,
     action: ConflictedAction,
     ambiguity: Ambiguity,
@@ -1151,7 +1165,7 @@ fn item_lane_heads(
     }
 
     if item.index != 0 {
-        for item_index in back_refs.clone() {
+        for &item_index in back_refs {
             let transition = if item_index.state_id == ambiguity.location.state_id {
                 ambiguity.transition.clone()
             } else {
@@ -1163,6 +1177,7 @@ fn item_lane_heads(
             };
             ret.extend(item_lane_heads(
                 db,
+                language,
                 lr0_parse_table,
                 action.clone(),
                 Ambiguity {
@@ -1195,7 +1210,11 @@ fn item_lane_heads(
                 Ambiguity {
                     location: back_ref,
                     transition: transition.clone(),
-                    term_string: TermString::new(&item.alternative.terms(db)[item.index + 1..]),
+                    term_string: TermString::new(
+                        db,
+                        language,
+                        item.alternative.terms(db)[item.index + 1..].to_vec(),
+                    ),
                 },
                 new_history,
             ));
@@ -1266,10 +1285,14 @@ fn conflicts(
                 None => {
                     let remaining_negative_lookahead: Vec<_> =
                         match item.alternative.negative_lookahead(db) {
-                            Some(negative_lookahead) => vec![TermString::new(&[Term {
-                                kind: TermKind::NonTerminal(negative_lookahead),
-                                silent: false,
-                            }])],
+                            Some(negative_lookahead) => vec![TermString::new(
+                                db,
+                                language,
+                                vec![Term {
+                                    kind: TermKind::NonTerminal(negative_lookahead),
+                                    silent: false,
+                                }],
+                            )],
                             None => Vec::new(),
                         };
 
@@ -1280,7 +1303,7 @@ fn conflicts(
                     )
                 }
             };
-            if conflict.contains_finished_lookahead(db, language) {
+            if conflict.contains_finished_lookahead(db) {
                 // If negative lookahead is finished then this action doesn't exist.
                 return None;
             }
@@ -1293,7 +1316,11 @@ fn conflicts(
                 Ambiguity {
                     location,
                     transition: None,
-                    term_string: TermString::new(&item.alternative.terms(db)[item.index..]),
+                    term_string: TermString::new(
+                        db,
+                        language,
+                        item.alternative.terms(db)[item.index..].to_vec(),
+                    ),
                 },
                 History::new(location),
             );
@@ -1306,27 +1333,17 @@ fn conflicts(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictedAction {
     Shift(Terminal, StateId),
-    Reduce(NonTerminal, Alternative, Vec<Arc<TermString>>),
+    Reduce(NonTerminal, Alternative, Vec<TermString>),
 }
 
 impl ConflictedAction {
-    fn with_lookahead(
-        &self,
-        db: &dyn Db,
-        language: Language,
-        terminal: Terminal,
-    ) -> ConflictedAction {
+    fn with_lookahead(&self, db: &dyn Db, terminal: Terminal) -> ConflictedAction {
         match self {
             ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
                 let new_negative_lookahead = remaining_negative_lookahead
                     .iter()
-                    .flat_map(|term_string| term_string.clone().next(db, language))
-                    .filter(|(t, _)| {
-                        // Cannot be None because the action should have already
-                        // been removed in that case
-                        t.as_ref().unwrap() == &terminal
-                    })
-                    .map(|(_, term_string)| term_string)
+                    .filter_map(|term_string| term_string.clone().next(db).1.remove(&terminal))
+                    .flatten()
                     .collect();
                 ConflictedAction::Reduce(*non_terminal, *alternative, new_negative_lookahead)
             }
@@ -1334,16 +1351,13 @@ impl ConflictedAction {
         }
     }
 
-    fn contains_finished_lookahead(&self, db: &dyn Db, language: Language) -> bool {
+    fn contains_finished_lookahead(&self, db: &dyn Db) -> bool {
         match self {
             ConflictedAction::Shift(_, _) => false,
             ConflictedAction::Reduce(_, _, remaining_negative_lookahead) => {
-                remaining_negative_lookahead.iter().any(|term_string| {
-                    term_string
-                        .clone()
-                        .next(db, language)
-                        .any(|(t, _)| t.is_none())
-                })
+                remaining_negative_lookahead
+                    .iter()
+                    .any(|term_string| term_string.next(db).0)
             }
         }
     }
@@ -1387,7 +1401,7 @@ impl From<ConflictedAction> for Action {
 struct Ambiguity {
     location: ItemIndex,
     transition: Option<TermKind>,
-    term_string: Arc<TermString>,
+    term_string: TermString,
 }
 
 impl DisplayWithDb for Ambiguity {

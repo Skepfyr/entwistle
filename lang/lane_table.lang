@@ -7,3 +7,29 @@ U: U 'k' 't' | 's'
 E: 'a' | 'b' | 'c' | 'v'
 C: 'c' | 'w'
 P: 'z'
+
+= G
+xsktktsktzca
+=
+G:
+  "x"
+  W:
+    U:
+      U:
+        "s"
+      "k"
+      "t"
+    X:
+      "k"
+      "t"
+      U:
+        "s"
+      X:
+        "k"
+        "t"
+      P:
+        "z"
+    C:
+      "c"
+  "a"
+=

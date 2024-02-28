@@ -1,12 +1,15 @@
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use color_eyre::Result;
 use entwistle::{
+    debug_new_non_terminal,
     diagnostics::diagnostics,
-    language::{self, Source},
+    language::{self, Expression, Rule, Source},
+    lower::{Term, TermKind},
+    parse_table::{lr0_parse_table, parse_table, term_string::TermString},
     test::run_test,
     util::DisplayWithDb,
-    Database,
+    Database, Span,
 };
 use tracing_subscriber::prelude::*;
 
@@ -35,23 +38,6 @@ fn main() -> Result<()> {
     }
 
     println!("--------------");
-
-    // let pattern_ident = *language
-    //     .definitions(&db)
-    //     .keys()
-    //     .find(|ident| ident.name(&db) == "PatternNoTopAlt")
-    //     .unwrap();
-    // let pattern = debug_new_non_terminal(&db, pattern_ident);
-    // let term_string = TermString::new(&[Term {
-    //     kind: TermKind::NonTerminal(pattern),
-    //     silent: false,
-    // }]);
-    // for (terminal, next) in term_string.next(&db, language) {
-    //     match terminal {
-    //         Some(terminal) => println!("{}: {}", terminal.display(&db), next.display(&db)),
-    //         None => println!("None: {}", next.display(&db)),
-    //     }
-    // }
 
     // let pattern = *language
     //     .definitions(&db)
@@ -139,6 +125,8 @@ fn main() -> Result<()> {
     //     }
     //     return Ok(());
     // }
+    let parse_table = parse_table(&db, language, language.tests(&db)[0].goal(&db).clone(), 4);
+    println!("{}", parse_table.display(&db));
 
     println!("--------------");
 
