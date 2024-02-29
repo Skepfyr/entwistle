@@ -125,7 +125,7 @@ fn main() -> Result<()> {
     //     }
     //     return Ok(());
     // }
-    let parse_table = parse_table(&db, language, language.tests(&db)[0].goal(&db).clone(), 4);
+    let parse_table = parse_table(&db, language, language.tests(&db)[0].goal(&db).clone());
     println!("{}", parse_table.display(&db));
 
     println!("--------------");

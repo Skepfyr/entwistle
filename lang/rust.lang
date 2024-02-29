@@ -349,13 +349,12 @@ UseTree:
   ((SimplePath _)? "::" _)? "{" _ CommaSeparated<UseTree>? _ "}"
   SimplePath (_ as _ (Identifier | "_"))?
 
-Function: FunctionQualifiers _ fn _ Identifier _ GenericParams? "(" _ FunctionParameters? _ ")" _ (FunctionReturnType _)? WhereClause? (BlockExpression | ";")
+Function: (const _)? (async _)? (unsafe _)? (extern _ Abi? _)? fn _ Identifier _ GenericParams? "(" _ FunctionParameters? _ ")" _ (FunctionReturnType _)? WhereClause? (BlockExpression | ";")
 
-FunctionQualifiers: (const _)? (async _)? (unsafe _)? (extern _ Abi? _)?
 Abi: String | RawString
 
 FunctionParameters:
-  SelfParam _ ","? _
+  SelfParam (_ ",")?
   (SelfParam _ "," _)? CommaSeparated<FunctionParam>
 
 SelfParam: (OuterAttribute _)* (ShorthandSelf | TypedSelf)
@@ -371,18 +370,18 @@ TypeAlias: type _ Identifier _ GenericParams? _ WhereClause? "=" _ Type _ ";"
 
 Struct: StructStruct | TupleStruct
 StructStruct: struct _ Identifier _ GenericParams? WhereClause? ("{" _ (StructFields? _) "}" | ";")
-TupleStruct: struct _ Identifier _ GenericParams? "(" _ TupleFields? ")" WhereClause? ";"
+TupleStruct: struct _ Identifier _ GenericParams? "(" _ (TupleFields _)? ")" WhereClause? ";"
 
 StructFields: CommaSeparated<StructField>
-StructField: (OuterAttribute _)* Visibility? Identifier ":" _ Type
+StructField: (OuterAttribute _)* (Visibility _)? Identifier _ ":" _ Type
 
 TupleFields: CommaSeparated<TupleField>
-TupleField: (OuterAttribute _)* Visibility? Type
+TupleField: (OuterAttribute _)* (Visibility _)? Type
 
 Enumeration: enum _ Identifier _ (GenericParams _)? (WhereClause _)? "{" _ EnumItems? _ "}"
 EnumItems: CommaSeparated<EnumItem>
-EnumItem: (OuterAttribute _)* Visibility? _ Identifier _ (EnumItemTuple | EnumItemStruct | EnumItemDiscriminant)?
-EnumItemTuple: "(" _ TupleFields? _ ")"
+EnumItem: (OuterAttribute _)* (Visibility _)? Identifier (_ (EnumItemTuple | EnumItemStruct | EnumItemDiscriminant))?
+EnumItemTuple: "(" _ (TupleFields _)? ")"
 EnumItemStruct: "{" _ StructFields? _ "}"
 EnumItemDiscriminant: "=" Expression
 
@@ -393,7 +392,7 @@ StaticItem: static _ (mut _)? Identifier _ ":" _ Type _ ("=" _ Expression _)? ";
 
 Trait: (unsafe _)? trait _ Identifier _ GenericParams? (":" _ TypeParamBounds?)? WhereClause? "{" InnerAttribute* AssociatedItem* "}"
 Implementation: InherentImpl | TraitImpl
-InherentImpl: impl _ GenericParams? Type _ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
+InherentImpl: impl _ (GenericParams _)? Type _ (WhereClause _)? "{" _ (InnerAttribute _)* (AssociatedItem _)* "}"
 TraitImpl: (unsafe _)? impl _ GenericParams? "!"? _ TypePath _ for _ Type _ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
 
 ExternBlock: (unsafe _)? extern _ Abi? _ "{" InnerAttribute* ExternalItem* "}"
@@ -563,7 +562,7 @@ IfLetExpression: if _ let _ MatchArmPatterns "=" Expression _ BlockExpression (_
 
 MatchExpression: match _ Expression _ "{" _ (InnerAttribute _)* (MatchArms _)? "}"
 MatchArms: (MatchArm _ "=>" (ExpressionWithoutBlock _ "," | ExpressionWithBlock (_ ",")?) _)* MatchArm _ "=>" _ Expression (_ ",")?
-MatchArm: (OuterAttribute _)* MatchArmPatterns _ (MatchArmGuard _)?
+MatchArm: (OuterAttribute _)* MatchArmPatterns (_ MatchArmGuard)?
 MatchArmPatterns: ("|" _)? Pattern (_ "|" _ Pattern)*
 MatchArmGuard: if _ Expression
 
@@ -638,7 +637,7 @@ ArrayType: '[' _ Type _ ';' _ Expression _ ']'
 SliceType: '[' _ Type _ ']'
 InferredType: '_'
 BareFunctionType: (ForLifetimes _)? FunctionTypeQualifiers _ fn _ '(' _ (FunctionParametersMaybeNamedVariadic _)? ')' (_ BareFunctionReturnType)?
-FunctionTypeQualifiers: unsafe? (_ extern (_ Abi)?)?
+FunctionTypeQualifiers: (unsafe _)? (extern (_ Abi)?)?
 BareFunctionReturnType: "->" _ TypeNoBounds
 FunctionParametersMaybeNamedVariadic:
   CommaSeparated<MaybeNamedParam>
@@ -649,7 +648,7 @@ TypeParamBounds: TypeParamBound (_ '+' _ TypeParamBound)* (_ '+')?
 TypeParamBound: Lifetime | TraitBound
 TraitBound:
   ('?' _)? (ForLifetimes _)? TypePath
-  '(' ('?' _)? (ForLifetimes _)? TypePath ')'
+  '(' _ ('?' _)? (ForLifetimes _)? TypePath _ ')'
 LifetimeBounds: (Lifetime _ '+' _)* Lifetime?
 Lifetime: LifetimeOrLabel | StaticLifetime | "'_"
 ForLifetimes: for _ GenericParams

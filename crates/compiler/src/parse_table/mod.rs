@@ -278,8 +278,8 @@ pub struct Lr0State {
 impl DisplayWithDb for Lr0State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         writeln!(f, "Items:")?;
-        for (i, (item, _backlinks)) in self.item_set.iter().enumerate() {
-            write!(f, "    {i}: {} ->", item.non_terminal.display(db))?;
+        for (i, (item, backlinks)) in self.item_set.iter().enumerate() {
+            write!(f, "  {:>2}: {} ->", i, item.non_terminal.display(db))?;
             for term in &item.alternative.terms(db)[..item.index] {
                 write!(f, " {}", term.display(db))?;
             }
@@ -291,6 +291,14 @@ impl DisplayWithDb for Lr0State {
                 write!(f, "(!>>{})", lookahead.display(db))?;
             }
             writeln!(f)?;
+            write!(f, "      Backlinks: {{")?;
+            for (i, item) in backlinks.iter().enumerate() {
+                if i != 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", item)?;
+            }
+            writeln!(f, "}}")?;
         }
         writeln!(f, "Actions:")?;
         for (t, state) in &self.actions {
@@ -310,6 +318,7 @@ pub struct ItemSet {
 
 #[salsa::tracked]
 pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Arc<Lr0ParseTable> {
+    trace!(goal = %goal.display(db), "Generating LR(0) parse table");
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
@@ -443,22 +452,16 @@ fn closure(
     state
 }
 
-pub fn parse_table(
-    db: &dyn Db,
-    language: Language,
-    goal: Rule,
-    max_lookahead: usize,
-) -> LrkParseTable {
+pub fn parse_table(db: &dyn Db, language: Language, goal: Rule) -> LrkParseTable {
     let goal = NonTerminal::new_goal(db, goal);
     let lr0_parse_table = Lr0ParseTable::clone(&lr0_parse_table(db, language, goal));
     debug!(lr0_parse_table = %lr0_parse_table.display(db), "Generated LR(0) parse table");
-    build_lrk_parse_table(db, language, max_lookahead, lr0_parse_table)
+    build_lrk_parse_table(db, language, lr0_parse_table)
 }
 
 fn build_lrk_parse_table(
     db: &dyn Db,
     language: Language,
-    max_lookahead: usize,
     mut lr0_parse_table: Lr0ParseTable,
 ) -> LrkParseTable {
     let mut states = Vec::new();
@@ -499,7 +502,6 @@ fn build_lrk_parse_table(
             let make_action = make_action(
                 db,
                 language,
-                max_lookahead,
                 &mut lr0_parse_table,
                 visited.clone(),
                 conflicts.clone(),
@@ -546,7 +548,6 @@ fn build_lrk_parse_table(
             let make_action = make_action(
                 db,
                 language,
-                max_lookahead,
                 &mut lr0_parse_table,
                 visited.clone(),
                 conflicts.clone(),
@@ -567,12 +568,12 @@ fn build_lrk_parse_table(
 fn make_action(
     db: &dyn Db,
     language: Language,
-    max_lookahead: usize,
     lr0_parse_table: &mut Lr0ParseTable,
     mut visited: HashSet<Lr0StateId>,
     conflicts: HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>,
     invalidate_state: &mut impl FnMut(Lr0StateId),
 ) -> Option<Action> {
+    debug!("Making action");
     if conflicts.is_empty() {
         trace!("This state is broken as it has no actions");
         return Some(Action::Reduce(
@@ -604,6 +605,14 @@ fn make_action(
         .0
         .clone()
         .into();
+
+    for (conflict, ambiguities) in &conflicts {
+        println!("Conflict: {}", conflict.display(db));
+        for (ambiguity, history) in ambiguities {
+            println!("  Ambiguity: {}", ambiguity.display(db));
+            println!("    History: {}", history);
+        }
+    }
 
     let mut split_info = HashMap::new();
     let mut potential_ambiguities = HashSet::new();
@@ -895,8 +904,7 @@ fn make_action(
 
     let mut regexes = Vec::with_capacity(next.len());
     let mut terminals = Vec::with_capacity(next.len());
-    let mut actions = Vec::with_capacity(next.len());
-    for (terminal, conflicts) in next {
+    for (terminal, conflicts) in &next {
         let common_loops = conflicts.iter().fold(
             HashMap::<_, HashSet<_>>::new(),
             |mut common_loops, (action, ambiguities)| {
@@ -951,154 +959,37 @@ fn make_action(
             }
             return Some(arbitrary_resolution);
         }
-        let Some(max_lookahead) = max_lookahead.checked_sub(1) else {
-            emit(
-                format!("Ambiguity: maximum lookahead exceeded"),
-                conflicts
-                    .into_iter()
-                    .map(|(action, ambiguities)| {
-                        (
-                            Span { start: 0, end: 0 },
-                            Some(format!("{}", action.display(db))),
-                        )
-                    })
-                    .collect(),
+        regexes.push(terminal_nfa(db, language, terminal));
+        terminals.push(terminal.clone());
+    }
+
+    let nfa = build_nfa(&terminals, &regexes);
+    if !validate_nfa(&nfa) {
+        // This early return does mean we don't spot some high-level ambiguities
+        // with the grammar, but this kind of ambiguity frequently causes massive
+        // combinatorial explosions as make_action enumerates the entire language.
+        return Some(arbitrary_resolution);
+    }
+
+    let actions = next
+        .into_iter()
+        .map(|(terminal, conflicts)| {
+            let tracing_span = debug_span!(
+                "make_action",
+                terminal = %terminal.display(db),
+                conflicts = conflicts.keys().map(|conflict| conflict.display(db)).join(", ")
             );
-            return Some(arbitrary_resolution);
-        };
-        let tracing_span = debug_span!(
-            "make_action",
-            terminal = %terminal.display(db),
-            conflicts = conflicts.keys().map(|conflict| conflict.display(db)).join(", ")
-        );
-        let _guard = tracing_span.enter();
-        let action = make_action(
-            db,
-            language,
-            max_lookahead,
-            lr0_parse_table,
-            visited.clone(),
-            conflicts,
-            invalidate_state,
-        )?;
-        regexes.push(terminal_nfa(db, language, &terminal));
-        terminals.push(terminal);
-        actions.push(action);
-    }
-
-    let mut builder = NfaBuilder::new();
-    let start = builder
-        .add_union(Vec::with_capacity(terminals.len()))
-        .unwrap();
-    for regex in &regexes {
-        builder.start_pattern().unwrap();
-        let pattern_start = builder
-            .add_capture_start(regex_automata::util::primitives::StateID::MAX, 0, None)
-            .unwrap();
-        builder.patch(start, pattern_start).unwrap();
-
-        let mut id_map = HashMap::new();
-        id_map.insert(regex.start_anchored(), pattern_start);
-        let mut to_add = vec![regex.start_anchored()];
-        while let Some(id) = to_add.pop() {
-            let new = match regex.state(id) {
-                NfaState::ByteRange { trans } => {
-                    let next = *id_map.entry(trans.next).or_insert_with_key(|id| {
-                        to_add.push(*id);
-                        builder.add_empty().unwrap()
-                    });
-                    builder
-                        .add_range(Transition {
-                            start: trans.start,
-                            end: trans.end,
-                            next,
-                        })
-                        .unwrap()
-                }
-                NfaState::Sparse(SparseTransitions { transitions }) => {
-                    let transitions = transitions
-                        .iter()
-                        .map(|trans| Transition {
-                            start: trans.start,
-                            end: trans.end,
-                            next: *id_map.entry(trans.next).or_insert_with_key(|id| {
-                                to_add.push(*id);
-                                builder.add_empty().unwrap()
-                            }),
-                        })
-                        .collect();
-                    builder.add_sparse(transitions).unwrap()
-                }
-                NfaState::Dense(DenseTransitions { transitions }) => {
-                    let transitions = transitions
-                        .iter()
-                        .enumerate()
-                        .map(|(i, next)| Transition {
-                            start: i.try_into().unwrap(),
-                            end: i.try_into().unwrap(),
-                            next: *id_map.entry(*next).or_insert_with_key(|id| {
-                                to_add.push(*id);
-                                builder.add_empty().unwrap()
-                            }),
-                        })
-                        .collect();
-                    builder.add_sparse(transitions).unwrap()
-                }
-                NfaState::Look { look, next } => {
-                    let next = *id_map.entry(*next).or_insert_with_key(|id| {
-                        to_add.push(*id);
-                        builder.add_empty().unwrap()
-                    });
-                    builder.add_look(next, *look).unwrap()
-                }
-                NfaState::Union { alternates } => {
-                    let alternates = alternates
-                        .iter()
-                        .map(|alt| {
-                            *id_map.entry(*alt).or_insert_with_key(|id| {
-                                to_add.push(*id);
-                                builder.add_empty().unwrap()
-                            })
-                        })
-                        .collect();
-                    builder.add_union(alternates).unwrap()
-                }
-                NfaState::BinaryUnion { alt1, alt2 } => {
-                    let alternates = [alt1, alt2]
-                        .into_iter()
-                        .map(|alt| {
-                            *id_map.entry(*alt).or_insert_with_key(|id| {
-                                to_add.push(*id);
-                                builder.add_empty().unwrap()
-                            })
-                        })
-                        .collect();
-                    builder.add_union(alternates).unwrap()
-                }
-                // Ignore capture groups because we only care about whether there's a match.
-                NfaState::Capture {
-                    next,
-                    pattern_id: _,
-                    group_index: _,
-                    slot: _,
-                } => *id_map.entry(*next).or_insert_with_key(|id| {
-                    to_add.push(*id);
-                    builder.add_empty().unwrap()
-                }),
-                NfaState::Fail => builder.add_fail().unwrap(),
-                NfaState::Match { pattern_id: _ } => {
-                    let match_state = builder.add_match().unwrap();
-                    builder.add_capture_end(match_state, 0).unwrap()
-                }
-            };
-            builder.patch(id_map[&id], new).unwrap();
-        }
-
-        builder.finish_pattern(pattern_start).unwrap();
-    }
-    let nfa = builder.build(start, start).unwrap();
-
-    validate_nfa(&nfa);
+            let _guard = tracing_span.enter();
+            make_action(
+                db,
+                language,
+                lr0_parse_table,
+                visited.clone(),
+                conflicts,
+                invalidate_state,
+            )
+        })
+        .collect::<Option<_>>()?;
 
     Some(Action::Ambiguous {
         nfa,
@@ -1458,8 +1349,124 @@ impl fmt::Display for History {
     }
 }
 
+fn build_nfa(terminals: &[Terminal], regexes: &[NFA]) -> NFA {
+    let mut builder = NfaBuilder::new();
+    let start = builder
+        .add_union(Vec::with_capacity(terminals.len()))
+        .unwrap();
+    for regex in regexes {
+        builder.start_pattern().unwrap();
+        let pattern_start = builder
+            .add_capture_start(regex_automata::util::primitives::StateID::MAX, 0, None)
+            .unwrap();
+        builder.patch(start, pattern_start).unwrap();
+
+        let mut id_map = HashMap::new();
+        id_map.insert(regex.start_anchored(), pattern_start);
+        let mut to_add = vec![regex.start_anchored()];
+        while let Some(id) = to_add.pop() {
+            let new = match regex.state(id) {
+                NfaState::ByteRange { trans } => {
+                    let next = *id_map.entry(trans.next).or_insert_with_key(|id| {
+                        to_add.push(*id);
+                        builder.add_empty().unwrap()
+                    });
+                    builder
+                        .add_range(Transition {
+                            start: trans.start,
+                            end: trans.end,
+                            next,
+                        })
+                        .unwrap()
+                }
+                NfaState::Sparse(SparseTransitions { transitions }) => {
+                    let transitions = transitions
+                        .iter()
+                        .map(|trans| Transition {
+                            start: trans.start,
+                            end: trans.end,
+                            next: *id_map.entry(trans.next).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            }),
+                        })
+                        .collect();
+                    builder.add_sparse(transitions).unwrap()
+                }
+                NfaState::Dense(DenseTransitions { transitions }) => {
+                    let transitions = transitions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, next)| Transition {
+                            start: i.try_into().unwrap(),
+                            end: i.try_into().unwrap(),
+                            next: *id_map.entry(*next).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            }),
+                        })
+                        .collect();
+                    builder.add_sparse(transitions).unwrap()
+                }
+                NfaState::Look { look, next } => {
+                    let next = *id_map.entry(*next).or_insert_with_key(|id| {
+                        to_add.push(*id);
+                        builder.add_empty().unwrap()
+                    });
+                    builder.add_look(next, *look).unwrap()
+                }
+                NfaState::Union { alternates } => {
+                    let alternates = alternates
+                        .iter()
+                        .map(|alt| {
+                            *id_map.entry(*alt).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            })
+                        })
+                        .collect();
+                    builder.add_union(alternates).unwrap()
+                }
+                NfaState::BinaryUnion { alt1, alt2 } => {
+                    let alternates = [alt1, alt2]
+                        .into_iter()
+                        .map(|alt| {
+                            *id_map.entry(*alt).or_insert_with_key(|id| {
+                                to_add.push(*id);
+                                builder.add_empty().unwrap()
+                            })
+                        })
+                        .collect();
+                    builder.add_union(alternates).unwrap()
+                }
+                // Ignore capture groups because we only care about whether there's a match.
+                NfaState::Capture {
+                    next,
+                    pattern_id: _,
+                    group_index: _,
+                    slot: _,
+                } => *id_map.entry(*next).or_insert_with_key(|id| {
+                    to_add.push(*id);
+                    builder.add_empty().unwrap()
+                }),
+                NfaState::Fail => builder.add_fail().unwrap(),
+                NfaState::Match { pattern_id: _ } => {
+                    let match_state = builder.add_match().unwrap();
+                    builder.add_capture_end(match_state, 0).unwrap()
+                }
+            };
+            builder.patch(id_map[&id], new).unwrap();
+        }
+
+        builder.finish_pattern(pattern_start).unwrap();
+    }
+    builder.build(start, start).unwrap()
+}
+
 /// Check if any of the regexes are prefixes of any of the other regexes.
-fn validate_nfa(nfa: &NFA) {
+#[must_use]
+fn validate_nfa(nfa: &NFA) -> bool {
+    let mut valid = true;
     let mut start = BTreeSet::new();
     start.insert(nfa.start_anchored());
     let mut to_visit = vec![(start, None::<(PatternID, Vec<u8>)>, Vec::new())];
@@ -1508,6 +1515,7 @@ fn validate_nfa(nfa: &NFA) {
             {
                 if let Some(other_colour) = intrinsic_colour {
                     if other_colour != this_colour {
+                        valid = false;
                         emit(
                             format!(
                                 "Two tokens match the string {}",
@@ -1528,6 +1536,7 @@ fn validate_nfa(nfa: &NFA) {
             (intrinsic_colour, &new_colour)
         {
             if *new_colour != intrinsic_colour {
+                valid = false;
                 emit(
                     "Tokens conflict as one matches the prefix of the other",
                     vec![
@@ -1572,4 +1581,5 @@ fn validate_nfa(nfa: &NFA) {
             }
         }
     }
+    valid
 }

@@ -15,7 +15,7 @@ use crate::{
 #[instrument(skip_all)]
 #[salsa::tracked]
 pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<ParseTree>> {
-    let parse_table = parse_table(db, language, test.goal(db).clone(), 5);
+    let parse_table = parse_table(db, language, test.goal(db).clone());
     let mut states = vec![StateId::START];
     let mut forest = vec![];
     let input = Input::new(test.test(db)).anchored(Anchored::Yes);
