@@ -471,11 +471,6 @@ fn build_lrk_parse_table(
     while lr0_state_id < lr0_parse_table.states.len() {
         let next_state = &lr0_parse_table[Lr0StateId(lr0_state_id)];
         let conflicts = conflicts(db, next_state, lr0_state_id, language);
-        let goto = next_state
-            .goto
-            .iter()
-            .map(|(nt, id)| (*nt, StateId(id.0)))
-            .collect();
 
         let mut invalidate_state = |id: Lr0StateId| {
             if id.0 < lr0_state_id {
@@ -511,17 +506,17 @@ fn build_lrk_parse_table(
                 break action;
             }
         };
+        let goto = lr0_parse_table[Lr0StateId(lr0_state_id)]
+            .goto
+            .iter()
+            .map(|(nt, id)| (*nt, StateId(id.0)))
+            .collect();
         states.push(State { action, goto });
         lr0_state_id += 1
     }
     while let Some(lr0_state_id) = invalidated.pop() {
         let next_state = &lr0_parse_table[Lr0StateId(lr0_state_id)];
         let conflicts = conflicts(db, next_state, lr0_state_id, language);
-        let goto = next_state
-            .goto
-            .iter()
-            .map(|(nt, id)| (*nt, StateId(id.0)))
-            .collect();
 
         let mut invalidate_state = |id: Lr0StateId| {
             if id.0 < lr0_state_id {
@@ -557,6 +552,11 @@ fn build_lrk_parse_table(
                 break action;
             }
         };
+        let goto = lr0_parse_table[Lr0StateId(lr0_state_id)]
+            .goto
+            .iter()
+            .map(|(nt, id)| (*nt, StateId(id.0)))
+            .collect();
         states[lr0_state_id] = State { action, goto };
     }
     LrkParseTable {
@@ -605,14 +605,6 @@ fn make_action(
         .0
         .clone()
         .into();
-
-    for (conflict, ambiguities) in &conflicts {
-        println!("Conflict: {}", conflict.display(db));
-        for (ambiguity, history) in ambiguities {
-            println!("  Ambiguity: {}", ambiguity.display(db));
-            println!("    History: {}", history);
-        }
-    }
 
     let mut split_info = HashMap::new();
     let mut potential_ambiguities = HashSet::new();
@@ -942,10 +934,7 @@ fn make_action(
                 .filter(|(_, actions)| actions.len() > 1)
             {
                 emit(
-                    format!(
-                        "Ambiguity: infinite lookahead, looping every {} terminals",
-                        i + 1
-                    ),
+                    format!("Ambiguity: infinite lookahead, looping every {i} terminals"),
                     actions
                         .into_iter()
                         .map(|action| {

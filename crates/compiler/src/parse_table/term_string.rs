@@ -60,8 +60,10 @@ impl TermString {
         TermString {
             parse_table,
             locations: vec![Location {
-                terminals: 0,
-                tree: Tree { children: None },
+                tree: Tree {
+                    terminals: 0,
+                    children: None,
+                },
                 state: Lr0StateId(0),
             }],
         }
@@ -81,8 +83,10 @@ impl TermString {
             for (terminal, state) in &state.actions {
                 let mut locations = locations.clone();
                 locations.push(Location {
-                    terminals: 1,
-                    tree: Tree { children: None },
+                    tree: Tree {
+                        terminals: 1,
+                        children: None,
+                    },
                     state: *state,
                 });
                 derivative
@@ -120,14 +124,9 @@ impl TermString {
                     (locations.len(), HashSet::new())
                 };
                 locations.push(Location {
-                    terminals: reduced.iter().map(|loc| loc.terminals).sum(),
                     tree: Tree {
-                        children: Some(
-                            reduced
-                                .iter()
-                                .map(|loc| (loc.tree.clone(), loc.state))
-                                .collect(),
-                        ),
+                        terminals: reduced.iter().map(|loc| loc.tree.terminals).sum(),
+                        children: Some(reduced.into()),
                     },
                     state: new_loc,
                 });
@@ -144,36 +143,35 @@ impl TermString {
         // TODO: This would be way nicer as a generator.
         // TODO: It feels like there should be a more efficient way of doing this,
         // lots of caching is available too.
-        for (start, start_loc) in self.locations.iter().enumerate() {
-            let mut loop_len = 0;
-            for (end, end_loc) in self.locations.iter().enumerate().skip(start + 1) {
-                loop_len += end_loc.terminals;
+        let mut tail_len = 0;
+        for (end, end_loc) in self.locations.iter().enumerate().rev() {
+            let path = &self.locations[end..];
+            let mut left_recursive = &end_loc.tree;
+            while let Some([left_child, rest @ ..]) = left_recursive.children.as_deref() {
+                left_recursive = &left_child.tree;
+
+                path_prefixes_of_tree(&path[1..], rest, 0, &mut |prefix_len| {
+                    callback(tail_len + end_loc.tree.terminals - prefix_len);
+                });
+            }
+            let mut loop_len = end_loc.tree.terminals;
+            for (start, start_loc) in self.locations[..end].iter().enumerate().rev() {
                 if start_loc.state != end_loc.state {
                     continue;
                 }
                 // We've found a loop from start to end, now we check that the
                 // path we've taken from end could be the start of that loop.
-                let path = &self.locations[end..];
-                let loop_locs = self.locations[start..end]
-                    .iter()
-                    .map(|loc| (loc.tree.clone(), loc.state))
-                    .collect::<Vec<_>>();
-                fn matches(path: &[Location], loop_locs: Option<&[(Tree, Lr0StateId)]>) -> bool {
-                    let [path_loc, path @ ..] = path else {
-                        return true;
-                    };
-                    let Some([loop_loc, loop_locs @ ..]) = loop_locs else {
-                        return false;
-                    };
-                    if path_loc.state == loop_loc.1 && matches(path, Some(loop_locs)) {
-                        return true;
-                    }
-                    matches(path, loop_loc.0.children.as_deref())
-                }
-                if matches(&path[1..], Some(&loop_locs[1..])) {
-                    callback(loop_len.try_into().unwrap());
-                }
+                path_prefixes_of_tree(
+                    &path[1..],
+                    &self.locations[start + 1..end],
+                    0,
+                    &mut |prefix_len| {
+                        callback(tail_len + loop_len - prefix_len);
+                    },
+                );
+                loop_len += start_loc.tree.terminals;
             }
+            tail_len += end_loc.tree.terminals;
         }
     }
 }
@@ -184,7 +182,7 @@ impl DisplayWithDb for TermString {
         // TODO: How are you meant to know what the states are?
         write!(f, "{}: 0", self.parse_table.goal.display(db))?;
         for location in &self.locations[1..] {
-            write!(f, " (#{}) {}", location.terminals, location.state)?;
+            write!(f, " (#{}) {}", location.tree.terminals, location.state)?;
         }
         Ok(())
     }
@@ -192,12 +190,35 @@ impl DisplayWithDb for TermString {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Location {
-    terminals: usize,
     tree: Tree,
     state: Lr0StateId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Tree {
-    children: Option<Arc<[(Tree, Lr0StateId)]>>,
+    terminals: u32,
+    children: Option<Arc<[Location]>>,
+}
+
+fn path_prefixes_of_tree(
+    mut path: &[Location],
+    mut tree: &[Location],
+    mut prefix_len: u32,
+    callback: &mut impl FnMut(u32),
+) {
+    while let [path_loc, remaining_path @ ..] = path {
+        let [tree_loc, remaining_tree @ ..] = tree else {
+            return;
+        };
+        if let Some(children) = &tree_loc.tree.children {
+            path_prefixes_of_tree(path, children, prefix_len, callback);
+        }
+        if path_loc.state != tree_loc.state {
+            return;
+        }
+        path = remaining_path;
+        tree = remaining_tree;
+        prefix_len += tree_loc.tree.terminals;
+    }
+    callback(prefix_len);
 }
