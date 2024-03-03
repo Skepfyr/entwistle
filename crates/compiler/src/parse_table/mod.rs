@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{self, Write as _},
     hash::Hash,
     ops::Index,
@@ -466,27 +466,28 @@ fn build_lrk_parse_table(
 ) -> LrkParseTable {
     let mut states = Vec::new();
 
-    let mut invalidated = Vec::new();
-    let mut lr0_state_id = 0;
-    while lr0_state_id < lr0_parse_table.states.len() {
-        let next_state = &lr0_parse_table[Lr0StateId(lr0_state_id)];
+    let mut invalidated = (0..lr0_parse_table.states.len())
+        .map(Lr0StateId)
+        .collect::<VecDeque<_>>();
+    while let Some(lr0_state_id) = invalidated.pop_front() {
+        let next_state = &lr0_parse_table[lr0_state_id];
         let conflicts = conflicts(db, next_state, lr0_state_id, language);
 
         let mut invalidate_state = |id: Lr0StateId| {
-            if id.0 < lr0_state_id {
-                invalidated.push(id.0);
+            if !invalidated.contains(&id) {
+                invalidated.push_back(id);
             }
         };
 
         let mut visited = HashSet::new();
-        visited.insert(Lr0StateId(lr0_state_id));
+        visited.insert(lr0_state_id);
         // This shouldn't loop forever because a split has ocurred each time
         // it returns, so at worst it will convert the entire graph into a
         // tree and then exit.
         let action = loop {
             let span = debug_span!(
                 "make_action",
-                state = lr0_state_id,
+                state = %lr0_state_id,
                 conflicts = conflicts
                     .keys()
                     .map(|conflict| conflict.display(db))
@@ -506,58 +507,20 @@ fn build_lrk_parse_table(
                 break action;
             }
         };
-        let goto = lr0_parse_table[Lr0StateId(lr0_state_id)]
+        let goto = lr0_parse_table[lr0_state_id]
             .goto
             .iter()
             .map(|(nt, id)| (*nt, StateId(id.0)))
             .collect();
-        states.push(State { action, goto });
-        lr0_state_id += 1
-    }
-    while let Some(lr0_state_id) = invalidated.pop() {
-        let next_state = &lr0_parse_table[Lr0StateId(lr0_state_id)];
-        let conflicts = conflicts(db, next_state, lr0_state_id, language);
-
-        let mut invalidate_state = |id: Lr0StateId| {
-            if id.0 < lr0_state_id {
-                invalidated.push(id.0);
-            }
-        };
-
-        let mut visited = HashSet::new();
-        visited.insert(Lr0StateId(lr0_state_id));
-        // This shouldn't loop forever because a split has ocurred each time
-        // it returns, so at worst it will convert the entire graph into a
-        // tree and then exit.
-        let action = loop {
-            let span = debug_span!(
-                "make_action",
-                state = lr0_state_id,
-                conflicts = conflicts
-                    .keys()
-                    .map(|conflict| conflict.display(db))
-                    .join(", ")
+        if lr0_state_id.0 < states.len() {
+            states[lr0_state_id.0] = State { action, goto };
+        } else {
+            assert!(
+                lr0_state_id.0 == states.len(),
+                "The queue enforces this grows one at a time"
             );
-            let _enter = span.enter();
-            debug!("Making top-level action");
-            let make_action = make_action(
-                db,
-                language,
-                &mut lr0_parse_table,
-                visited.clone(),
-                conflicts.clone(),
-                &mut invalidate_state,
-            );
-            if let Some(action) = make_action {
-                break action;
-            }
-        };
-        let goto = lr0_parse_table[Lr0StateId(lr0_state_id)]
-            .goto
-            .iter()
-            .map(|(nt, id)| (*nt, StateId(id.0)))
-            .collect();
-        states[lr0_state_id] = State { action, goto };
+            states.push(State { action, goto });
+        }
     }
     LrkParseTable {
         goal: lr0_parse_table.goal,
@@ -796,38 +759,41 @@ fn make_action(
 
             // Reuse the existing state for the first split
             state_id_map.insert((state, *state_splits.next().unwrap()), state);
+            invalidate_state(state);
 
             for &split in state_splits {
-                state_id_map.insert((state, split), Lr0StateId(lr0_parse_table.states.len()));
-                let new_state = lr0_parse_table[state].clone();
                 let new_state_id = Lr0StateId(lr0_parse_table.states.len());
+                let new_state = lr0_parse_table[state].clone();
+                state_id_map.insert((state, split), new_state_id);
                 // Add back references for all the targets not involved in
                 // this split as they won't get fixed up later.
-                std::iter::Iterator::chain(new_state.actions.values(), new_state.goto.values())
-                    .filter(|target| !marks.contains_key(target))
-                    .for_each(|&target| {
-                        for (_, back_refs) in &mut lr0_parse_table.states[target.0].item_set {
-                            back_refs.extend(
-                                back_refs
-                                    .iter()
-                                    .filter(|item_idx| item_idx.state_id == state)
-                                    .map(|item_idx| ItemIndex {
-                                        state_id: new_state_id,
-                                        item: item_idx.item,
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        }
-                    });
+                let targets = Iterator::chain(new_state.actions.values(), new_state.goto.values())
+                    .copied()
+                    .filter(|target| !marks.contains_key(target));
+                for target in targets {
+                    for (_, back_refs) in &mut lr0_parse_table.states[target.0].item_set {
+                        back_refs.extend(
+                            back_refs
+                                .iter()
+                                .filter(|item_idx| item_idx.state_id == state)
+                                .map(|item_idx| ItemIndex {
+                                    state_id: new_state_id,
+                                    item: item_idx.item,
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                }
                 lr0_parse_table.states.push(new_state);
+                invalidate_state(new_state_id);
             }
         }
-        for (&(old_state_id, split), &new_state_id) in &state_id_map {
+        for (&(_old_state_id, split), &new_state_id) in &state_id_map {
             let new_state = &mut lr0_parse_table.states[new_state_id.0];
             for (_, back_refs) in &mut new_state.item_set {
                 let old_back_refs = std::mem::take(back_refs);
                 back_refs.extend(old_back_refs.into_iter().filter_map(|back_ref| {
-                    if marks.get(&back_ref.state_id).is_none() {
+                    if !marks.contains_key(&back_ref.state_id) {
                         Some(back_ref)
                     } else {
                         state_id_map
@@ -847,9 +813,6 @@ fn make_action(
                 if let Some(&new_id) = state_id_map.get(&(*old_id, split)) {
                     *old_id = new_id;
                 }
-            }
-            if old_state_id == new_state_id {
-                invalidate_state(old_state_id);
             }
         }
     }
@@ -1142,7 +1105,7 @@ impl DisplayWithDb for AmbiguitySource {
 fn conflicts(
     db: &dyn Db,
     next_state: &Lr0State,
-    lr0_state_id: usize,
+    state_id: Lr0StateId,
     language: Language,
 ) -> HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>> {
     let conflicts: HashMap<_, _> = next_state
@@ -1188,7 +1151,7 @@ fn conflicts(
                 return None;
             }
             let location = ItemIndex {
-                state_id: Lr0StateId(lr0_state_id),
+                state_id,
                 item: item_idx,
             };
             let mut ambiguities = HashMap::new();
