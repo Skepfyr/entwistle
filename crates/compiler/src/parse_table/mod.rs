@@ -642,7 +642,7 @@ fn make_action(
     }
 
     let mut splitting_occurred = false;
-    for (state, split_table) in split_info {
+    for (state_id, split_table) in split_info {
         let mut splits: Vec<(HashSet<TermKind>, HashMap<usize, HashSet<ConflictedAction>>)> =
             Vec::new();
         for (term, actions) in split_table {
@@ -677,7 +677,7 @@ fn make_action(
             continue;
         }
         splitting_occurred = true;
-        debug!(splits = splits.len(), ?state, "Splitting states");
+        debug!(splits = splits.len(), ?state_id, "Splitting states");
         trace!(splits = %SplitDisplay(&splits).display(db), "Split info");
         struct SplitDisplay<'a>(
             &'a [(HashSet<TermKind>, HashMap<usize, HashSet<ConflictedAction>>)],
@@ -708,74 +708,72 @@ fn make_action(
                 Ok(())
             }
         }
-        let mut marks: HashMap<Lr0StateId, HashSet<usize>> = HashMap::new();
-        fn visit(
-            parse_table: &Lr0ParseTable,
-            visitable: &HashSet<Lr0StateId>,
-            action: &mut impl FnMut(Lr0StateId),
-            state: Lr0StateId,
-        ) {
-            if !visitable.contains(&state) {
-                return;
-            }
-            let mut visited = HashSet::new();
-            visited.insert(state);
-            let mut stack = vec![state];
-            while let Some(state) = stack.pop() {
-                action(state);
-                for &next in parse_table[state]
-                    .actions
-                    .values()
-                    .chain(parse_table[state].goto.values())
-                {
-                    if visitable.contains(&next) && visited.insert(next) {
+        let mut state_id_map: HashMap<Lr0StateId, HashMap<usize, Lr0StateId>> = HashMap::new();
+        for (split, (terms, _)) in splits.iter().enumerate() {
+            let mut stack = terms
+                .iter()
+                .map(|next| match next {
+                    TermKind::Terminal(t) => lr0_parse_table[state_id].actions[t],
+                    TermKind::NonTerminal(nt) => lr0_parse_table[state_id].goto[nt],
+                })
+                .collect::<Vec<_>>();
+            let mut checked = HashSet::new();
+            checked.extend(stack.iter().copied());
+            while let Some(old_state_id) = stack.pop() {
+                let old_state = &lr0_parse_table[old_state_id];
+                for &next in old_state.actions.values().chain(old_state.goto.values()) {
+                    if visited.contains(&next) && checked.insert(next) {
                         stack.push(next);
+                    }
+                }
+                match state_id_map.entry(old_state_id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(Default::default()).insert(split, old_state_id);
+                        invalidate_state(old_state_id);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let new_state_id = Lr0StateId(lr0_parse_table.states.len());
+                        let new_state = lr0_parse_table[old_state_id].clone();
+                        entry.get_mut().insert(split, new_state_id);
+                        lr0_parse_table.states.push(new_state);
+                        invalidate_state(new_state_id);
                     }
                 }
             }
         }
-        for (mark, (terms, _)) in splits.iter().enumerate() {
-            for next in terms {
-                let next_state = match &next {
-                    TermKind::Terminal(t) => lr0_parse_table[state].actions[t],
-                    TermKind::NonTerminal(nt) => lr0_parse_table[state].goto[nt],
-                };
-                visit(
-                    lr0_parse_table,
-                    &visited,
-                    &mut |id| {
-                        marks.entry(id).or_default().insert(mark);
-                    },
-                    next_state,
-                );
+        let mut original_state_links = HashSet::new();
+        let state = &mut lr0_parse_table.states[state_id.0];
+        for (term, old_state_id) in Iterator::chain(
+            state
+                .actions
+                .iter_mut()
+                .map(|(t, id)| (TermKind::Terminal(t.clone()), id)),
+            state
+                .goto
+                .iter_mut()
+                .map(|(nt, id)| (TermKind::NonTerminal(*nt), id)),
+        ) {
+            if let Some(split) = splits.iter().position(|(terms, _)| terms.contains(&term)) {
+                let new_state_id = state_id_map[old_state_id][&split];
+                *old_state_id = new_state_id;
+                original_state_links.insert(new_state_id);
             }
         }
-        let mut state_id_map = HashMap::new();
-        for &state in &visited {
-            let Some(state_splits) = marks.get(&state) else {
-                continue;
-            };
-            let mut state_splits = state_splits.iter();
 
-            // Reuse the existing state for the first split
-            state_id_map.insert((state, *state_splits.next().unwrap()), state);
-            invalidate_state(state);
-
-            for &split in state_splits {
-                let new_state_id = Lr0StateId(lr0_parse_table.states.len());
-                let new_state = lr0_parse_table[state].clone();
-                state_id_map.insert((state, split), new_state_id);
-                // Add back references for all the targets not involved in
-                // this split as they won't get fixed up later.
+        for (&old_state_id, new_states) in &state_id_map {
+            for (&split, &new_state_id) in new_states {
+                let new_state = &lr0_parse_table.states[new_state_id.0];
+                // Add back references for all the targets not involved in this split.
                 let targets = Iterator::chain(new_state.actions.values(), new_state.goto.values())
                     .copied()
-                    .filter(|target| !marks.contains_key(target));
+                    .filter(|target| !state_id_map.contains_key(target))
+                    .collect::<Vec<_>>();
                 for target in targets {
                     for (_, back_refs) in &mut lr0_parse_table.states[target.0].item_set {
                         back_refs.extend(
                             back_refs
                                 .iter()
-                                .filter(|item_idx| item_idx.state_id == state)
+                                .filter(|item_idx| item_idx.state_id == old_state_id)
                                 .map(|item_idx| ItemIndex {
                                     state_id: new_state_id,
                                     item: item_idx.item,
@@ -784,34 +782,32 @@ fn make_action(
                         )
                     }
                 }
-                lr0_parse_table.states.push(new_state);
-                invalidate_state(new_state_id);
-            }
-        }
-        for (&(_old_state_id, split), &new_state_id) in &state_id_map {
-            let new_state = &mut lr0_parse_table.states[new_state_id.0];
-            for (_, back_refs) in &mut new_state.item_set {
-                let old_back_refs = std::mem::take(back_refs);
-                back_refs.extend(old_back_refs.into_iter().filter_map(|back_ref| {
-                    if !marks.contains_key(&back_ref.state_id) {
-                        Some(back_ref)
-                    } else {
-                        state_id_map
-                            .get(&(back_ref.state_id, split))
-                            .map(|&new_id| ItemIndex {
+                let new_state = &mut lr0_parse_table.states[new_state_id.0];
+                for (_, back_refs) in &mut new_state.item_set {
+                    let old_back_refs = std::mem::take(back_refs);
+                    back_refs.extend(old_back_refs.into_iter().filter_map(|back_ref| {
+                        if back_ref.state_id == state_id {
+                            original_state_links
+                                .contains(&new_state_id)
+                                .then_some(back_ref)
+                        } else if let Some(new_states) = state_id_map.get(&back_ref.state_id) {
+                            new_states.get(&split).map(|&new_id| ItemIndex {
                                 state_id: new_id,
                                 item: back_ref.item,
                             })
+                        } else {
+                            Some(back_ref)
+                        }
+                    }));
+                }
+                for old_id in
+                    Iterator::chain(new_state.actions.values_mut(), new_state.goto.values_mut())
+                {
+                    if let Some(new_ids) = state_id_map.get(old_id) {
+                        if let Some(&new_id) = new_ids.get(&split) {
+                            *old_id = new_id;
+                        }
                     }
-                }));
-            }
-            for old_id in new_state
-                .actions
-                .values_mut()
-                .chain(new_state.goto.values_mut())
-            {
-                if let Some(&new_id) = state_id_map.get(&(*old_id, split)) {
-                    *old_id = new_id;
                 }
             }
         }
