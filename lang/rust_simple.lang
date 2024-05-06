@@ -124,11 +124,11 @@
 
 -_:
   Whitespace
-  Whitespace? Comment Whitespace?
+#  Whitespace? Comment Whitespace?
 
 Comment:
   LineComment
-  BlockComment
+#  BlockComment
 LineComment: '//' /([^\/!\n]|\/\/)[^\n]*/? '\n'
 BlockComment:
   '/*' (/[^*!]/ | '**' | BlockCommentOrDoc) (BlockCommentOrDoc | (/[^*]/ | '*' (!>> '/')))* '*' '/'
@@ -178,7 +178,7 @@ BlockCommentOrDoc: BlockComment | InnerBlockDoc | OuterBlockDoc
   EscapedSingleQuote
   EscapedDoubleQuote
 
-@Newline: "\n" | "\r\n"
+@Newline: /\n/ | /\r\n/
 @StringContinue: "\\" Newline
 
 @StringChar:
@@ -218,13 +218,14 @@ RawByteString:
   'br' '#' '"' RawStringContents<'#'> '"' '#'
   'br' '#' '#' '"' RawStringContents<'#' '#'> '"' '#' '#'
 
-@Integer:
-  /[0-9_]+/
-  /0x[0-9a-fA-F_]+/
-  /0o[0-7_]+/
-  /0b[01_]+/
+@SuffixNoE: /[a-df-zA-DF-Z_][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+\b/
+@Integer: (DecimalLiteral | BinaryLiteral | OctalLiteral | HexLiteral) (SuffixNoE)?
+@DecimalLiteral: /[0-9][0-9_]+/
+@BinaryLiteral: /0b[01_]*[01][01_]*/
+@OctalLiteral: /0o[0-7_]*[0-7][0-7_]*/
+@HexLiteral: /0x[0-9a-fA-F_]*[0-9a-fA-F][0-9a-fA-F_]*/
 @Float: /[0-9_]+(.[0-9_]+)?((e|E)(\+|-)[0-9_]+)?/
-@Number: Integer | Float
+@Number: Float | Integer
 
 TupleIndex: Integer
 
@@ -296,7 +297,9 @@ Crate: Utf8Bom? (Shebang Newline)? _ (InnerAttribute _)* (Item _)*
 ==
 
 @Utf8Bom: "\uFEFF"
-Shebang: "#!" Whitespace* BlockComment? Whitespace* (/[^\[\n\r]/ /[^\n\r]/+)?
+Shebang: "#!" (/[^\[\n\r]/ /[^\n\r]/+)?
+# TODO: Shebang should be the below but BlockComment doesn't work yet.
+# "#!" Whitespace* (BlockComment Whitespace*)? (/[^\[\n\r]/ /[^\n\r]/+)?
 
 -CommaSeparated<Item>: Item (_ "," _ Item)? (_ ",")?
 
@@ -474,12 +477,11 @@ ExpressionWithoutBlock:
   ArrayExpression
   TupleExpression
   StructExpression
-  EnumerationVariantExpression
 
   ExpressionWithoutBlock _ "." _ Identifier
   ExpressionWithoutBlock _ "." _ PathExprSegment _ "(" (CallParams _)? ")"
   ExpressionWithoutBlock _ "(" _ (CallParams _)? ")"
-  PathExpression
+  QualifiedPathInExpression # TODO Should be PathExpression but that's ambiguous
   GroupedExpression
   LiteralExpression
   MacroInvocation
@@ -525,20 +527,6 @@ StructBase: ".." _ Expression
 StructExprTuple: PathInExpression _ "(" _ (InnerAttribute _)* (CommaSeparated<Expression> _)? ")"
 StructExprUnit: PathInExpression
 
-EnumerationVariantExpression:
-  EnumExprStruct
-  EnumExprTuple
-
-
-  EnumExprUnit
-EnumExprStruct: PathInExpression _ "{" _ EnumExprFields _ "}"
-EnumExprFields: CommaSeparated<EnumExprField>
-EnumExprField:
-  Identifier
-  (Identifier | TupleIndex) _ ":" _ Expression
-EnumExprTuple: PathInExpression _ "(" _ (CommaSeparated<Expression> _)? ")"
-EnumExprUnit: PathInExpression
-
 CallParams: CommaSeparated<Expression>
 
 ClosureExpression: (move _)? "|" _ ClosureParameters? _ "|" _ (Expression | "->" _ TypeNoBounds _ BlockExpression)
@@ -572,7 +560,7 @@ Pattern: '|'? PatternNoTopAlt ('|' PatternNoTopAlt)*
 PatternNoTopAlt: PatternWithoutRange | RangePattern
 PatternWithoutRange:
   LiteralPattern
-  (ref _)? (mut _)? Identifier (_ '@' _ PatternNoTopAlt)?
+  IdentifierPattern
   '_'
   '..'
   ('&' | '&&') _ (mut _)? PatternWithoutRange
@@ -594,6 +582,7 @@ LiteralPattern:
   RawByteString
   ('-' _)? Integer
   ('-' _)? Float
+IdentifierPattern: (ref _)? (mut _)? Identifier (_ '@' _ PatternNoTopAlt)?
 RangePattern:
   RangePatternBound _ '..=' _ RangePatternBound
   RangePatternBound _ '..'
@@ -608,12 +597,15 @@ StructPatternElements:
 StructPatternFields: StructPatternField (_ ',' _ StructPatternField)*
 StructPatternField: (OuterAttribute _)* (TupleIndex _ ':' _ Pattern | Identifier _ ':' _ Pattern | (ref _)? (mut _)? Identifier)
 TupleStructPattern: PathInExpression '(' _ (CommaSeparated<Pattern> _)? ')'
-TuplePattern: '..' | Pattern _ ',' (_ CommaSeparated<Pattern>)?
+TuplePattern: '(' _ (TuplePatternItems _)? ')'
+TuplePatternItems: '..' | Pattern _ ',' (_ CommaSeparated<Pattern>)?
 
 Type:
   TypeNoBounds
-  impl _ TypeParamBounds
-  (dyn _)? TypeParamBounds
+  # TODO: These differ from the reference as TypeParamBounds is ambiguous
+  # with TypeNoBounds -> impl _ TraitBound.
+  impl _ TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
+  (dyn _)? TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
 TypeNoBounds:
   '(' _ Type _ ')'
   impl _ TraitBound

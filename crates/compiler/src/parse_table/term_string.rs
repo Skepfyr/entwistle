@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use tracing::{instrument, trace};
+
 use crate::{
     language::Language,
     lower::{Alternative, NonTerminal, Term, Terminal},
@@ -69,6 +71,7 @@ impl TermString {
         }
     }
 
+    #[instrument(level = "debug", skip_all, fields(self = %self.display(db)))]
     pub fn next<'a>(&'a self, db: &'a dyn Db) -> (bool, HashMap<Terminal, HashSet<TermString>>) {
         let mut contains_empty = false;
         let mut derivative: HashMap<Terminal, HashSet<TermString>> = HashMap::new();
@@ -89,13 +92,19 @@ impl TermString {
                     },
                     state: *state,
                 });
+                let term_string = TermString {
+                    parse_table: self.parse_table.clone(),
+                    locations,
+                };
+                trace!(
+                    terminal = %terminal.display(db),
+                    term_string = %term_string.display(db),
+                    "Found partial derivative"
+                );
                 derivative
                     .entry(terminal.clone())
                     .or_default()
-                    .insert(TermString {
-                        parse_table: self.parse_table.clone(),
-                        locations,
-                    });
+                    .insert(term_string);
             }
             for (item, _) in &state.item_set {
                 let num_terms = item.alternative.terms(db).len();
@@ -103,8 +112,9 @@ impl TermString {
                     // Shift not a reduction
                     continue;
                 }
-                if item.non_terminal.is_internal(db) {
-                    // The internal non-terminal is the top level so we're done
+                if item.non_terminal == self.parse_table.goal {
+                    // The goal non-terminal is the top level and can't appear
+                    // anywhere else, so we're done.
                     contains_empty = true;
                     continue;
                 }
@@ -157,6 +167,7 @@ impl TermString {
             let mut loop_len = end_loc.tree.terminals;
             for (start, start_loc) in self.locations[..end].iter().enumerate().rev() {
                 if start_loc.state != end_loc.state {
+                    loop_len += start_loc.tree.terminals;
                     continue;
                 }
                 // We've found a loop from start to end, now we check that the

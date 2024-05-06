@@ -1,0 +1,11 @@
+S: Q 'b' | R 'a' | 'd' P
+Q: 'd' A | 'd' S 'a'
+R: 'd' B | 'd' S 'b'
+P: A 'a' | B 'b'
+A: 'c'
+B: 'c'
+
+== S
+ddcaba
+==
+==

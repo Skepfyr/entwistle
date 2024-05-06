@@ -18,10 +18,12 @@ pub struct Jar(
     language::Language_direct_dependencies,
     language::Test,
     lower::production,
+    lower::terminal_nfa,
     lower::NonTerminal,
     lower::Production,
     lower::Alternative,
     parse_table::lr0_parse_table,
+    parse_table::terminals_conflict,
     test::run_test,
     debug_new_non_terminal,
 );

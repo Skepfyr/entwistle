@@ -1,8 +1,8 @@
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{self, Write as _},
     hash::Hash,
-    ops::Index,
+    ops::{Index, IndexMut},
     sync::Arc,
     vec,
 };
@@ -14,13 +14,15 @@ use regex_automata::{
         Builder as NfaBuilder, DenseTransitions, SparseTransitions, State as NfaState, Transition,
         NFA,
     },
-    util::look::Look,
-    PatternID,
+    util::{
+        look::{Look, LookMatcher, LookSet},
+        primitives::StateID as NfaStateID,
+    },
 };
-use tracing::{debug, debug_span, trace};
+use tracing::{debug, debug_span, instrument, trace};
 
 use crate::{
-    diagnostics::emit,
+    diagnostics::{emit, emit_diagnostic, Diagnostic},
     language::{Language, Rule},
     lower::{production, terminal_nfa, Alternative, NonTerminal, Term, TermKind, Terminal},
     util::DisplayWithDb,
@@ -260,6 +262,12 @@ impl Index<Lr0StateId> for Lr0ParseTable {
     }
 }
 
+impl IndexMut<Lr0StateId> for Lr0ParseTable {
+    fn index_mut(&mut self, index: Lr0StateId) -> &mut Self::Output {
+        &mut self.states[index.0]
+    }
+}
+
 impl Index<ItemIndex> for Lr0ParseTable {
     type Output = (Item, BTreeSet<ItemIndex>);
 
@@ -317,8 +325,9 @@ pub struct ItemSet {
 }
 
 #[salsa::tracked]
+#[instrument(skip_all, fields(goal = %goal.display(db)))]
 pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Arc<Lr0ParseTable> {
-    trace!(goal = %goal.display(db), "Generating LR(0) parse table");
+    trace!("Generating LR(0) parse table");
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
 
@@ -384,7 +393,9 @@ pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Ar
         state_id += 1;
     }
 
-    Arc::new(Lr0ParseTable { goal, states })
+    let parse_table = Lr0ParseTable { goal, states };
+    trace!(parse_table = %parse_table.display(db), "Generated LR(0) parse table");
+    Arc::new(parse_table)
 }
 
 fn add_state(
@@ -452,11 +463,14 @@ fn closure(
     state
 }
 
+#[instrument(skip_all, fields(goal = %goal.display(db)))]
 pub fn parse_table(db: &dyn Db, language: Language, goal: Rule) -> LrkParseTable {
     let goal = NonTerminal::new_goal(db, goal);
     let lr0_parse_table = Lr0ParseTable::clone(&lr0_parse_table(db, language, goal));
     debug!(lr0_parse_table = %lr0_parse_table.display(db), "Generated LR(0) parse table");
-    build_lrk_parse_table(db, language, lr0_parse_table)
+    let lrk_parse_table = build_lrk_parse_table(db, language, lr0_parse_table);
+    debug!(lrk_parse_table = %lrk_parse_table.display(db), "Generated LR(k) parse table");
+    lrk_parse_table
 }
 
 fn build_lrk_parse_table(
@@ -464,6 +478,8 @@ fn build_lrk_parse_table(
     language: Language,
     mut lr0_parse_table: Lr0ParseTable,
 ) -> LrkParseTable {
+    let mut sccs = StronglyConnectedComponents::new(&lr0_parse_table);
+
     let mut states = Vec::new();
 
     let mut invalidated = (0..lr0_parse_table.states.len())
@@ -479,8 +495,6 @@ fn build_lrk_parse_table(
             }
         };
 
-        let mut visited = HashSet::new();
-        visited.insert(lr0_state_id);
         // This shouldn't loop forever because a split has ocurred each time
         // it returns, so at worst it will convert the entire graph into a
         // tree and then exit.
@@ -491,15 +505,16 @@ fn build_lrk_parse_table(
                 conflicts = conflicts
                     .keys()
                     .map(|conflict| conflict.display(db))
-                    .join(", ")
+                    .join(", "),
             );
             let _enter = span.enter();
-            debug!("Making top-level action");
+            debug!(%sccs, "Making top-level action");
             let make_action = make_action(
                 db,
                 language,
                 &mut lr0_parse_table,
-                visited.clone(),
+                &mut sccs,
+                lr0_state_id,
                 conflicts.clone(),
                 &mut invalidate_state,
             );
@@ -532,7 +547,8 @@ fn make_action(
     db: &dyn Db,
     language: Language,
     lr0_parse_table: &mut Lr0ParseTable,
-    mut visited: HashSet<Lr0StateId>,
+    sccs: &mut StronglyConnectedComponents,
+    state: Lr0StateId,
     conflicts: HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>,
     invalidate_state: &mut impl FnMut(Lr0StateId),
 ) -> Option<Action> {
@@ -569,8 +585,51 @@ fn make_action(
         .clone()
         .into();
 
-    let mut split_info = HashMap::new();
-    let mut potential_ambiguities = HashSet::new();
+    let unfixable_conflicts = conflicts
+        .iter()
+        .flat_map(|(action, ambiguities)| {
+            ambiguities
+                .iter()
+                .map(move |(ambiguity, history)| (ambiguity.location, (action, history)))
+        })
+        .fold(
+            HashMap::<ItemIndex, HashMap<&ConflictedAction, Vec<Arc<History>>>>::new(),
+            |mut acc, (location, (action, history))| {
+                acc.entry(location)
+                    .or_default()
+                    .entry(action)
+                    .or_default()
+                    .push(history.clone());
+                acc
+            },
+        );
+    let mut any_unfixable_conflicts = false;
+    for (location, actions) in unfixable_conflicts {
+        if actions.len() <= 1 {
+            continue;
+        }
+        any_unfixable_conflicts = true;
+        emit(
+            format!(
+                "Conflict in state {} at {} between:\n{}",
+                state,
+                location,
+                actions
+                    .iter()
+                    .map(|(action, history)| format!(
+                        "{}:\n{}",
+                        action.display(db),
+                        history.iter().format("\n")
+                    ))
+                    .format("\n")
+            ),
+            vec![(Span { start: 0, end: 0 }, None)],
+        )
+    }
+    if any_unfixable_conflicts {
+        return Some(arbitrary_resolution);
+    }
+
     let mut next: HashMap<Terminal, HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>> =
         HashMap::new();
 
@@ -578,293 +637,57 @@ fn make_action(
     for (action, ambiguities) in conflicts {
         let span = debug_span!("extend_ambiguities", action = %action.display(db));
         let _enter = span.enter();
-        let mut pending = ambiguities.into_iter().collect::<Vec<_>>();
-        let mut ambiguities: HashMap<
-            Ambiguity,
-            (bool, HashMap<Terminal, HashSet<TermString>>, Arc<History>),
-        > = HashMap::new();
-        let mut lane_members = HashMap::new();
-        while let Some((ambiguity, history)) = pending.pop() {
-            let (can_be_empty, _, existing_history) = ambiguities
-                .entry(ambiguity.clone())
-                .or_insert_with_key(|ambiguity| {
-                    let (can_be_empty, derivative) = ambiguity.term_string.next(db);
-                    (can_be_empty, derivative, History::new(ambiguity.location))
-                });
-            if *can_be_empty {
-                // term_string is empty, so we must now walk the parse table.
-                potential_ambiguities.extend(item_lane_heads(
-                    db,
-                    language,
-                    lr0_parse_table,
-                    action.clone(),
-                    ambiguity.clone(),
-                    &history,
-                    &mut split_info,
-                    &mut lane_members,
-                    &mut pending,
-                ));
-            }
-            Arc::make_mut(existing_history).merge(&history);
-        }
-        visited.extend(lane_members.into_keys().map(|(idx, _)| idx.state_id));
-        for (ambiguity, (_, derivative, history)) in ambiguities {
-            for (terminal, term_strings) in derivative {
-                let new_action = action.with_lookahead(db, terminal.clone());
-                if new_action.contains_finished_lookahead(db) {
-                    trace!("Dropping ambiguity because negative lookahead matched");
-                    continue;
-                }
-                let action_ambiguities = next
-                    .entry(terminal)
-                    .or_default()
-                    .entry(new_action)
-                    .or_default();
-                for term_string in term_strings {
-                    let next_history = Arc::make_mut(
-                        action_ambiguities
-                            .entry(Ambiguity {
-                                term_string,
-                                ..ambiguity.clone()
-                            })
-                            .and_modify(|_| {
-                                panic!("Merging histories! This might not be hittable...")
-                            })
-                            .or_insert_with(|| History::new(ambiguity.location)),
+        for (ambiguity, history) in ambiguities {
+            trace!(ambiguity = %ambiguity.display(db), %history, "Investigating ambiguity");
+            let (can_be_empty, derivative) = ambiguity.term_string.next(db);
+            if can_be_empty {
+                let mut lane_head = |new_history: Arc<History>| {
+                    let item = &lr0_parse_table[new_history.location].0;
+                    let term_string = TermString::new(
+                        db,
+                        language,
+                        item.alternative.terms(db)[item.index + 1..].to_vec(),
                     );
-                    next_history.prev.extend(history.prev.iter().cloned());
-                    next_history
-                        .terminals_yielded
-                        .extend(history.terminals_yielded.iter().map(|i| *i + 1));
-                }
+                    let (can_be_empty, derivative) = term_string.next(db);
+                    add_derivative(db, &mut next, derivative, &action, new_history);
+                    !can_be_empty
+                };
+                item_lane_heads(
+                    lr0_parse_table,
+                    history.clone(),
+                    &mut lane_head,
+                    &mut HashSet::new(),
+                );
             }
+            add_derivative(db, &mut next, derivative, &action, history);
         }
     }
 
-    let mut splitting_occurred = false;
-    for (state_id, split_table) in split_info {
-        let mut splits: Vec<(HashSet<TermKind>, HashMap<usize, HashSet<ConflictedAction>>)> =
-            Vec::new();
-        for (term, actions) in split_table {
-            let Some(term) = term else { continue };
-            let (terms, split_actions) = match splits.iter_mut().find(|(_, split)| {
-                actions.iter().all(|(item, action)| {
-                    split
-                        .get(item)
-                        .map(|split_action| {
-                            action
-                                .iter()
-                                .any(|(action, _)| split_action.contains(action))
-                        })
-                        .unwrap_or(true)
-                })
-            }) {
-                Some(split) => split,
-                None => {
-                    splits.push(Default::default());
-                    splits.last_mut().unwrap()
-                }
-            };
-            terms.insert(term);
-            for (item, action) in actions {
-                split_actions
-                    .entry(item)
-                    .or_default()
-                    .extend(action.into_iter().map(|(action, _)| action));
-            }
-        }
-        if splits.len() <= 1 {
-            continue;
-        }
-        splitting_occurred = true;
-        debug!(splits = splits.len(), ?state_id, "Splitting states");
-        trace!(splits = %SplitDisplay(&splits).display(db), "Split info");
-        struct SplitDisplay<'a>(
-            &'a [(HashSet<TermKind>, HashMap<usize, HashSet<ConflictedAction>>)],
-        );
-        impl<'a> DisplayWithDb for SplitDisplay<'a> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-                for (terms, item_actions) in self.0 {
-                    f.write_char('{')?;
-                    for (i, term) in terms.iter().enumerate() {
-                        if i != 0 {
-                            f.write_char(',')?;
-                        }
-                        write!(f, "{}", term.display(db))?;
-                    }
-                    writeln!(f, "}}:")?;
-                    for (item, actions) in item_actions {
-                        write!(f, "  {}: ", item)?;
-                        for (j, action) in actions.iter().enumerate() {
-                            if j != 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{}", action.display(db))?;
-                        }
-                        writeln!(f)?;
-                    }
-                }
-
-                Ok(())
-            }
-        }
-        let mut state_id_map: HashMap<Lr0StateId, HashMap<usize, Lr0StateId>> = HashMap::new();
-        for (split, (terms, _)) in splits.iter().enumerate() {
-            let mut stack = terms
-                .iter()
-                .map(|next| match next {
-                    TermKind::Terminal(t) => lr0_parse_table[state_id].actions[t],
-                    TermKind::NonTerminal(nt) => lr0_parse_table[state_id].goto[nt],
-                })
-                .collect::<Vec<_>>();
-            let mut checked = HashSet::new();
-            checked.extend(stack.iter().copied());
-            while let Some(old_state_id) = stack.pop() {
-                let old_state = &lr0_parse_table[old_state_id];
-                for &next in old_state.actions.values().chain(old_state.goto.values()) {
-                    if visited.contains(&next) && checked.insert(next) {
-                        stack.push(next);
-                    }
-                }
-                match state_id_map.entry(old_state_id) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Default::default()).insert(split, old_state_id);
-                        invalidate_state(old_state_id);
-                    }
-                    Entry::Occupied(mut entry) => {
-                        let new_state_id = Lr0StateId(lr0_parse_table.states.len());
-                        let new_state = lr0_parse_table[old_state_id].clone();
-                        entry.get_mut().insert(split, new_state_id);
-                        lr0_parse_table.states.push(new_state);
-                        invalidate_state(new_state_id);
-                    }
-                }
-            }
-        }
-        let mut original_state_links = HashSet::new();
-        let state = &mut lr0_parse_table.states[state_id.0];
-        for (term, old_state_id) in Iterator::chain(
-            state
-                .actions
-                .iter_mut()
-                .map(|(t, id)| (TermKind::Terminal(t.clone()), id)),
-            state
-                .goto
-                .iter_mut()
-                .map(|(nt, id)| (TermKind::NonTerminal(*nt), id)),
-        ) {
-            if let Some(split) = splits.iter().position(|(terms, _)| terms.contains(&term)) {
-                let new_state_id = state_id_map[old_state_id][&split];
-                *old_state_id = new_state_id;
-                original_state_links.insert(new_state_id);
-            }
-        }
-
-        for (&old_state_id, new_states) in &state_id_map {
-            for (&split, &new_state_id) in new_states {
-                let new_state = &lr0_parse_table.states[new_state_id.0];
-                // Add back references for all the targets not involved in this split.
-                let targets = Iterator::chain(new_state.actions.values(), new_state.goto.values())
-                    .copied()
-                    .filter(|target| !state_id_map.contains_key(target))
-                    .collect::<Vec<_>>();
-                for target in targets {
-                    for (_, back_refs) in &mut lr0_parse_table.states[target.0].item_set {
-                        back_refs.extend(
-                            back_refs
-                                .iter()
-                                .filter(|item_idx| item_idx.state_id == old_state_id)
-                                .map(|item_idx| ItemIndex {
-                                    state_id: new_state_id,
-                                    item: item_idx.item,
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    }
-                }
-                let new_state = &mut lr0_parse_table.states[new_state_id.0];
-                for (_, back_refs) in &mut new_state.item_set {
-                    let old_back_refs = std::mem::take(back_refs);
-                    back_refs.extend(old_back_refs.into_iter().filter_map(|back_ref| {
-                        if back_ref.state_id == state_id {
-                            original_state_links
-                                .contains(&new_state_id)
-                                .then_some(back_ref)
-                        } else if let Some(new_states) = state_id_map.get(&back_ref.state_id) {
-                            new_states.get(&split).map(|&new_id| ItemIndex {
-                                state_id: new_id,
-                                item: back_ref.item,
-                            })
-                        } else {
-                            Some(back_ref)
-                        }
-                    }));
-                }
-                for old_id in
-                    Iterator::chain(new_state.actions.values_mut(), new_state.goto.values_mut())
-                {
-                    if let Some(new_ids) = state_id_map.get(old_id) {
-                        if let Some(&new_id) = new_ids.get(&split) {
-                            *old_id = new_id;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // FIXME: Maybe split states here, if two lookahead generating states
-    // conflict in a way where splitting would help, could reduce the amount
-    // of lookahead by increasing the number of states.
-
-    if splitting_occurred {
+    if StateSplitter::split_states(
+        db,
+        language,
+        lr0_parse_table,
+        sccs,
+        invalidate_state,
+        state,
+        &next,
+    ) {
         debug!(lr0_parse_table = %lr0_parse_table.display(db), "Split");
         return None;
     }
 
-    if !potential_ambiguities.is_empty() {
-        debug!("Ambiguity detected");
-        for ambiguity in potential_ambiguities {
-            let string_for_conflict = |conflict: &ConflictedAction| match conflict {
-                ConflictedAction::Shift(t, s) => format!(
-                    "could continue to state {} and read this {}",
-                    s,
-                    t.display(db)
-                ),
-                ConflictedAction::Reduce(nt, _, _) => {
-                    format!("might have just read a {}", nt.display(db))
-                }
-            };
-            emit(
-                format!("{}", ambiguity.display(db)),
-                vec![
-                    (
-                        Span { start: 0, end: 0 },
-                        Some(string_for_conflict(&ambiguity.conflict_a.0)),
-                    ),
-                    (
-                        Span { start: 0, end: 0 },
-                        Some(string_for_conflict(&ambiguity.conflict_b.0)),
-                    ),
-                ],
-            );
-        }
-        // Pick an arbitrary action to resolve the ambiguity
-        return Some(arbitrary_resolution);
-    }
-
-    let mut regexes = Vec::with_capacity(next.len());
-    let mut terminals = Vec::with_capacity(next.len());
-    for (terminal, conflicts) in &next {
+    for conflicts in next.values() {
         let common_loops = conflicts.iter().fold(
             HashMap::<_, HashSet<_>>::new(),
             |mut common_loops, (action, ambiguities)| {
                 for (ambiguity, history) in ambiguities {
+                    // Add all the loops generated by the current term string.
                     ambiguity.term_string.loop_lengths(|loop_length| {
                         common_loops.entry(loop_length).or_default().insert(action);
                     });
-                    // Reset count to 0 because we don't know how far through the state we are,
-                    // the loop length is from the start of the last time we saw this item to
+
+                    // Add all the loops generated by the history.
+                    // The loop length is from the start of the last time we saw this item to
                     // the *start* of this item.
                     let loc = history.location;
                     let mut to_investigate: Vec<_> = history
@@ -907,18 +730,10 @@ fn make_action(
             }
             return Some(arbitrary_resolution);
         }
-        regexes.push(terminal_nfa(db, language, terminal));
-        terminals.push(terminal.clone());
     }
 
-    let nfa = build_nfa(&terminals, &regexes);
-    if !validate_nfa(&nfa) {
-        // This early return does mean we don't spot some high-level ambiguities
-        // with the grammar, but this kind of ambiguity frequently causes massive
-        // combinatorial explosions as make_action enumerates the entire language.
-        return Some(arbitrary_resolution);
-    }
-
+    let terminals = next.keys().cloned().collect::<Vec<_>>();
+    let nfa = build_nfa(db, language, &terminals);
     let actions = next
         .into_iter()
         .map(|(terminal, conflicts)| {
@@ -932,7 +747,8 @@ fn make_action(
                 db,
                 language,
                 lr0_parse_table,
-                visited.clone(),
+                sccs,
+                state,
                 conflicts,
                 invalidate_state,
             )
@@ -947,154 +763,68 @@ fn make_action(
 }
 
 fn item_lane_heads(
-    db: &dyn Db,
-    language: Language,
     lr0_parse_table: &Lr0ParseTable,
-    action: ConflictedAction,
-    ambiguity: Ambiguity,
-    history: &Arc<History>,
-    split_info: &mut HashMap<
-        Lr0StateId,
-        HashMap<Option<TermKind>, HashMap<usize, Vec<(ConflictedAction, Arc<History>)>>>,
-    >,
-    visited: &mut HashMap<(ItemIndex, Option<TermKind>), u32>,
-    ambiguities: &mut Vec<(Ambiguity, Arc<History>)>,
-) -> HashSet<AmbiguitySource> {
-    trace!(action = %action.display(db), ambiguity = %ambiguity.display(db), "Computing lane heads");
-    let (item, back_refs) = &lr0_parse_table[ambiguity.location];
-
-    let num_visits = visited
-        .entry((ambiguity.location, ambiguity.transition.clone()))
-        .or_default();
-    // Allow the search to pass through nodes twice so that cycles get counted properly.
-    if *num_visits >= 2 {
-        return HashSet::new();
-    }
-    *num_visits += 1;
-
-    let mut ret = HashSet::new();
-    let existing_action = split_info
-        .entry(ambiguity.location.state_id)
-        .or_default()
-        .entry(ambiguity.transition.clone())
-        .or_default()
-        .entry(ambiguity.location.item);
-    match existing_action {
-        Entry::Occupied(mut entry) => {
-            if entry
-                .get()
-                .iter()
-                .all(|(old_action, _)| *old_action != action)
-            {
-                ret.extend(entry.get().iter().cloned().map(|(conflict_b, b_history)| {
-                    AmbiguitySource {
-                        location: ambiguity.location,
-                        transition: ambiguity.transition.clone(),
-                        non_terminal: item.non_terminal,
-                        conflict_a: (action.clone(), history.clone()),
-                        conflict_b: (conflict_b, b_history),
-                    }
-                }));
-                entry.get_mut().push((action.clone(), history.clone()));
-            }
-        }
-        Entry::Vacant(entry) => {
-            entry.insert(vec![(action.clone(), history.clone())]);
-        }
-    }
+    history: Arc<History>,
+    is_lane_head: &mut impl FnMut(Arc<History>) -> bool,
+    visited: &mut HashSet<ItemIndex>,
+) {
+    trace!(location = %history.location, "Computing lane heads");
+    let (item, back_refs) = &lr0_parse_table[history.location];
 
     if item.index != 0 {
-        for &item_index in back_refs {
-            let transition = if item_index.state_id == ambiguity.location.state_id {
-                ambiguity.transition.clone()
-            } else {
-                lr0_parse_table[item_index]
-                    .0
-                    .next(db)
-                    .as_ref()
-                    .map(|t| t.kind.clone())
-            };
-            ret.extend(item_lane_heads(
-                db,
-                language,
+        for &back_ref in back_refs {
+            item_lane_heads(
                 lr0_parse_table,
-                action.clone(),
-                Ambiguity {
-                    location: item_index,
-                    transition,
-                    ..ambiguity.clone()
-                },
-                history,
-                split_info,
+                history.prepend_empty(back_ref),
+                is_lane_head,
                 visited,
-                ambiguities,
-            ));
+            );
+            visited.remove(&back_ref);
         }
     } else {
         for &back_ref in back_refs {
-            let transition = if back_ref.state_id == ambiguity.location.state_id {
-                ambiguity.transition.clone()
-            } else {
-                lr0_parse_table[back_ref]
-                    .0
-                    .next(db)
-                    .as_ref()
-                    .map(|t| t.kind.clone())
-            };
+            if !visited.insert(back_ref) {
+                continue;
+            }
             trace!(%back_ref, "Walking parse table");
-            let item = &lr0_parse_table[back_ref].0;
-            let mut new_history = History::new(back_ref);
-            Arc::make_mut(&mut new_history).prev.push(history.clone());
-            ambiguities.push((
-                Ambiguity {
-                    location: back_ref,
-                    transition: transition.clone(),
-                    term_string: TermString::new(
-                        db,
-                        language,
-                        item.alternative.terms(db)[item.index + 1..].to_vec(),
-                    ),
-                },
-                new_history,
-            ));
+            let new_history = history.prepend_lane_head(back_ref);
+            if !is_lane_head(new_history.clone()) {
+                item_lane_heads(lr0_parse_table, new_history, is_lane_head, visited);
+            }
+            visited.remove(&back_ref);
         }
     }
-    ret
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct AmbiguitySource {
-    location: ItemIndex,
-    transition: Option<TermKind>,
-    non_terminal: NonTerminal,
-    conflict_a: (ConflictedAction, Arc<History>),
-    conflict_b: (ConflictedAction, Arc<History>),
-}
-
-impl DisplayWithDb for AmbiguitySource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        write!(
-            f,
-            "Ambiguity for {} and {} ",
-            self.conflict_a.0.display(db),
-            self.conflict_b.0.display(db),
-        )?;
-        write!(
-            f,
-            "in {} for non-terminal {}",
-            self.location,
-            self.non_terminal.display(db),
-        )?;
-        match &self.transition {
-            Some(transition) => writeln!(f, " and transition {}", transition.display(db)),
-            None => writeln!(f),
-        }?;
-        writeln!(
-            f,
-            "history: {} and {}",
-            self.conflict_a.1, self.conflict_b.1,
-        )?;
-        Ok(())
+fn add_derivative(
+    db: &dyn Db,
+    next: &mut HashMap<Terminal, HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>>,
+    derivative: HashMap<Terminal, HashSet<TermString>>,
+    action: &ConflictedAction,
+    mut history: Arc<History>,
+) {
+    Arc::make_mut(&mut history).terminals_yielded =
+        history.terminals_yielded.iter().map(|i| *i + 1).collect();
+    for (terminal, term_strings) in derivative {
+        let new_action = action.with_lookahead(db, terminal.clone());
+        if new_action.contains_finished_lookahead(db) {
+            trace!("Dropping ambiguity because negative lookahead matched");
+            continue;
+        }
+        let action_ambiguities = next
+            .entry(terminal)
+            .or_default()
+            .entry(new_action)
+            .or_default();
+        for term_string in term_strings {
+            action_ambiguities
+                .entry(Ambiguity {
+                    location: history.location,
+                    term_string,
+                })
+                .and_modify(|old_history| Arc::make_mut(old_history).merge(&history))
+                .or_insert_with(|| history.clone());
+        }
     }
 }
 
@@ -1154,7 +884,6 @@ fn conflicts(
             ambiguities.insert(
                 Ambiguity {
                     location,
-                    transition: None,
                     term_string: TermString::new(
                         db,
                         language,
@@ -1239,27 +968,21 @@ impl From<ConflictedAction> for Action {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Ambiguity {
     location: ItemIndex,
-    transition: Option<TermKind>,
     term_string: TermString,
 }
 
 impl DisplayWithDb for Ambiguity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        let transition = self.transition.as_ref().map(|t| t.display(db));
-        let transition = match transition {
-            Some(t) => format!("Some({})", t),
-            None => "None".to_string(),
-        };
         write!(
             f,
             "Ambiguity for {} ({})",
-            transition,
+            self.location,
             self.term_string.display(db)
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 struct History {
     location: ItemIndex,
     terminals_yielded: BTreeSet<u32>,
@@ -1277,6 +1000,24 @@ impl History {
         })
     }
 
+    fn prepend_empty(self: &Arc<Self>, location: ItemIndex) -> Arc<Self> {
+        Arc::new(Self {
+            location,
+            terminals_yielded: BTreeSet::new(),
+            prev: vec![self.clone()],
+        })
+    }
+
+    fn prepend_lane_head(self: &Arc<Self>, location: ItemIndex) -> Arc<Self> {
+        let mut terminals_yielded = BTreeSet::new();
+        terminals_yielded.insert(0);
+        Arc::new(Self {
+            location,
+            terminals_yielded,
+            prev: vec![self.clone()],
+        })
+    }
+
     fn merge(&mut self, other: &History) {
         assert_eq!(self.location, other.location);
         self.terminals_yielded
@@ -1287,22 +1028,26 @@ impl History {
 
 impl fmt::Display for History {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}x{} [{}]",
-            self.location,
-            self.terminals_yielded.iter().format(","),
-            self.prev.iter().format(", ")
-        )
+        write!(f, "{}", self.location)?;
+        if !self.terminals_yielded.is_empty() {
+            write!(f, "x{{{}}}", self.terminals_yielded.iter().format(","))?;
+        }
+        match self.prev.as_slice() {
+            [] => {}
+            [prev] => write!(f, " {}", prev)?,
+            prev => write!(f, " [{}]", prev.iter().format(", "))?,
+        }
+        Ok(())
     }
 }
 
-fn build_nfa(terminals: &[Terminal], regexes: &[NFA]) -> NFA {
+fn build_nfa(db: &dyn Db, language: Language, terminals: &[Terminal]) -> NFA {
     let mut builder = NfaBuilder::new();
     let start = builder
         .add_union(Vec::with_capacity(terminals.len()))
         .unwrap();
-    for regex in regexes {
+    for terminal in terminals {
+        let regex = terminal_nfa(db, language, terminal.clone());
         builder.start_pattern().unwrap();
         let pattern_start = builder
             .add_capture_start(regex_automata::util::primitives::StateID::MAX, 0, None)
@@ -1411,123 +1156,816 @@ fn build_nfa(terminals: &[Terminal], regexes: &[NFA]) -> NFA {
     builder.build(start, start).unwrap()
 }
 
-/// Check if any of the regexes are prefixes of any of the other regexes.
-#[must_use]
-fn validate_nfa(nfa: &NFA) -> bool {
-    let mut valid = true;
-    let mut start = BTreeSet::new();
-    start.insert(nfa.start_anchored());
-    let mut to_visit = vec![(start, None::<(PatternID, Vec<u8>)>, Vec::new())];
+/// Check if one of the two terminals matches a prefix of the other
+#[salsa::tracked]
+pub fn terminals_conflict(
+    db: &dyn Db,
+    language: Language,
+    terminal_a: Terminal,
+    terminal_b: Terminal,
+) -> Result<(), Diagnostic> {
+    if terminal_a == terminal_b {
+        return Err(Diagnostic {
+            message: format!("Terminal conflicts with itself: {}", terminal_a.display(db)),
+            labels: vec![(Span { start: 0, end: 0 }, None)],
+        });
+    }
+
+    let a = terminal_nfa(db, language, terminal_a.clone());
+    let b = terminal_nfa(db, language, terminal_b.clone());
+
+    // TODO: this is a hack around the fact that I can't work out how to deal
+    // with unicode word boundaries as they're multi-byte.
+    const UNICODE_LOOK: LookSet = LookSet {
+        bits: Look::WordEndHalfUnicode.as_repr()
+            | Look::WordEndUnicode.as_repr()
+            | Look::WordStartHalfUnicode.as_repr()
+            | Look::WordStartUnicode.as_repr()
+            | Look::WordUnicode.as_repr()
+            | Look::WordUnicodeNegate.as_repr(),
+    };
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    struct Pos {
+        a: NfaStateID,
+        b: NfaStateID,
+        is_prev_char_word: bool,
+        is_prev_char_newline: bool,
+        look_set: u32,
+    }
+
+    let start = Pos {
+        a: a.start_anchored(),
+        b: b.start_anchored(),
+        is_prev_char_word: false,
+        is_prev_char_newline: false,
+        look_set: LookSet::empty().bits,
+    };
     let mut visited = HashSet::new();
-    while let Some((mut states, mut new_colour, string)) = to_visit.pop() {
-        loop {
-            let mut to_add = Vec::new();
-            for &id in &states {
-                match nfa.state(id) {
-                    &NfaState::Look { look, next } => {
-                        // This is overzealous and will flag word boundaries etc as
-                        // clashing when they actually aren't.
-                        if look != Look::End {
-                            to_add.push(next);
-                        }
-                    }
-                    NfaState::Union { alternates } => to_add.extend(alternates.iter().copied()),
-                    &NfaState::BinaryUnion { alt1, alt2 } => {
-                        to_add.push(alt1);
-                        to_add.push(alt2);
-                    }
-                    &NfaState::Capture { next, .. } => to_add.push(next),
-                    NfaState::ByteRange { .. }
-                    | NfaState::Sparse(_)
-                    | NfaState::Dense(_)
-                    | NfaState::Fail
-                    | NfaState::Match { .. } => {}
+    let mut to_check = vec![(start, vec![])];
+    visited.insert(start);
+    while let Some((pos, prefix)) = to_check.pop() {
+        let a_state = a.state(pos.a);
+        let b_state = b.state(pos.b);
+        if let (NfaState::Match { .. }, NfaState::Match { .. }) = (a_state, b_state) {
+            return Err(Diagnostic {
+                message: format!(
+                    "Ambiguous terminals {} and {}, both match the prefix {:?}",
+                    terminal_a.display(db),
+                    terminal_b.display(db),
+                    String::from_utf8_lossy(&prefix),
+                ),
+                labels: vec![(Span { start: 0, end: 0 }, None)],
+            });
+        }
+        match a_state {
+            NfaState::ByteRange { .. }
+            | NfaState::Sparse(_)
+            | NfaState::Dense(_)
+            | NfaState::Match { .. } => {}
+            &NfaState::Look { look, next } => {
+                let next = Pos {
+                    a: next,
+                    look_set: if look.as_repr() & UNICODE_LOOK.bits != 0 {
+                        pos.look_set
+                    } else {
+                        pos.look_set | look.as_repr()
+                    },
+                    ..pos
+                };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
                 }
+                continue;
             }
-            let mut modified = false;
-            for state in to_add {
-                modified |= states.insert(state);
-            }
-            if !modified {
-                break;
-            }
-        }
-        if !visited.insert(states.clone()) {
-            continue;
-        }
-        let mut intrinsic_colour: Option<PatternID> = None;
-        for &state in &states {
-            if let &NfaState::Match {
-                pattern_id: this_colour,
-            } = nfa.state(state)
-            {
-                if let Some(other_colour) = intrinsic_colour {
-                    if other_colour != this_colour {
-                        valid = false;
-                        emit(
-                            format!(
-                                "Two tokens match the string {}",
-                                String::from_utf8_lossy(&string)
-                            ),
-                            vec![
-                                (Span { start: 0, end: 0 }, None),
-                                (Span { start: 0, end: 0 }, None),
-                            ],
-                        );
+            NfaState::Union { alternates } => {
+                for &alt in &**alternates {
+                    let next = Pos { a: alt, ..pos };
+                    if visited.insert(next) {
+                        to_check.push((next, prefix.clone()));
                     }
-                } else {
-                    intrinsic_colour = Some(this_colour);
                 }
+                continue;
             }
-        }
-        if let (Some(intrinsic_colour), Some((new_colour, prefix))) =
-            (intrinsic_colour, &new_colour)
-        {
-            if *new_colour != intrinsic_colour {
-                valid = false;
-                emit(
-                    "Tokens conflict as one matches the prefix of the other",
-                    vec![
-                        (
-                            Span { start: 0, end: 0 },
-                            Some(format!(
-                                "matches the string {:?}",
-                                String::from_utf8_lossy(&string)
-                            )),
-                        ),
-                        (
-                            Span { start: 0, end: 0 },
-                            Some(format!(
-                                "matches the prefix {:?}",
-                                String::from_utf8_lossy(prefix)
-                            )),
-                        ),
-                    ],
-                );
+            &NfaState::BinaryUnion { alt1, alt2 } => {
+                let next = Pos { a: alt1, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                let next = Pos { a: alt2, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                continue;
             }
+            &NfaState::Capture { next, .. } => {
+                let next = Pos { a: next, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                continue;
+            }
+            NfaState::Fail => continue,
         }
-        new_colour = new_colour.or_else(|| intrinsic_colour.map(|c| (c, string.clone())));
-        for i in 0..=u8::MAX {
-            let next_states: BTreeSet<_> = states
-                .iter()
-                .flat_map(|id| match nfa.state(*id) {
-                    NfaState::ByteRange { trans } => trans.matches_byte(i).then_some(trans.next),
-                    NfaState::Sparse(trans) => trans.matches_byte(i),
-                    NfaState::Dense(trans) => trans.matches_byte(i),
-                    NfaState::Look { .. }
-                    | NfaState::Union { .. }
-                    | NfaState::BinaryUnion { .. }
-                    | NfaState::Capture { .. }
-                    | NfaState::Fail
-                    | NfaState::Match { .. } => None,
-                })
-                .collect();
-            if !next_states.is_empty() {
-                let mut prefix = string.clone();
-                prefix.push(i);
-                to_visit.push((next_states, new_colour.clone(), prefix));
+        match b_state {
+            NfaState::ByteRange { .. }
+            | NfaState::Sparse(_)
+            | NfaState::Dense(_)
+            | NfaState::Match { .. } => {}
+            &NfaState::Look { look, next } => {
+                let next = Pos {
+                    b: next,
+                    look_set: if look.as_repr() & UNICODE_LOOK.bits != 0 {
+                        pos.look_set
+                    } else {
+                        pos.look_set | look.as_repr()
+                    },
+                    ..pos
+                };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                continue;
+            }
+            NfaState::Union { alternates } => {
+                for &alt in &**alternates {
+                    let next = Pos { b: alt, ..pos };
+                    if visited.insert(next) {
+                        to_check.push((next, prefix.clone()));
+                    }
+                }
+                continue;
+            }
+            &NfaState::BinaryUnion { alt1, alt2 } => {
+                let next = Pos { b: alt1, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                let next = Pos { b: alt2, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                continue;
+            }
+            &NfaState::Capture { next, .. } => {
+                let next = Pos { b: next, ..pos };
+                if visited.insert(next) {
+                    to_check.push((next, prefix.clone()));
+                }
+                continue;
+            }
+            NfaState::Fail => continue,
+        }
+        for c in 0..=u8::MAX {
+            let a_state = match a_state {
+                NfaState::ByteRange { trans } => trans.matches_byte(c).then_some(trans.next),
+                NfaState::Sparse(trans) => trans.matches_byte(c),
+                NfaState::Dense(trans) => trans.matches_byte(c),
+                NfaState::Match { .. } => Some(pos.a),
+                NfaState::Look { .. }
+                | NfaState::Union { .. }
+                | NfaState::BinaryUnion { .. }
+                | NfaState::Capture { .. }
+                | NfaState::Fail => unreachable!(),
+            };
+            let b_state = match b_state {
+                NfaState::ByteRange { trans } => trans.matches_byte(c).then_some(trans.next),
+                NfaState::Sparse(trans) => trans.matches_byte(c),
+                NfaState::Dense(trans) => trans.matches_byte(c),
+                NfaState::Match { .. } => Some(pos.b),
+                NfaState::Look { .. }
+                | NfaState::Union { .. }
+                | NfaState::BinaryUnion { .. }
+                | NfaState::Capture { .. }
+                | NfaState::Fail => unreachable!(),
+            };
+            let (a_state, b_state) = match (a_state, b_state) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let mut prefix = prefix.clone();
+            prefix.push(c);
+            let look_matches = LookMatcher::new().matches_set(
+                LookSet { bits: pos.look_set },
+                &prefix,
+                prefix.len() - 1,
+            );
+            if !look_matches {
+                continue;
+            }
+            let next = Pos {
+                a: a_state,
+                b: b_state,
+                is_prev_char_word: c == b'_' || c.is_ascii_alphanumeric(),
+                is_prev_char_newline: c == b'\n',
+                look_set: LookSet::empty().bits,
+            };
+            if visited.insert(next) {
+                to_check.push((next, prefix));
             }
         }
     }
-    valid
+    Ok(())
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ComponentId(usize);
+
+struct Component {
+    states: HashSet<Lr0StateId>,
+    forward_refs: HashSet<ComponentId>,
+    backward_refs: HashSet<ComponentId>,
+}
+
+struct StronglyConnectedComponents {
+    components: Vec<Component>,
+    component_map: HashMap<Lr0StateId, ComponentId>,
+}
+
+impl fmt::Display for StronglyConnectedComponents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        f.write_char('[')?;
+        for component in &self.components {
+            if component.states.len() == 1 {
+                continue;
+            }
+            if first {
+                first = false;
+            } else {
+                f.write_str(", ")?;
+            }
+            f.write_str("{")?;
+            for (i, state) in component.states.iter().enumerate() {
+                if i != 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", state)?;
+            }
+            f.write_str("}")?;
+        }
+        f.write_char(']')?;
+        Ok(())
+    }
+}
+
+impl StronglyConnectedComponents {
+    fn new(lr0_parse_table: &Lr0ParseTable) -> Self {
+        let mut components = Vec::new();
+        let mut component_map = HashMap::new();
+        let mut stack = Vec::new();
+        let mut indices = HashMap::new();
+        let mut low_link = HashMap::new();
+        let mut index = 0;
+
+        for state_id in 0..lr0_parse_table.states.len() {
+            let state_id = Lr0StateId(state_id);
+            if !indices.contains_key(&state_id) {
+                strong_connect(
+                    lr0_parse_table,
+                    state_id,
+                    &mut index,
+                    &mut stack,
+                    &mut indices,
+                    &mut low_link,
+                    &mut components,
+                    &mut component_map,
+                );
+            }
+        }
+
+        fn strong_connect(
+            lr0_parse_table: &Lr0ParseTable,
+            state_id: Lr0StateId,
+            index: &mut u32,
+            stack: &mut Vec<Lr0StateId>,
+            indices: &mut HashMap<Lr0StateId, u32>,
+            low_link: &mut HashMap<Lr0StateId, u32>,
+            components: &mut Vec<HashSet<Lr0StateId>>,
+            component_map: &mut HashMap<Lr0StateId, ComponentId>,
+        ) {
+            let state = &lr0_parse_table[state_id];
+            indices.insert(state_id, *index);
+            low_link.insert(state_id, *index);
+            *index += 1;
+            stack.push(state_id);
+            for &next in state.goto.values().chain(state.actions.values()) {
+                match indices.get(&next) {
+                    None => {
+                        strong_connect(
+                            lr0_parse_table,
+                            next,
+                            index,
+                            stack,
+                            indices,
+                            low_link,
+                            components,
+                            component_map,
+                        );
+                        low_link.insert(state_id, low_link[&state_id].min(low_link[&next]));
+                    }
+                    Some(next_index) if stack.contains(&next) => {
+                        low_link.insert(state_id, low_link[&state_id].min(*next_index));
+                    }
+                    _ => (),
+                }
+            }
+            if low_link[&state_id] == indices[&state_id] {
+                let mut component = HashSet::new();
+                loop {
+                    let next = stack.pop().unwrap();
+                    component.insert(next);
+                    component_map.insert(next, ComponentId(components.len()));
+                    if next == state_id {
+                        break;
+                    }
+                }
+                components.push(component);
+            }
+        }
+
+        let components = components
+            .into_iter()
+            .enumerate()
+            .map(|(i, states)| {
+                let component_id = ComponentId(i);
+                let mut forward_refs = HashSet::new();
+                let mut backward_refs = HashSet::new();
+                for state_id in states.iter().copied() {
+                    let state = &lr0_parse_table[state_id];
+                    for &next in state.goto.values().chain(state.actions.values()) {
+                        let next_component = component_map[&next];
+                        if next_component != component_id {
+                            forward_refs.insert(next_component);
+                        }
+                    }
+                    for (_, back_refs) in &state.item_set {
+                        for back_ref in back_refs {
+                            let prev_component = component_map[&back_ref.state_id];
+                            if prev_component != component_id {
+                                backward_refs.insert(prev_component);
+                            }
+                        }
+                    }
+                }
+                Component {
+                    states,
+                    forward_refs,
+                    backward_refs,
+                }
+            })
+            .collect();
+
+        Self {
+            components,
+            component_map,
+        }
+    }
+
+    fn component(&self, state_id: Lr0StateId) -> ComponentId {
+        self.component_map[&state_id]
+    }
+
+    fn states(&self, component: ComponentId) -> &HashSet<Lr0StateId> {
+        &self.components[component.0].states
+    }
+
+    fn refs(&self, component: ComponentId) -> &HashSet<ComponentId> {
+        &self.components[component.0].forward_refs
+    }
+
+    fn back_refs(&self, component: ComponentId) -> &HashSet<ComponentId> {
+        &self.components[component.0].backward_refs
+    }
+}
+
+struct StateSplitter<'a, F> {
+    db: &'a dyn Db,
+    language: Language,
+    lr0_parse_table: &'a mut Lr0ParseTable,
+    sccs: &'a mut StronglyConnectedComponents,
+    invalidate_state: &'a mut F,
+    component_paths: HashMap<ComponentId, HashMap<Vec<ComponentId>, usize>>,
+    components_splits: HashMap<ComponentId, Vec<ComponentId>>,
+    old_to_new_state_map: HashMap<(ComponentId, Lr0StateId), Lr0StateId>,
+    new_to_old_state_map: HashMap<Lr0StateId, Lr0StateId>,
+}
+
+impl<'a, F: FnMut(Lr0StateId)> StateSplitter<'a, F> {
+    #[instrument(level = "debug", skip_all)]
+    fn split_states(
+        db: &'a dyn Db,
+        language: Language,
+        lr0_parse_table: &'a mut Lr0ParseTable,
+        sccs: &'a mut StronglyConnectedComponents,
+        invalidate_state: &'a mut F,
+        state: Lr0StateId,
+        next: &HashMap<Terminal, HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>>,
+    ) -> bool {
+        let mut splitter = Self {
+            db,
+            language,
+            lr0_parse_table,
+            sccs,
+            invalidate_state,
+            component_paths: HashMap::new(),
+            components_splits: HashMap::new(),
+            old_to_new_state_map: HashMap::new(),
+            new_to_old_state_map: HashMap::new(),
+        };
+        let ambiguities: Vec<_> = next
+            .iter()
+            .flat_map(|(terminal, actions)| actions.iter().map(move |item| (terminal, item)))
+            .flat_map(|(terminal, (action, ambiguities))| {
+                ambiguities
+                    .values()
+                    .map(move |history| (history, terminal, action))
+            })
+            .fold(Vec::new(), |mut acc, (history, terminal, action)| {
+                fn recurse(
+                    history: &Arc<History>,
+                    terminal: &Terminal,
+                    action: &ConflictedAction,
+                    path: &mut VecDeque<Lr0StateId>,
+                    acc: &mut Vec<(VecDeque<Lr0StateId>, Terminal, ConflictedAction)>,
+                ) {
+                    path.push_back(history.location.state_id);
+                    if history.prev.is_empty() {
+                        acc.push((path.clone(), terminal.clone(), action.clone()));
+                    } else {
+                        for prev in &history.prev {
+                            recurse(prev, terminal, action, path, acc);
+                        }
+                    }
+                    path.pop_back();
+                }
+                recurse(history, terminal, action, &mut VecDeque::new(), &mut acc);
+                acc
+            });
+        let mut splits = Vec::new();
+        splitter.trace_paths(
+            ambiguities,
+            splitter.sccs.component(state),
+            HashMap::new(),
+            &mut Vec::new(),
+            &mut splits,
+        );
+        if splits.len() <= 1 {
+            return false;
+        }
+        let splits = splits
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, (_, paths))| {
+                paths
+                    .into_iter()
+                    .map(move |mut path| (path.pop().unwrap(), (path, i)))
+            })
+            .into_group_map();
+        for (start, paths) in splits {
+            // Paths definitely have at least two components as there must be
+            // more than one split and therefore more than one path.
+            for (component, paths) in paths
+                .into_iter()
+                .map(|(mut path, i)| (path.pop().unwrap(), (path, i)))
+                .into_group_map()
+            {
+                splitter.split(start, component, paths);
+            }
+        }
+        true
+    }
+
+    fn trace_paths(
+        &self,
+        mut ambiguities: Vec<(VecDeque<Lr0StateId>, Terminal, ConflictedAction)>,
+        component: ComponentId,
+        mut lookahead: HashMap<Terminal, HashSet<ConflictedAction>>,
+        path: &mut Vec<ComponentId>,
+        splits: &mut Vec<(
+            Option<HashMap<Terminal, HashSet<ConflictedAction>>>,
+            Vec<Vec<ComponentId>>,
+        )>,
+    ) {
+        path.push(component);
+
+        ambiguities.retain_mut(|(history, terminal, action)| {
+            while let Some(loc) = history.back() {
+                if self.sccs.component(*loc) != component {
+                    return true;
+                }
+                history.pop_back();
+            }
+            lookahead
+                .entry(terminal.clone())
+                .or_default()
+                .insert(action.clone());
+            false
+        });
+
+        if !ambiguities.is_empty() {
+            for &next_component in self.sccs.back_refs(component) {
+                let ambiguities = ambiguities
+                    .iter()
+                    .filter(|(history, _, _)| {
+                        self.sccs.component(*history.back().unwrap()) == next_component
+                    })
+                    .cloned()
+                    .collect();
+                self.trace_paths(ambiguities, next_component, lookahead.clone(), path, splits);
+            }
+        } else {
+            // First check if there are any conflicts between lookahead tokens
+            // that could never be resolved.
+            for terminal_a in lookahead.keys() {
+                for terminal_b in lookahead.keys() {
+                    if terminal_a == terminal_b {
+                        continue;
+                    }
+                    if let Err(diagnostic) = terminals_conflict(
+                        self.db,
+                        self.language,
+                        terminal_a.clone(),
+                        terminal_b.clone(),
+                    ) {
+                        emit_diagnostic(diagnostic);
+                        return;
+                    }
+                }
+            }
+            // Next check if there are any overlaps between actions that mean
+            // we'll have to extend the lookahead.
+            if lookahead.values().any(|actions| actions.len() > 1) {
+                // This path is ambiguous in itself, hopefully the next
+                // lookahead terminal will disambiguate.
+                match splits.iter_mut().find(|(info, _)| info.is_none()) {
+                    Some((_, paths)) => paths.push(path.clone()),
+                    None => splits.push((None, vec![path.clone()])),
+                }
+            } else {
+                // This path is unambiguous, so lets try and merge it with an
+                // existing split if possible.
+                let existing_split = splits.iter_mut().find(|(split_lookahead, _)| {
+                    let Some(split_lookahead) = split_lookahead else {
+                        return false;
+                    };
+                    // Check that none of the terminals conflict and that
+                    // they don't introduce any action conflicts.
+                    for (terminal, action) in &lookahead {
+                        if let Some(split_action) = split_lookahead.get(terminal) {
+                            if action != split_action {
+                                return false;
+                            }
+                        } else {
+                            for split_terminal in split_lookahead.keys() {
+                                if terminals_conflict(
+                                    self.db,
+                                    self.language,
+                                    terminal.clone(),
+                                    split_terminal.clone(),
+                                )
+                                .is_err()
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    true
+                });
+                match existing_split {
+                    Some((_, split_paths)) => split_paths.push(path.clone()),
+                    None => splits.push((Some(lookahead.clone()), vec![path.clone()])),
+                }
+            }
+        }
+        path.pop();
+    }
+
+    fn split(
+        &mut self,
+        prev_component: ComponentId,
+        component: ComponentId,
+        paths: Vec<(Vec<ComponentId>, usize)>,
+    ) {
+        let new_component = self
+            .components_splits
+            .get(&component)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|component| {
+                let existing_paths = &self.component_paths[component];
+                paths.iter().all(|(path, split)| {
+                    let existing_split = existing_paths.get(path);
+                    existing_split.is_none() || existing_split == Some(split)
+                })
+            })
+            .unwrap_or_else(|| self.split_component(component));
+        self.patch_component(
+            prev_component,
+            *self.components_splits[&component]
+                .iter()
+                .find(|c| self.sccs.refs(prev_component).contains(c))
+                .unwrap(),
+            new_component,
+        );
+        self.component_paths
+            .entry(new_component)
+            .or_default()
+            .extend(paths.iter().cloned());
+        for (next_component, paths) in paths
+            .into_iter()
+            .filter_map(|(mut path, split)| path.pop().map(|component| (component, (path, split))))
+            .into_group_map()
+        {
+            self.split(new_component, next_component, paths);
+        }
+    }
+
+    fn split_component(&mut self, component: ComponentId) -> ComponentId {
+        if !self
+            .component_paths
+            .get(&component)
+            .is_some_and(|set| !set.is_empty())
+        {
+            // If there are no paths associated with the component then we can
+            // just use it directly.
+            for &state in &self.sccs.components[component.0].states {
+                self.sccs.component_map.insert(state, component);
+                self.old_to_new_state_map.insert((component, state), state);
+                self.new_to_old_state_map.insert(state, state);
+            }
+            self.components_splits.insert(component, vec![component]);
+            return component;
+        }
+
+        let new_component_id = ComponentId(self.sccs.components.len());
+        let mut states = HashSet::new();
+        for &old_state in &self.sccs.components[component.0].states {
+            let new_state_id = Lr0StateId(self.lr0_parse_table.states.len());
+            let new_state = self.lr0_parse_table[old_state].clone();
+
+            for next_state_id in Iterator::chain(
+                new_state.actions.values().copied(),
+                new_state.goto.values().copied(),
+            ) {
+                if self.sccs.components[component.0]
+                    .states
+                    .contains(&next_state_id)
+                {
+                    continue;
+                }
+                for (_, back_refs) in &mut self.lr0_parse_table[next_state_id].item_set {
+                    let mut to_insert = Vec::new();
+                    for back_ref in &*back_refs {
+                        if back_ref.state_id == old_state {
+                            to_insert.push(ItemIndex {
+                                state_id: new_state_id,
+                                item: back_ref.item,
+                            });
+                        }
+                    }
+                    back_refs.extend(to_insert);
+                }
+            }
+
+            self.lr0_parse_table.states.push(new_state);
+            (self.invalidate_state)(new_state_id);
+            self.sccs
+                .component_map
+                .insert(new_state_id, new_component_id);
+            states.insert(new_state_id);
+            self.old_to_new_state_map
+                .insert((new_component_id, old_state), new_state_id);
+            self.new_to_old_state_map.insert(new_state_id, old_state);
+        }
+        for &state in &states {
+            let state = &mut self.lr0_parse_table[state];
+            for (_, back_refs) in &mut state.item_set {
+                let old_back_refs = std::mem::take(back_refs);
+                for mut back_ref in old_back_refs {
+                    if let Some(new_state) = self
+                        .old_to_new_state_map
+                        .get(&(new_component_id, back_ref.state_id))
+                    {
+                        back_ref.state_id = *new_state;
+                        back_refs.insert(back_ref);
+                    }
+                }
+            }
+            for next_state in Iterator::chain(state.actions.values_mut(), state.goto.values_mut()) {
+                if let Some(new_state) = self
+                    .old_to_new_state_map
+                    .get(&(new_component_id, *next_state))
+                {
+                    *next_state = *new_state;
+                }
+            }
+        }
+        let new_component = Component {
+            states,
+            forward_refs: self.sccs.refs(component).clone(),
+            backward_refs: HashSet::new(),
+        };
+        for next_component in &new_component.forward_refs {
+            self.sccs.components[next_component.0]
+                .backward_refs
+                .insert(new_component_id);
+        }
+        self.sccs.components.push(new_component);
+        self.components_splits
+            .entry(component)
+            .or_default()
+            .push(new_component_id);
+        new_component_id
+    }
+
+    fn patch_component(
+        &mut self,
+        component_id: ComponentId,
+        old_dest_id: ComponentId,
+        new_dest_id: ComponentId,
+    ) {
+        if old_dest_id == new_dest_id {
+            return;
+        }
+
+        fn get_3_components(
+            components: &mut [Component],
+            a: ComponentId,
+            b: ComponentId,
+            c: ComponentId,
+        ) -> (&mut Component, &mut Component, &mut Component) {
+            assert_ne!(a, b);
+            assert_ne!(b, c);
+            assert_ne!(a, c);
+            assert!((0..components.len()).contains(&a.0));
+            assert!((0..components.len()).contains(&b.0));
+            assert!((0..components.len()).contains(&c.0));
+            let components = components.as_mut_ptr();
+            unsafe {
+                (
+                    &mut *components.add(a.0),
+                    &mut *components.add(b.0),
+                    &mut *components.add(c.0),
+                )
+            }
+        }
+        let (component, old_dest, new_dest) = get_3_components(
+            &mut self.sccs.components,
+            component_id,
+            old_dest_id,
+            new_dest_id,
+        );
+
+        old_dest.backward_refs.remove(&component_id);
+        new_dest.backward_refs.insert(component_id);
+        component.forward_refs.remove(&old_dest_id);
+        component.forward_refs.insert(new_dest_id);
+
+        for &state_id in &component.states {
+            (self.invalidate_state)(state_id);
+            let states = self.lr0_parse_table.states.as_mut_slice();
+            assert!(state_id.0 < states.len());
+            let state = unsafe { &mut *states.as_mut_ptr().add(state_id.0) };
+            for dest_state in
+                std::iter::Iterator::chain(state.actions.values_mut(), state.goto.values_mut())
+                    .filter(|id| old_dest.states.contains(id))
+            {
+                let old_dest_state_id = *dest_state;
+                let new_dest_state_id = self.old_to_new_state_map[&(
+                    new_dest_id,
+                    self.new_to_old_state_map
+                        .get(dest_state)
+                        .copied()
+                        .unwrap_or(*dest_state),
+                )];
+                *dest_state = new_dest_state_id;
+
+                assert_ne!(state_id, old_dest_state_id);
+                assert_ne!(state_id, new_dest_state_id);
+                assert_ne!(old_dest_state_id, new_dest_state_id);
+                assert!(old_dest_state_id.0 < states.len());
+                assert!(new_dest_state_id.0 < states.len());
+                let old_dest_state = unsafe { &mut *states.as_mut_ptr().add(old_dest_state_id.0) };
+                let new_dest_state = unsafe { &mut *states.as_mut_ptr().add(new_dest_state_id.0) };
+                for ((_, old_back_refs), (_, new_back_refs)) in std::iter::zip(
+                    old_dest_state.item_set.iter_mut(),
+                    new_dest_state.item_set.iter_mut(),
+                ) {
+                    old_back_refs.retain(|old_back_ref| {
+                        if old_back_ref.state_id == state_id {
+                            new_back_refs.insert(ItemIndex {
+                                state_id,
+                                item: old_back_ref.item,
+                            });
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+            }
+        }
+    }
 }

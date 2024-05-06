@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::Path};
 use ariadne::{Label, Report, ReportKind, Source};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use tracing::debug;
 
 use crate::Span;
 
@@ -61,10 +62,15 @@ impl<'a> ariadne::Cache<()> for NamedSource<'a> {
 
 pub fn emit(message: impl Into<String>, labels: Vec<(Span, Option<String>)>) {
     assert!(!labels.is_empty());
-    DIAGNOSTICS.lock().insert(Diagnostic {
+    emit_diagnostic(Diagnostic {
         message: message.into(),
         labels,
     });
+}
+
+pub fn emit_diagnostic(diagnostic: Diagnostic) {
+    debug!("emitting diagnostic: {:?}", diagnostic);
+    DIAGNOSTICS.lock().insert(diagnostic);
 }
 
 pub fn diagnostics() -> Vec<Diagnostic> {

@@ -66,7 +66,7 @@ pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<Parse
         match action {
             Action::Ambiguous { .. } => unreachable!(),
             Action::Shift(terminal, new_state) => {
-                let regex = terminal_nfa(db, language, terminal);
+                let regex = terminal_nfa(db, language, terminal.clone());
                 let pike_vm = PikeVM::new_from_nfa(regex).unwrap();
                 let Some(half_match) =
                     pike_vm.find(&mut pike_vm.create_cache(), input.clone().range(offset..))

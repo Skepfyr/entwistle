@@ -52,9 +52,7 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
                 None,
             )],
         ),
-        NonTerminalInner::Internal { alternative } => {
-            Production::new(db, vec![alternative.clone()])
-        }
+        NonTerminalInner::Internal { alternative } => Production::new(db, vec![*alternative]),
         NonTerminalInner::Named {
             name,
             generics: generic_parameters,
@@ -447,9 +445,10 @@ fn lower_term(
 }
 
 #[instrument(skip_all, fields(terminal = %terminal.display(db)))]
-pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: &Terminal) -> NFA {
+#[salsa::tracked(no_eq)]
+pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: Terminal) -> NFA {
     match terminal {
-        &Terminal::Named { ident, span } => {
+        Terminal::Named { ident, span } => {
             let nfa = ident_nfa(db, language, ident, span, &mut HashSet::new());
             if nfa.has_empty() {
                 emit("Tokens must not match the empty string", vec![(span, None)]);
