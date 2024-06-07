@@ -123,7 +123,7 @@
   RawIdentifier
 
 -_:
-  Whitespace
+  Whitespace?
 #  Whitespace? Comment Whitespace?
 
 Comment:
@@ -301,7 +301,7 @@ Shebang: "#!" (/[^\[\n\r]/ /[^\n\r]/+)?
 # TODO: Shebang should be the below but BlockComment doesn't work yet.
 # "#!" Whitespace* (BlockComment Whitespace*)? (/[^\[\n\r]/ /[^\n\r]/+)?
 
--CommaSeparated<Item>: Item (_ "," _ Item)? (_ ",")?
+-CommaSeparated<Item>: Item (_ "," _ Item)* (_ ",")?
 
 ConfigurationPredicate:
   ConfigurationOption
@@ -395,7 +395,7 @@ StaticItem: static _ (mut _)? Identifier _ ":" _ Type _ ("=" _ Expression _)? ";
 
 Trait: (unsafe _)? trait _ Identifier _ GenericParams? (":" _ TypeParamBounds?)? WhereClause? "{" InnerAttribute* AssociatedItem* "}"
 Implementation: InherentImpl | TraitImpl
-InherentImpl: impl _ (GenericParams _)? Type _ (WhereClause _)? "{" _ (InnerAttribute _)* (AssociatedItem _)* "}"
+InherentImpl: (unsafe _)? impl _ (GenericParams _)? Type _ (WhereClause _)? "{" _ (InnerAttribute _)* (AssociatedItem _)* "}"
 TraitImpl: (unsafe _)? impl _ GenericParams? "!"? _ TypePath _ for _ Type _ WhereClause? "{" InnerAttribute* AssociatedItem* "}"
 
 ExternBlock: (unsafe _)? extern _ Abi? _ "{" InnerAttribute* ExternalItem* "}"
@@ -601,16 +601,18 @@ TuplePattern: '(' _ (TuplePatternItems _)? ')'
 TuplePatternItems: '..' | Pattern _ ',' (_ CommaSeparated<Pattern>)?
 
 Type:
-  TypeNoBounds
   # TODO: These differ from the reference as TypeParamBounds is ambiguous
   # with TypeNoBounds -> impl _ TraitBound.
   impl _ TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
-  (dyn _)? TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
+  dyn _ TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
+  TypeParamBound (_ '+' _ TypeParamBound)+ (_ '+')?
+  TypeMaybeBounds
 TypeNoBounds:
-  '(' _ Type _ ')'
   impl _ TraitBound
-  (dyn _)? TraitBound
-  TypePath
+  dyn _ TraitBound
+  TraitBound
+  TypeMaybeBounds
+-TypeMaybeBounds:
   TupleType
   NeverType
   RawPointerType

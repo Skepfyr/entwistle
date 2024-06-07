@@ -33,11 +33,11 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
             db,
             vec![Alternative::new(
                 db,
-                non_terminal.span(db),
                 vec![
                     Term {
                         kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                             db,
+                            language,
                             rule.clone(),
                             None,
                             BTreeMap::new(),
@@ -160,13 +160,8 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
                 })
                 .collect();
             if last != definition.rules.len() {
-                let span = Span {
-                    start: definition.rules[first].span.start,
-                    end: definition.rules[last - 1].span.end,
-                };
                 alternatives.push(Alternative::new(
                     db,
-                    span,
                     vec![Term {
                         kind: TermKind::NonTerminal(NonTerminal::new_named(
                             db,
@@ -184,55 +179,33 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
             }
             Production::new(db, alternatives)
         }
-        NonTerminalInner::Anonymous {
-            rule,
-            context,
-            generics,
-        } => {
-            if rule.alternatives.len() == 1
-                && rule.alternatives.iter().next().unwrap().sequence.len() == 1
-            {
-                let &(ref item, ref quantifier, span) =
-                    &rule.alternatives.iter().next().unwrap().sequence[0];
-                let term = lower_term(
-                    db,
-                    language,
-                    generics,
-                    item,
-                    Quantifier::Once,
-                    span,
-                    context.as_ref(),
-                );
-                let mut alternatives: Vec<Alternative> = Vec::new();
-                // Zero times
-                if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
-                    alternatives.push(Alternative::new(db, span, vec![], None));
-                }
-                // One time
-                if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce | Quantifier::Once =
-                    quantifier
-                {
-                    alternatives.push(Alternative::new(db, span, vec![term.clone()], None));
-                }
-                // Many times
-                if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
-                    alternatives.push(Alternative::new(
-                        db,
-                        span,
-                        vec![
-                            Term {
-                                kind: TermKind::NonTerminal(non_terminal),
-                                silent: true,
-                            },
-                            term,
-                        ],
-                        None,
-                    ));
-                }
-                Production::new(db, alternatives)
-            } else {
-                lower_rule(db, language, rule, context.as_ref(), generics)
+        NonTerminalInner::Anonymous { production } => *production,
+        NonTerminalInner::Quantified { term, quantifier } => {
+            let mut alternatives: Vec<Alternative> = Vec::new();
+            // Zero times
+            if let Quantifier::Any | Quantifier::AtMostOnce = quantifier {
+                alternatives.push(Alternative::new(db, vec![], None));
             }
+            // One time
+            if let Quantifier::AtMostOnce | Quantifier::AtLeastOnce | Quantifier::Once = quantifier
+            {
+                alternatives.push(Alternative::new(db, vec![term.clone()], None));
+            }
+            // Many times
+            if let Quantifier::Any | Quantifier::AtLeastOnce = quantifier {
+                alternatives.push(Alternative::new(
+                    db,
+                    vec![
+                        Term {
+                            kind: TermKind::NonTerminal(non_terminal),
+                            silent: true,
+                        },
+                        term.clone(),
+                    ],
+                    None,
+                ));
+            }
+            Production::new(db, alternatives)
         }
     }
 }
@@ -270,6 +243,7 @@ fn lower_rule(
                                 sequence,
                                 Some(NonTerminal::new_anonymous(
                                     db,
+                                    language,
                                     rule.clone(),
                                     current_name,
                                     generics.clone(),
@@ -293,7 +267,7 @@ fn lower_rule(
                         )
                     })
                     .collect::<Vec<_>>();
-                Alternative::new(db, expression.span, terms, lookahead)
+                Alternative::new(db, terms, lookahead)
             })
             .collect(),
     )
@@ -309,24 +283,7 @@ fn lower_term(
     span: Span,
     current_name: Option<&Name>,
 ) -> Term {
-    if quantifier != Quantifier::Once {
-        let mut alternatives = BTreeSet::new();
-        alternatives.insert(Expression {
-            sequence: vec![(item.clone(), quantifier, span)],
-            span,
-        });
-        return Term {
-            kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
-                db,
-                Rule { alternatives, span },
-                current_name,
-                generics.clone(),
-            )),
-            silent: true,
-        };
-    }
-
-    match item {
+    let term = match item {
         Item::Ident {
             mark,
             ident,
@@ -343,6 +300,7 @@ fn lower_term(
                         return Term {
                             kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                                 db,
+                                language,
                                 Rule {
                                     span,
                                     alternatives: BTreeSet::new(),
@@ -379,6 +337,7 @@ fn lower_term(
                         .map(|arg| {
                             NonTerminal::new_anonymous(
                                 db,
+                                language,
                                 arg.clone(),
                                 current_name,
                                 generics.clone(),
@@ -417,6 +376,7 @@ fn lower_term(
         Item::Group(rule) => Term {
             kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                 db,
+                language,
                 rule.clone(),
                 current_name,
                 generics.clone(),
@@ -431,6 +391,7 @@ fn lower_term(
             Term {
                 kind: TermKind::NonTerminal(NonTerminal::new_anonymous(
                     db,
+                    language,
                     Rule {
                         span,
                         alternatives: BTreeSet::new(),
@@ -441,6 +402,15 @@ fn lower_term(
                 silent: true,
             }
         }
+    };
+
+    if quantifier != Quantifier::Once {
+        Term {
+            kind: TermKind::NonTerminal(NonTerminal::new_quantified(db, term, quantifier)),
+            silent: true,
+        }
+    } else {
+        term
     }
 }
 
@@ -1170,9 +1140,11 @@ pub enum NonTerminalInner {
         span: Span,
     },
     Anonymous {
-        rule: Rule,
-        context: Option<Name>,
-        generics: BTreeMap<Ident, NonTerminal>,
+        production: Production,
+    },
+    Quantified {
+        term: Term,
+        quantifier: Quantifier,
     },
 }
 
@@ -1198,6 +1170,7 @@ impl NonTerminal {
 
     pub fn new_anonymous(
         db: &dyn Db,
+        language: Language,
         rule: Rule,
         context: Option<&Name>,
         generics: BTreeMap<Ident, Self>,
@@ -1217,17 +1190,17 @@ impl NonTerminal {
                     Item::Lookaround(_, rule) => contains_non_super_ident(rule, context),
                 })
         }
-        let context = context
-            .filter(|name| contains_non_super_ident(&rule, &name.ident))
-            .cloned();
+        let context = context.filter(|name| contains_non_super_ident(&rule, &name.ident));
         Self::new(
             db,
             NonTerminalInner::Anonymous {
-                rule,
-                context,
-                generics,
+                production: lower_rule(db, language, &rule, context, &generics),
             },
         )
+    }
+
+    pub fn new_quantified(db: &dyn Db, term: Term, quantifier: Quantifier) -> Self {
+        Self::new(db, NonTerminalInner::Quantified { term, quantifier })
     }
 
     pub fn is_goal(self, db: &dyn Db) -> bool {
@@ -1236,6 +1209,10 @@ impl NonTerminal {
 
     pub fn is_internal(self, db: &dyn Db) -> bool {
         matches!(self.inner(db), NonTerminalInner::Internal { .. })
+    }
+
+    pub fn is_named(self, db: &dyn Db) -> bool {
+        matches!(self.inner(db), NonTerminalInner::Named { .. })
     }
 
     pub fn ident(self, db: &dyn Db) -> Ident {
@@ -1248,15 +1225,7 @@ impl NonTerminal {
                 span: _,
             } => *ident,
             NonTerminalInner::Anonymous { .. } => Ident::new(db, "anon".into()),
-        }
-    }
-
-    pub fn span(&self, db: &dyn Db) -> Span {
-        match self.inner(db) {
-            NonTerminalInner::Goal { rule, .. } => rule.span,
-            NonTerminalInner::Internal { alternative } => alternative.span(db),
-            NonTerminalInner::Named { span, .. } => *span,
-            NonTerminalInner::Anonymous { rule, .. } => rule.span,
+            NonTerminalInner::Quantified { .. } => Ident::new(db, "quantified".into()),
         }
     }
 }
@@ -1287,25 +1256,11 @@ impl DisplayWithDb for NonTerminal {
                     f.write_str(">")?;
                 }
             }
-            NonTerminalInner::Anonymous {
-                rule,
-                generics,
-                context,
-            } => {
-                match context {
-                    Some(context) => write!(f, "{{{}}}#{}", rule.display(db), context.display(db))?,
-                    None => write!(f, "{{{}}}", rule.display(db))?,
-                }
-                if !generics.is_empty() {
-                    f.write_str("<")?;
-                    for (i, (name, value)) in generics.iter().enumerate() {
-                        if i != 0 {
-                            f.write_str(", ")?;
-                        }
-                        write!(f, "{}={}", name.display(db), value.display(db))?;
-                    }
-                    f.write_str(">")?;
-                }
+            NonTerminalInner::Anonymous { production } => {
+                write!(f, "({})", production.display(db))?;
+            }
+            NonTerminalInner::Quantified { term, quantifier } => {
+                write!(f, "{}{}", term.display(db), quantifier)?;
             }
         }
         Ok(())
@@ -1375,7 +1330,7 @@ impl DisplayWithDb for Terminal {
             Self::Named { ident, .. } => {
                 write!(f, "@{}", ident.display(db))
             }
-            Self::Anonymous { name, .. } => write!(f, "@'{name}'"),
+            Self::Anonymous { name, .. } => write!(f, "'{name}'"),
             Self::EndOfInput { .. } => write!(f, "$"),
         }
     }
@@ -1484,7 +1439,6 @@ impl DisplayWithDb for Production {
 
 #[salsa::interned]
 pub struct Alternative {
-    pub span: Span,
     #[return_ref]
     pub terms: Vec<Term>,
     pub negative_lookahead: Option<NonTerminal>,
@@ -1513,7 +1467,8 @@ pub struct Term {
 
 impl DisplayWithDb for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        if self.silent {
+        // Only show the silent marker if it's not obvious.
+        if self.silent && matches!(self.kind, TermKind::NonTerminal(nt) if nt.is_named(db)) {
             f.write_char('-')?;
         }
         <TermKind as DisplayWithDb>::fmt(&self.kind, f, db)

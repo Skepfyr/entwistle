@@ -11,7 +11,7 @@ use crate::{
     language::Language,
     lower::{Alternative, NonTerminal, Term, Terminal},
     util::DisplayWithDb,
-    Db, Span,
+    Db, 
 };
 
 use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
@@ -54,10 +54,7 @@ impl TermString {
         let parse_table = lr0_parse_table(
             db,
             language,
-            NonTerminal::new_internal(
-                db,
-                Alternative::new(db, Span { start: 0, end: 0 }, terms, None),
-            ),
+            NonTerminal::new_internal(db, Alternative::new(db, terms, None)),
         );
         TermString {
             parse_table,

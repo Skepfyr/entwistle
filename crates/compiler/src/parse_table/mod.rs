@@ -558,6 +558,7 @@ fn make_action(
         return Some(Action::Reduce(
             NonTerminal::new_anonymous(
                 db,
+                language,
                 Rule {
                     span: Span { start: 0, end: 0 },
                     alternatives: BTreeSet::new(),
@@ -565,7 +566,7 @@ fn make_action(
                 None,
                 BTreeMap::new(),
             ),
-            Alternative::new(db, Span { start: 0, end: 0 }, Vec::new(), None),
+            Alternative::new(db, Vec::new(), None),
         ));
     } else if conflicts.len() == 1 {
         return Some(
