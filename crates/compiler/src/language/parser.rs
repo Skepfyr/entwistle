@@ -97,8 +97,8 @@ fn file(db: &dyn Db) -> impl Parser<char, Language, Error = ParseError> + '_ {
                                 vec![(
                                     rule.span,
                                     Some(format!(
-                                        "Duplicate definition of {:?}",
-                                        rule.ident.debug_with(db, true)
+                                        "Duplicate definition of {}",
+                                        rule.ident.display(db)
                                     )),
                                 )],
                             );
