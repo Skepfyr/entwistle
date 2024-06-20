@@ -10,12 +10,12 @@ use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
 mod parser;
 
 #[salsa::interned]
-pub struct Ident {
+pub struct Ident<'db> {
     #[return_ref]
     pub name: String,
 }
 
-impl DisplayWithDb for Ident {
+impl<'db> DisplayWithDb for Ident<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         f.write_str(self.name(db))
     }
@@ -28,22 +28,22 @@ pub struct Source {
 }
 
 #[salsa::tracked]
-pub struct Language {
+pub struct Language<'db> {
     #[return_ref]
-    pub definitions: HashMap<Ident, Definition>,
+    pub definitions: HashMap<Ident<'db>, Definition<'db>>,
     #[return_ref]
-    pub tests: Vec<Test>,
+    pub tests: Vec<Test<'db>>,
 }
 
 #[salsa::tracked]
-pub fn parse(db: &dyn Db, input: Source) -> Language {
+pub fn parse<'db>(db: &'db dyn Db, input: Source) -> Language<'db> {
     parser::parse_grammar(db, input.text(db))
 }
 
 #[salsa::tracked]
-impl Language {
+impl<'db> Language<'db> {
     #[salsa::tracked]
-    pub fn definition(self, db: &dyn Db, ident: Ident, span: Span) -> Option<Definition> {
+    pub fn definition(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> Option<Definition<'db>> {
         match self.definitions(db).get(&ident).cloned() {
             Some(definition) => Some(definition),
             None => {
@@ -54,7 +54,7 @@ impl Language {
     }
 
     #[salsa::tracked]
-    pub fn dependencies(self, db: &dyn Db, ident: Ident, span: Span) -> HashSet<Ident> {
+    pub fn dependencies(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> HashSet<Ident<'db>> {
         let mut dependencies = HashSet::new();
         let mut visited = HashSet::new();
         let mut next = vec![ident];
@@ -70,8 +70,8 @@ impl Language {
     }
 
     #[salsa::tracked]
-    pub fn direct_dependencies(self, db: &dyn Db, ident: Ident, span: Span) -> HashSet<Ident> {
-        fn production_deps(dependencies: &mut HashSet<Ident>, production: &Rule) {
+    pub fn direct_dependencies(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> HashSet<Ident<'db>> {
+        fn production_deps<'db>(dependencies: &mut HashSet<Ident<'db>>, production: &Rule<'db>) {
             production
                 .alternatives
                 .iter()
@@ -97,22 +97,22 @@ impl Language {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Definition {
+pub struct Definition<'db> {
     pub silent: bool,
     pub atomic: bool,
-    pub ident: Ident,
-    pub generics: Vec<Ident>,
+    pub ident: Ident<'db>,
+    pub generics: Vec<Ident<'db>>,
     pub span: Span,
-    pub rules: Vec<Rule>,
+    pub rules: Vec<Rule<'db>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Rule {
+pub struct Rule<'db> {
     pub span: Span,
-    pub alternatives: BTreeSet<Expression>,
+    pub alternatives: BTreeSet<Expression<'db>>,
 }
 
-impl DisplayWithDb for Rule {
+impl<'db> DisplayWithDb for Rule<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         for (i, expression) in self.alternatives.iter().enumerate() {
             if i > 0 {
@@ -125,12 +125,12 @@ impl DisplayWithDb for Rule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Expression {
+pub struct Expression<'db> {
     pub span: Span,
-    pub sequence: Vec<(Item, Quantifier, Span)>,
+    pub sequence: Vec<(Item<'db>, Quantifier, Span)>,
 }
 
-impl DisplayWithDb for Expression {
+impl<'db> DisplayWithDb for Expression<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         for (i, (item, quantifier, _)) in self.sequence.iter().enumerate() {
             if i > 0 {
@@ -143,19 +143,19 @@ impl DisplayWithDb for Expression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Item {
+pub enum Item<'db> {
     Ident {
         mark: Mark,
-        ident: Ident,
-        generics: Vec<Rule>,
+        ident: Ident<'db>,
+        generics: Vec<Rule<'db>>,
     },
     String(String),
     Regex(String),
-    Group(Rule),
-    Lookaround(LookaroundType, Rule),
+    Group(Rule<'db>),
+    Lookaround(LookaroundType, Rule<'db>),
 }
 
-impl DisplayWithDb for Item {
+impl<'db> DisplayWithDb for Item<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
             Item::Ident {
@@ -252,23 +252,23 @@ impl fmt::Display for Mark {
 }
 
 #[salsa::tracked]
-pub struct Test {
+pub struct Test<'db> {
     #[return_ref]
-    pub goal: Rule,
+    pub goal: Rule<'db>,
     #[return_ref]
     pub test: String,
     pub test_span: Span,
     #[return_ref]
-    pub parse_trees: Vec<ParseTree>,
+    pub parse_trees: Vec<ParseTree<'db>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ParseTree {
-    Leaf { ident: Option<Ident>, data: String },
-    Node { ident: Ident, nodes: Vec<ParseTree> },
+pub enum ParseTree<'db> {
+    Leaf { ident: Option<Ident<'db>>, data: String },
+    Node { ident: Ident<'db>, nodes: Vec<ParseTree<'db>> },
 }
 
-impl DisplayWithDb for ParseTree {
+impl<'db> DisplayWithDb for ParseTree<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
             ParseTree::Leaf { ident, data } => {
@@ -289,7 +289,7 @@ impl DisplayWithDb for ParseTree {
     }
 }
 
-impl ParseTree {
+impl<'db> ParseTree<'db> {
     pub fn ident(&self) -> Option<&Ident> {
         match self {
             ParseTree::Leaf { ident, .. } => ident.as_ref(),

@@ -48,10 +48,12 @@ impl ariadne::Span for Span {
     }
 }
 
-struct NamedSource<'a>(&'a Path, Source);
+struct NamedSource<'a>(&'a Path, Source<&'a str>);
 
 impl<'a> ariadne::Cache<()> for NamedSource<'a> {
-    fn fetch(&mut self, _: &()) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
+    type Storage = &'a str;
+
+    fn fetch(&mut self, _: &()) -> Result<&Source<&'a str>, Box<dyn std::fmt::Debug + '_>> {
         Ok(&self.1)
     }
 

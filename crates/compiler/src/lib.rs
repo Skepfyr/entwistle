@@ -9,19 +9,19 @@ pub mod util;
 
 #[salsa::jar(db = Db)]
 pub struct Jar(
-    language::Ident,
+    language::Ident<'_>,
     language::Source,
     language::parse,
-    language::Language,
+    language::Language<'_>,
     language::Language_definition,
     language::Language_dependencies,
     language::Language_direct_dependencies,
-    language::Test,
+    language::Test<'_>,
     lower::production,
     lower::terminal_nfa,
-    lower::NonTerminal,
-    lower::Production,
-    lower::Alternative,
+    lower::NonTerminal<'_>,
+    lower::Production<'_>,
+    lower::Alternative<'_>,
     parse_table::lr0_parse_table,
     parse_table::terminals_conflict,
     test::run_test,
@@ -29,7 +29,7 @@ pub struct Jar(
 );
 
 #[salsa::tracked]
-pub fn debug_new_non_terminal(db: &dyn Db, ident: language::Ident) -> lower::NonTerminal {
+pub fn debug_new_non_terminal<'db>(db: &'db dyn Db, ident: language::Ident<'db>) -> lower::NonTerminal<'db> {
     lower::NonTerminal::new_named(
         db,
         lower::Name { ident, index: 0 },

@@ -14,7 +14,7 @@ use crate::{
 
 #[instrument(skip_all)]
 #[salsa::tracked]
-pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<ParseTree>> {
+pub fn run_test<'db>(db: &'db dyn Db, language: Language<'db>, test: Test<'db>) -> Option<Vec<ParseTree<'db>>> {
     let parse_table = parse_table(db, language, test.goal(db).clone());
     let mut states = vec![StateId::START];
     let mut forest = vec![];
@@ -84,7 +84,7 @@ pub fn run_test(db: &dyn Db, language: Language, test: Test) -> Option<Vec<Parse
                     return None;
                 };
                 forest.push(ParseTree::Leaf {
-                    ident: terminal.ident().cloned(),
+                    ident: terminal.ident(),
                     data: String::from_utf8(input.haystack()[half_match.range()].to_owned())
                         .unwrap(),
                 });

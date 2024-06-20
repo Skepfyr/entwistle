@@ -27,7 +27,11 @@ use crate::{
 
 #[instrument(skip_all, fields(non_terminal = %non_terminal.display(db)))]
 #[salsa::tracked]
-pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) -> Production {
+pub fn production<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    non_terminal: NonTerminal<'db>,
+) -> Production<'db> {
     match non_terminal.inner(db) {
         NonTerminalInner::Goal { rule } => Production::new(
             db,
@@ -211,13 +215,13 @@ pub fn production(db: &dyn Db, language: Language, non_terminal: NonTerminal) ->
 }
 
 #[instrument(skip_all, fields(rule = %rule.display(db), ?current_name, ?generics))]
-fn lower_rule(
-    db: &dyn Db,
-    language: Language,
-    rule: &Rule,
-    current_name: Option<&Name>,
-    generics: &BTreeMap<Ident, NonTerminal>,
-) -> Production {
+fn lower_rule<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    rule: &Rule<'db>,
+    current_name: Option<&Name<'db>>,
+    generics: &BTreeMap<Ident<'db>, NonTerminal<'db>>,
+) -> Production<'db> {
     Production::new(
         db,
         rule.alternatives
@@ -274,15 +278,15 @@ fn lower_rule(
 }
 
 #[instrument(skip_all, fields(item = %item.display(db), %quantifier, %span, ?current_name, ?generics))]
-fn lower_term(
-    db: &dyn Db,
-    language: Language,
-    generics: &BTreeMap<Ident, NonTerminal>,
-    item: &Item,
+fn lower_term<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    generics: &BTreeMap<Ident<'db>, NonTerminal<'db>>,
+    item: &Item<'db>,
     quantifier: Quantifier,
     span: Span,
-    current_name: Option<&Name>,
-) -> Term {
+    current_name: Option<&Name<'db>>,
+) -> Term<'db> {
     let term = match item {
         Item::Ident {
             mark,
@@ -416,7 +420,7 @@ fn lower_term(
 
 #[instrument(skip_all, fields(terminal = %terminal.display(db)))]
 #[salsa::tracked(no_eq)]
-pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: Terminal) -> NFA {
+pub fn terminal_nfa<'db>(db: &dyn Db, language: Language<'db>, terminal: Terminal<'db>) -> NFA {
     match terminal {
         Terminal::Named { ident, span } => {
             let nfa = ident_nfa(db, language, ident, span, &mut HashSet::new());
@@ -433,12 +437,12 @@ pub fn terminal_nfa(db: &dyn Db, language: Language, terminal: Terminal) -> NFA 
 }
 
 #[instrument(skip_all, fields(ident = %ident.display(db)))]
-fn ident_nfa(
-    db: &dyn Db,
-    language: Language,
-    ident: Ident,
+fn ident_nfa<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    ident: Ident<'db>,
     span: Span,
-    visited: &mut HashSet<Ident>,
+    visited: &mut HashSet<Ident<'db>>,
 ) -> NFA {
     if !visited.insert(ident) {
         emit(
@@ -473,7 +477,7 @@ fn ident_nfa(
 }
 
 #[instrument(skip_all, fields(rule = %rule.display(db)))]
-fn rule_nfa(db: &dyn Db, language: Language, rule: &Rule, visited: &mut HashSet<Ident>) -> NFA {
+fn rule_nfa<'db>(db: &'db dyn Db, language: Language<'db>, rule: &Rule<'db>, visited: &mut HashSet<Ident<'db>>) -> NFA {
     alternation(
         rule.alternatives
             .iter()
@@ -497,11 +501,11 @@ fn alternation(alternatives: impl Iterator<Item = NFA>) -> NFA {
 }
 
 #[instrument(skip_all, fields(expression = %expression.display(db)))]
-fn expression_nfa(
-    db: &dyn Db,
-    language: Language,
-    expression: &Expression,
-    visited: &mut HashSet<Ident>,
+fn expression_nfa<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    expression: &Expression<'db>,
+    visited: &mut HashSet<Ident<'db>>,
 ) -> NFA {
     let mut builder = NfaBuilder::new();
     builder.set_utf8(true);
@@ -1120,44 +1124,44 @@ fn regex_nfa(regex: &str, span: Span) -> NFA {
 }
 
 #[salsa::interned]
-pub struct NonTerminal {
+pub struct NonTerminal<'db> {
     #[return_ref]
-    inner: NonTerminalInner,
+    inner: NonTerminalInner<'db>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NonTerminalInner {
+pub enum NonTerminalInner<'db> {
     Goal {
-        rule: Rule,
+        rule: Rule<'db>,
     },
     /// Used by [`TermString`](crate::parse_table::term_string::TermString)
     Internal {
-        alternative: Alternative,
+        alternative: Alternative<'db>,
     },
     Named {
-        name: Name,
-        generics: Vec<NonTerminal>,
+        name: Name<'db>,
+        generics: Vec<NonTerminal<'db>>,
         span: Span,
     },
     Anonymous {
-        production: Production,
+        production: Production<'db>,
     },
     Quantified {
-        term: Term,
+        term: Term<'db>,
         quantifier: Quantifier,
     },
 }
 
-impl NonTerminal {
-    pub fn new_goal(db: &dyn Db, rule: Rule) -> Self {
+impl<'db> NonTerminal<'db> {
+    pub fn new_goal(db: &'db dyn Db, rule: Rule<'db>) -> Self {
         Self::new(db, NonTerminalInner::Goal { rule })
     }
 
-    pub fn new_internal(db: &dyn Db, alternative: Alternative) -> Self {
+    pub fn new_internal(db: &'db dyn Db, alternative: Alternative<'db>) -> Self {
         Self::new(db, NonTerminalInner::Internal { alternative })
     }
 
-    pub fn new_named(db: &dyn Db, name: Name, generics: Vec<Self>, span: Span) -> Self {
+    pub fn new_named(db: &'db dyn Db, name: Name<'db>, generics: Vec<Self>, span: Span) -> Self {
         Self::new(
             db,
             NonTerminalInner::Named {
@@ -1169,13 +1173,13 @@ impl NonTerminal {
     }
 
     pub fn new_anonymous(
-        db: &dyn Db,
-        language: Language,
-        rule: Rule,
-        context: Option<&Name>,
-        generics: BTreeMap<Ident, Self>,
+        db: &'db dyn Db,
+        language: Language<'db>,
+        rule: Rule<'db>,
+        context: Option<&Name<'db>>,
+        generics: BTreeMap<Ident<'db>, Self>,
     ) -> Self {
-        fn contains_non_super_ident(rule: &Rule, context: &Ident) -> bool {
+        fn contains_non_super_ident<'db>(rule: &Rule<'db>, context: &Ident<'db>) -> bool {
             rule.alternatives
                 .iter()
                 .flat_map(|expression| &expression.sequence)
@@ -1199,7 +1203,7 @@ impl NonTerminal {
         )
     }
 
-    pub fn new_quantified(db: &dyn Db, term: Term, quantifier: Quantifier) -> Self {
+    pub fn new_quantified(db: &'db dyn Db, term: Term<'db>, quantifier: Quantifier) -> Self {
         Self::new(db, NonTerminalInner::Quantified { term, quantifier })
     }
 
@@ -1215,7 +1219,7 @@ impl NonTerminal {
         matches!(self.inner(db), NonTerminalInner::Named { .. })
     }
 
-    pub fn ident(self, db: &dyn Db) -> Ident {
+    pub fn ident(self, db: &'db dyn Db) -> Ident<'db> {
         match self.inner(db) {
             NonTerminalInner::Goal { .. } => Ident::new(db, "goal".into()),
             NonTerminalInner::Internal { .. } => Ident::new(db, "internal".into()),
@@ -1230,7 +1234,7 @@ impl NonTerminal {
     }
 }
 
-impl DisplayWithDb for NonTerminal {
+impl<'db> DisplayWithDb for NonTerminal<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self.inner(db) {
             NonTerminalInner::Goal { rule } => {
@@ -1268,12 +1272,12 @@ impl DisplayWithDb for NonTerminal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Name {
-    pub ident: Ident,
+pub struct Name<'db> {
+    pub ident: Ident<'db>,
     pub index: usize,
 }
 
-impl DisplayWithDb for Name {
+impl<'db> DisplayWithDb for Name<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         write!(f, "{}", self.ident.display(db))?;
         if self.index > 0 {
@@ -1284,13 +1288,13 @@ impl DisplayWithDb for Name {
 }
 
 #[derive(Clone)]
-pub enum Terminal {
-    Named { ident: Ident, span: Span },
+pub enum Terminal<'db> {
+    Named { ident: Ident<'db>, span: Span },
     Anonymous { name: Arc<str>, regex: NFA },
     EndOfInput,
 }
 
-impl Terminal {
+impl<'db> Terminal<'db> {
     pub fn name<'a>(&'a self, db: &'a dyn Db) -> &'a str {
         match self {
             Self::Named { ident, .. } => ident.name(db),
@@ -1299,15 +1303,15 @@ impl Terminal {
         }
     }
 
-    pub fn ident(&self) -> Option<&Ident> {
+    pub fn ident(&self) -> Option<Ident<'db>> {
         match self {
-            Self::Named { ident, .. } => Some(ident),
+            Self::Named { ident, .. } => Some(*ident),
             Self::Anonymous { .. } | Self::EndOfInput { .. } => None,
         }
     }
 }
 
-impl fmt::Debug for Terminal {
+impl<'db> fmt::Debug for Terminal<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Named { ident, span } => f
@@ -1324,7 +1328,7 @@ impl fmt::Debug for Terminal {
     }
 }
 
-impl DisplayWithDb for Terminal {
+impl<'db> DisplayWithDb for Terminal<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
             Self::Named { ident, .. } => {
@@ -1336,15 +1340,15 @@ impl DisplayWithDb for Terminal {
     }
 }
 
-impl PartialEq for Terminal {
-    fn eq(&self, other: &Self) -> bool {
+impl<'a, 'b> PartialEq<Terminal<'b>> for Terminal<'a> {
+    fn eq(&self, other: &Terminal<'b>) -> bool {
         match (self, other) {
             (
                 Self::Named {
                     ident: this,
                     span: this_span,
                 },
-                Self::Named {
+                Terminal::Named {
                     ident: other,
                     span: other_span,
                 },
@@ -1354,24 +1358,24 @@ impl PartialEq for Terminal {
                     name: this,
                     regex: _,
                 },
-                Self::Anonymous {
+                Terminal::Anonymous {
                     name: other,
                     regex: _,
                 },
             ) => this == other,
 
-            (Self::EndOfInput, Self::EndOfInput) => true,
+            (Self::EndOfInput, Terminal::EndOfInput) => true,
             _ => false,
         }
     }
 }
-impl Eq for Terminal {}
-impl PartialOrd for Terminal {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl<'db> Eq for Terminal<'db> {}
+impl<'a, 'b> PartialOrd<Terminal<'b>> for Terminal<'a> {
+    fn partial_cmp(&self, other: &Terminal<'b>) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for Terminal {
+impl<'a> Ord for Terminal<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (
@@ -1403,7 +1407,7 @@ impl Ord for Terminal {
         }
     }
 }
-impl Hash for Terminal {
+impl<'db> Hash for Terminal<'db> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
@@ -1420,12 +1424,12 @@ impl Hash for Terminal {
 }
 
 #[salsa::interned]
-pub struct Production {
+pub struct Production<'db> {
     #[return_ref]
-    pub alternatives: Vec<Alternative>,
+    pub alternatives: Vec<Alternative<'db>>,
 }
 
-impl DisplayWithDb for Production {
+impl<'db> DisplayWithDb for Production<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         for (i, alternative) in self.alternatives(db).iter().enumerate() {
             if i != 0 {
@@ -1438,13 +1442,13 @@ impl DisplayWithDb for Production {
 }
 
 #[salsa::interned]
-pub struct Alternative {
+pub struct Alternative<'db> {
     #[return_ref]
-    pub terms: Vec<Term>,
-    pub negative_lookahead: Option<NonTerminal>,
+    pub terms: Vec<Term<'db>>,
+    pub negative_lookahead: Option<NonTerminal<'db>>,
 }
 
-impl DisplayWithDb for Alternative {
+impl<'db> DisplayWithDb for Alternative<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         for (i, term) in self.terms(db).iter().enumerate() {
             if i != 0 {
@@ -1460,12 +1464,12 @@ impl DisplayWithDb for Alternative {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Term {
-    pub kind: TermKind,
+pub struct Term<'db> {
+    pub kind: TermKind<'db>,
     pub silent: bool,
 }
 
-impl DisplayWithDb for Term {
+impl<'db> DisplayWithDb for Term<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         // Only show the silent marker if it's not obvious.
         if self.silent && matches!(self.kind, TermKind::NonTerminal(nt) if nt.is_named(db)) {
@@ -1476,12 +1480,12 @@ impl DisplayWithDb for Term {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TermKind {
-    Terminal(Terminal),
-    NonTerminal(NonTerminal),
+pub enum TermKind<'db> {
+    Terminal(Terminal<'db>),
+    NonTerminal(NonTerminal<'db>),
 }
 
-impl DisplayWithDb for TermKind {
+impl<'db> DisplayWithDb for TermKind<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
             Self::Terminal(terminal) => write!(f, "{}", terminal.display(db)),

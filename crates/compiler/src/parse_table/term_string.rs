@@ -11,29 +11,29 @@ use crate::{
     language::Language,
     lower::{Alternative, NonTerminal, Term, Terminal},
     util::DisplayWithDb,
-    Db, 
+    Db,
 };
 
 use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
 
 #[derive(Debug, Clone)]
-pub struct TermString {
-    parse_table: Arc<Lr0ParseTable>,
+pub struct TermString<'db> {
+    parse_table: Arc<Lr0ParseTable<'db>>,
     locations: Vec<Location>,
 }
 
-impl PartialEq<TermString> for TermString {
+impl<'a, 'b> PartialEq<TermString<'b>> for TermString<'a> {
     fn eq(&self, other: &TermString) -> bool {
         Arc::ptr_eq(&self.parse_table, &other.parse_table) && self.locations == other.locations
     }
 }
-impl Eq for TermString {}
-impl PartialOrd for TermString {
+impl<'db> Eq for TermString<'db> {}
+impl<'a, 'b> PartialOrd<TermString<'b>> for TermString<'a> {
     fn partial_cmp(&self, other: &TermString) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for TermString {
+impl<'db> Ord for TermString<'db> {
     fn cmp(&self, other: &TermString) -> std::cmp::Ordering {
         Ord::cmp(
             &(Arc::as_ptr(&self.parse_table) as usize),
@@ -42,15 +42,15 @@ impl Ord for TermString {
         .then_with(|| self.locations.cmp(&other.locations))
     }
 }
-impl Hash for TermString {
+impl<'db> Hash for TermString<'db> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.parse_table) as usize).hash(state);
         self.locations.hash(state);
     }
 }
 
-impl TermString {
-    pub fn new(db: &dyn Db, language: Language, terms: Vec<Term>) -> Self {
+impl<'db> TermString<'db> {
+    pub fn new(db: &'db dyn Db, language: Language<'db>, terms: Vec<Term<'db>>) -> Self {
         let parse_table = lr0_parse_table(
             db,
             language,
@@ -69,7 +69,10 @@ impl TermString {
     }
 
     #[instrument(level = "debug", skip_all, fields(self = %self.display(db)))]
-    pub fn next<'a>(&'a self, db: &'a dyn Db) -> (bool, HashMap<Terminal, HashSet<TermString>>) {
+    pub fn next(
+        &self,
+        db: &'db dyn Db,
+    ) -> (bool, HashMap<Terminal<'db>, HashSet<TermString<'db>>>) {
         let mut contains_empty = false;
         let mut derivative: HashMap<Terminal, HashSet<TermString>> = HashMap::new();
 
@@ -184,7 +187,7 @@ impl TermString {
     }
 }
 
-impl DisplayWithDb for TermString {
+impl<'db> DisplayWithDb for TermString<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         // TODO: Print out trees too?
         // TODO: How are you meant to know what the states are?

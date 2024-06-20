@@ -5,16 +5,15 @@ use chumsky::{
     text::{newline, Character},
     Stream,
 };
-use salsa::DebugWithDb;
 
-use crate::{diagnostics::emit, Db, Span};
+use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
 
 use super::{
     Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
     Rule, Test,
 };
 
-pub(super) fn parse_grammar(db: &dyn Db, input: &str) -> Language {
+pub(super) fn parse_grammar<'db>(db: &'db dyn Db, input: &str) -> Language<'db> {
     let stream = Stream::from_iter(
         Span {
             start: input.len(),
@@ -76,9 +75,9 @@ impl chumsky::Span for Span {
 }
 
 fn file(db: &dyn Db) -> impl Parser<char, Language, Error = ParseError> + '_ {
-    enum RuleOrTest {
-        Rule(Definition),
-        Test(Test),
+    enum RuleOrTest<'db> {
+        Rule(Definition<'db>),
+        Test(Test<'db>),
     }
     choice((
         definition(db).map(RuleOrTest::Rule),
@@ -160,7 +159,7 @@ fn generic_params(db: &dyn Db) -> impl Parser<char, Vec<Ident>, Error = ParseErr
         .then_ignore(just('>'))
 }
 
-fn rule(db: &dyn Db) -> impl Parser<char, Rule, Error = ParseError> + Clone + '_ {
+fn rule<'db>(db: &'db dyn Db) -> impl Parser<char, Rule<'db>, Error = ParseError> + Clone + 'db {
     recursive(|rule| {
         expression(db, rule)
             .separated_by(just('|').padded_by(lws()))
@@ -171,10 +170,10 @@ fn rule(db: &dyn Db) -> impl Parser<char, Rule, Error = ParseError> + Clone + '_
     })
 }
 
-fn expression<'a>(
-    db: &'a dyn Db,
-    rule: impl Parser<char, Rule, Error = ParseError> + Clone + 'a,
-) -> impl Parser<char, Expression, Error = ParseError> + 'a {
+fn expression<'db>(
+    db: &'db dyn Db,
+    rule: impl Parser<char, Rule<'db>, Error = ParseError> + Clone + 'db,
+) -> impl Parser<char, Expression<'db>, Error = ParseError> + 'db {
     choice((
         just('(').then(lws()).then(just(')')).to(Vec::new()),
         term(db, rule)
@@ -186,10 +185,10 @@ fn expression<'a>(
     .map_with_span(|sequence, span| Expression { sequence, span })
 }
 
-fn term<'a>(
-    db: &'a dyn Db,
-    rule: impl Parser<char, Rule, Error = ParseError> + Clone + 'a,
-) -> impl Parser<char, Item, Error = ParseError> + 'a {
+fn term<'db>(
+    db: &'db dyn Db,
+    rule: impl Parser<char, Rule<'db>, Error = ParseError> + Clone + 'db,
+) -> impl Parser<char, Item<'db>, Error = ParseError> + 'db {
     choice((
         mark()
             .then(ident(db))
@@ -233,9 +232,9 @@ fn mark() -> impl Parser<char, Mark, Error = ParseError> {
     .padded_by(lws())
 }
 
-fn generic_args(
-    rule: impl Parser<char, Rule, Error = ParseError>,
-) -> impl Parser<char, Vec<Rule>, Error = ParseError> {
+fn generic_args<'db>(
+    rule: impl Parser<char, Rule<'db>, Error = ParseError>,
+) -> impl Parser<char, Vec<Rule<'db>>, Error = ParseError> {
     just('<')
         .ignore_then(
             rule.padded_by(lws())

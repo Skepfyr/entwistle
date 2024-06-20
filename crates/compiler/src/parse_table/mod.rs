@@ -34,12 +34,12 @@ use self::term_string::TermString;
 pub mod term_string;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LrkParseTable {
-    pub goal: NonTerminal,
-    pub states: Vec<State>,
+pub struct LrkParseTable<'db> {
+    pub goal: NonTerminal<'db>,
+    pub states: Vec<State<'db>>,
 }
 
-impl DisplayWithDb for LrkParseTable {
+impl<'db> DisplayWithDb for LrkParseTable<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         writeln!(f, "Goal: {}", self.goal.display(db))?;
         for (i, state) in self.states.iter().enumerate() {
@@ -55,8 +55,8 @@ impl DisplayWithDb for LrkParseTable {
     }
 }
 
-impl Index<StateId> for LrkParseTable {
-    type Output = State;
+impl<'db> Index<StateId> for LrkParseTable<'db> {
+    type Output = State<'db>;
 
     fn index(&self, index: StateId) -> &Self::Output {
         &self.states[index.0]
@@ -77,23 +77,23 @@ impl fmt::Display for StateId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct State {
-    pub action: Action,
-    pub goto: HashMap<NonTerminal, StateId>,
+pub struct State<'db> {
+    pub action: Action<'db>,
+    pub goto: HashMap<NonTerminal<'db>, StateId>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Action {
+pub enum Action<'db> {
     Ambiguous {
         nfa: NFA,
-        terminals: Vec<Terminal>,
-        actions: Vec<Action>,
+        terminals: Vec<Terminal<'db>>,
+        actions: Vec<Action<'db>>,
     },
-    Shift(Terminal, StateId),
-    Reduce(NonTerminal, Alternative),
+    Shift(Terminal<'db>, StateId),
+    Reduce(NonTerminal<'db>, Alternative<'db>),
 }
 
-impl DisplayWithDb for Action {
+impl<'db> DisplayWithDb for Action<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         fn display(
             action: &Action,
@@ -137,8 +137,8 @@ impl DisplayWithDb for Action {
     }
 }
 
-impl PartialEq for Action {
-    fn eq(&self, other: &Self) -> bool {
+impl<'a, 'b> PartialEq<Action<'b>> for Action<'a> {
+    fn eq(&self, other: &Action<'b>) -> bool {
         match (self, other) {
             (
                 Self::Ambiguous {
@@ -146,29 +146,29 @@ impl PartialEq for Action {
                     terminals: l_regexes,
                     actions: l_actions,
                 },
-                Self::Ambiguous {
+                Action::Ambiguous {
                     nfa: _,
                     terminals: r_regexes,
                     actions: r_actions,
                 },
             ) => l_regexes == r_regexes && l_actions == r_actions,
-            (Self::Shift(l0, l1), Self::Shift(r0, r1)) => l0 == r0 && l1 == r1,
-            (Self::Reduce(l0, l1), Self::Reduce(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::Shift(l0, l1), Action::Shift(r0, r1)) => l0 == r0 && l1 == r1,
+            (Self::Reduce(l0, l1), Action::Reduce(r0, r1)) => l0 == r0 && l1 == r1,
             _ => false,
         }
     }
 }
-impl Eq for Action {}
+impl<'db> Eq for Action<'db> {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Item {
-    pub non_terminal: NonTerminal,
-    pub alternative: Alternative,
+pub struct Item<'db> {
+    pub non_terminal: NonTerminal<'db>,
+    pub alternative: Alternative<'db>,
     pub index: usize,
 }
 
-impl Item {
-    fn new(non_terminal: NonTerminal, alternative: Alternative) -> Self {
+impl<'db> Item<'db> {
+    fn new(non_terminal: NonTerminal<'db>, alternative: Alternative<'db>) -> Self {
         Self {
             non_terminal,
             alternative,
@@ -176,7 +176,7 @@ impl Item {
         }
     }
 
-    fn next(&self, db: &dyn Db) -> Option<Term> {
+    fn next(&self, db: &'db dyn Db) -> Option<Term<'db>> {
         self.alternative.terms(db).get(self.index).cloned()
     }
 }
@@ -202,11 +202,11 @@ impl fmt::Display for ItemIndex {
     }
 }
 
-pub fn first_set(
-    db: &dyn Db,
-    language: Language,
-    non_terminal: NonTerminal,
-) -> (bool, HashSet<Terminal>) {
+pub fn first_set<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    non_terminal: NonTerminal<'db>,
+) -> (bool, HashSet<Terminal<'db>>) {
     production(db, language, non_terminal)
         .alternatives(db)
         .iter()
@@ -239,12 +239,12 @@ pub fn first_set(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lr0ParseTable {
-    pub goal: NonTerminal,
-    pub states: Vec<Lr0State>,
+pub struct Lr0ParseTable<'db> {
+    pub goal: NonTerminal<'db>,
+    pub states: Vec<Lr0State<'db>>,
 }
 
-impl DisplayWithDb for Lr0ParseTable {
+impl<'db> DisplayWithDb for Lr0ParseTable<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         for (i, state) in self.states.iter().enumerate() {
             writeln!(f, "State {i}:")?;
@@ -254,22 +254,22 @@ impl DisplayWithDb for Lr0ParseTable {
     }
 }
 
-impl Index<Lr0StateId> for Lr0ParseTable {
-    type Output = Lr0State;
+impl<'db> Index<Lr0StateId> for Lr0ParseTable<'db> {
+    type Output = Lr0State<'db>;
 
     fn index(&self, index: Lr0StateId) -> &Self::Output {
         &self.states[index.0]
     }
 }
 
-impl IndexMut<Lr0StateId> for Lr0ParseTable {
+impl<'db> IndexMut<Lr0StateId> for Lr0ParseTable<'db> {
     fn index_mut(&mut self, index: Lr0StateId) -> &mut Self::Output {
         &mut self.states[index.0]
     }
 }
 
-impl Index<ItemIndex> for Lr0ParseTable {
-    type Output = (Item, BTreeSet<ItemIndex>);
+impl<'db> Index<ItemIndex> for Lr0ParseTable<'db> {
+    type Output = (Item<'db>, BTreeSet<ItemIndex>);
 
     fn index(&self, index: ItemIndex) -> &Self::Output {
         &self[index.state_id].item_set[index.item]
@@ -277,13 +277,13 @@ impl Index<ItemIndex> for Lr0ParseTable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lr0State {
-    pub item_set: Vec<(Item, BTreeSet<ItemIndex>)>,
-    pub actions: BTreeMap<Terminal, Lr0StateId>,
-    pub goto: BTreeMap<NonTerminal, Lr0StateId>,
+pub struct Lr0State<'db> {
+    pub item_set: Vec<(Item<'db>, BTreeSet<ItemIndex>)>,
+    pub actions: BTreeMap<Terminal<'db>, Lr0StateId>,
+    pub goto: BTreeMap<NonTerminal<'db>, Lr0StateId>,
 }
 
-impl DisplayWithDb for Lr0State {
+impl<'db> DisplayWithDb for Lr0State<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         writeln!(f, "Items:")?;
         for (i, (item, backlinks)) in self.item_set.iter().enumerate() {
@@ -320,13 +320,17 @@ impl DisplayWithDb for Lr0State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ItemSet {
-    items: Vec<(Item, BTreeSet<ItemIndex>)>,
+pub struct ItemSet<'db> {
+    items: Vec<(Item<'db>, BTreeSet<ItemIndex>)>,
 }
 
 #[salsa::tracked]
 #[instrument(skip_all, fields(goal = %goal.display(db)))]
-pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Arc<Lr0ParseTable> {
+pub fn lr0_parse_table<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    goal: NonTerminal<'db>,
+) -> Arc<Lr0ParseTable<'db>> {
     trace!("Generating LR(0) parse table");
     let mut states: Vec<Lr0State> = Vec::new();
     let mut state_lookup: HashMap<BTreeSet<Item>, Lr0StateId> = HashMap::new();
@@ -398,11 +402,11 @@ pub fn lr0_parse_table(db: &dyn Db, language: Language, goal: NonTerminal) -> Ar
     Arc::new(parse_table)
 }
 
-fn add_state(
-    db: &dyn Db,
-    language: Language,
-    states: &mut Vec<Lr0State>,
-    state: &BTreeSet<Item>,
+fn add_state<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    states: &mut Vec<Lr0State<'db>>,
+    state: &BTreeSet<Item<'db>>,
 ) -> Lr0StateId {
     let new_id = Lr0StateId(states.len());
     states.push(Lr0State {
@@ -413,12 +417,12 @@ fn add_state(
     new_id
 }
 
-fn closure(
-    db: &dyn Db,
-    language: Language,
-    state: &BTreeSet<Item>,
+fn closure<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    state: &BTreeSet<Item<'db>>,
     state_id: Lr0StateId,
-) -> Vec<(Item, BTreeSet<ItemIndex>)> {
+) -> Vec<(Item<'db>, BTreeSet<ItemIndex>)> {
     let mut state: Vec<_> = state
         .iter()
         .map(|item| (item.clone(), BTreeSet::new()))
@@ -464,7 +468,11 @@ fn closure(
 }
 
 #[instrument(skip_all, fields(goal = %goal.display(db)))]
-pub fn parse_table(db: &dyn Db, language: Language, goal: Rule) -> LrkParseTable {
+pub fn parse_table<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    goal: Rule<'db>,
+) -> LrkParseTable<'db> {
     let goal = NonTerminal::new_goal(db, goal);
     let lr0_parse_table = Lr0ParseTable::clone(&lr0_parse_table(db, language, goal));
     debug!(lr0_parse_table = %lr0_parse_table.display(db), "Generated LR(0) parse table");
@@ -473,11 +481,11 @@ pub fn parse_table(db: &dyn Db, language: Language, goal: Rule) -> LrkParseTable
     lrk_parse_table
 }
 
-fn build_lrk_parse_table(
-    db: &dyn Db,
-    language: Language,
-    mut lr0_parse_table: Lr0ParseTable,
-) -> LrkParseTable {
+fn build_lrk_parse_table<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    mut lr0_parse_table: Lr0ParseTable<'db>,
+) -> LrkParseTable<'db> {
     let mut sccs = StronglyConnectedComponents::new(&lr0_parse_table);
 
     let mut states = Vec::new();
@@ -543,15 +551,15 @@ fn build_lrk_parse_table(
     }
 }
 
-fn make_action(
-    db: &dyn Db,
-    language: Language,
-    lr0_parse_table: &mut Lr0ParseTable,
+fn make_action<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    lr0_parse_table: &mut Lr0ParseTable<'db>,
     sccs: &mut StronglyConnectedComponents,
     state: Lr0StateId,
-    conflicts: HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>,
+    conflicts: HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, Arc<History>>>,
     invalidate_state: &mut impl FnMut(Lr0StateId),
-) -> Option<Action> {
+) -> Option<Action<'db>> {
     debug!("Making action");
     if conflicts.is_empty() {
         trace!("This state is broken as it has no actions");
@@ -797,11 +805,14 @@ fn item_lane_heads(
     }
 }
 
-fn add_derivative(
-    db: &dyn Db,
-    next: &mut HashMap<Terminal, HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>>,
-    derivative: HashMap<Terminal, HashSet<TermString>>,
-    action: &ConflictedAction,
+fn add_derivative<'db>(
+    db: &'db dyn Db,
+    next: &mut HashMap<
+        Terminal<'db>,
+        HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, Arc<History>>>,
+    >,
+    derivative: HashMap<Terminal<'db>, HashSet<TermString<'db>>>,
+    action: &ConflictedAction<'db>,
     mut history: Arc<History>,
 ) {
     Arc::make_mut(&mut history).terminals_yielded =
@@ -829,12 +840,12 @@ fn add_derivative(
     }
 }
 
-fn conflicts(
-    db: &dyn Db,
-    next_state: &Lr0State,
+fn conflicts<'db>(
+    db: &'db dyn Db,
+    next_state: &Lr0State<'db>,
     state_id: Lr0StateId,
-    language: Language,
-) -> HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>> {
+    language: Language<'db>,
+) -> HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, Arc<History>>> {
     let conflicts: HashMap<_, _> = next_state
         .item_set
         .iter()
@@ -900,13 +911,13 @@ fn conflicts(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ConflictedAction {
-    Shift(Terminal, StateId),
-    Reduce(NonTerminal, Alternative, Vec<TermString>),
+pub enum ConflictedAction<'db> {
+    Shift(Terminal<'db>, StateId),
+    Reduce(NonTerminal<'db>, Alternative<'db>, Vec<TermString<'db>>),
 }
 
-impl ConflictedAction {
-    fn with_lookahead(&self, db: &dyn Db, terminal: Terminal) -> ConflictedAction {
+impl<'db> ConflictedAction<'db> {
+    fn with_lookahead(&self, db: &'db dyn Db, terminal: Terminal<'db>) -> Self {
         match self {
             ConflictedAction::Reduce(non_terminal, alternative, remaining_negative_lookahead) => {
                 let new_negative_lookahead = remaining_negative_lookahead
@@ -932,7 +943,7 @@ impl ConflictedAction {
     }
 }
 
-impl DisplayWithDb for ConflictedAction {
+impl<'db> DisplayWithDb for ConflictedAction<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         match self {
             ConflictedAction::Shift(terminal, id) => {
@@ -955,8 +966,8 @@ impl DisplayWithDb for ConflictedAction {
     }
 }
 
-impl From<ConflictedAction> for Action {
-    fn from(conflict: ConflictedAction) -> Self {
+impl<'db> From<ConflictedAction<'db>> for Action<'db> {
+    fn from(conflict: ConflictedAction<'db>) -> Self {
         match conflict {
             ConflictedAction::Shift(terminal, id) => Action::Shift(terminal, id),
             ConflictedAction::Reduce(non_terminal, alternative, _) => {
@@ -967,12 +978,12 @@ impl From<ConflictedAction> for Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Ambiguity {
+struct Ambiguity<'db> {
     location: ItemIndex,
-    term_string: TermString,
+    term_string: TermString<'db>,
 }
 
-impl DisplayWithDb for Ambiguity {
+impl<'db> DisplayWithDb for Ambiguity<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         write!(
             f,
@@ -1159,11 +1170,11 @@ fn build_nfa(db: &dyn Db, language: Language, terminals: &[Terminal]) -> NFA {
 
 /// Check if one of the two terminals matches a prefix of the other
 #[salsa::tracked]
-pub fn terminals_conflict(
-    db: &dyn Db,
-    language: Language,
-    terminal_a: Terminal,
-    terminal_b: Terminal,
+pub fn terminals_conflict<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    terminal_a: Terminal<'db>,
+    terminal_b: Terminal<'db>,
 ) -> Result<(), Diagnostic> {
     if terminal_a == terminal_b {
         return Err(Diagnostic {
@@ -1539,10 +1550,10 @@ impl StronglyConnectedComponents {
     }
 }
 
-struct StateSplitter<'a, F> {
-    db: &'a dyn Db,
-    language: Language,
-    lr0_parse_table: &'a mut Lr0ParseTable,
+struct StateSplitter<'a, 'db, F> {
+    db: &'db dyn Db,
+    language: Language<'db>,
+    lr0_parse_table: &'a mut Lr0ParseTable<'db>,
     sccs: &'a mut StronglyConnectedComponents,
     invalidate_state: &'a mut F,
     component_paths: HashMap<ComponentId, HashMap<Vec<ComponentId>, usize>>,
@@ -1551,16 +1562,19 @@ struct StateSplitter<'a, F> {
     new_to_old_state_map: HashMap<Lr0StateId, Lr0StateId>,
 }
 
-impl<'a, F: FnMut(Lr0StateId)> StateSplitter<'a, F> {
+impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
     #[instrument(level = "debug", skip_all)]
     fn split_states(
-        db: &'a dyn Db,
-        language: Language,
-        lr0_parse_table: &'a mut Lr0ParseTable,
+        db: &'db dyn Db,
+        language: Language<'db>,
+        lr0_parse_table: &'a mut Lr0ParseTable<'db>,
         sccs: &'a mut StronglyConnectedComponents,
         invalidate_state: &'a mut F,
         state: Lr0StateId,
-        next: &HashMap<Terminal, HashMap<ConflictedAction, HashMap<Ambiguity, Arc<History>>>>,
+        next: &HashMap<
+            Terminal<'db>,
+            HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, Arc<History>>>,
+        >,
     ) -> bool {
         let mut splitter = Self {
             db,
@@ -1582,12 +1596,12 @@ impl<'a, F: FnMut(Lr0StateId)> StateSplitter<'a, F> {
                     .map(move |history| (history, terminal, action))
             })
             .fold(Vec::new(), |mut acc, (history, terminal, action)| {
-                fn recurse(
+                fn recurse<'db>(
                     history: &Arc<History>,
-                    terminal: &Terminal,
-                    action: &ConflictedAction,
+                    terminal: &Terminal<'db>,
+                    action: &ConflictedAction<'db>,
                     path: &mut VecDeque<Lr0StateId>,
-                    acc: &mut Vec<(VecDeque<Lr0StateId>, Terminal, ConflictedAction)>,
+                    acc: &mut Vec<(VecDeque<Lr0StateId>, Terminal<'db>, ConflictedAction<'db>)>,
                 ) {
                     path.push_back(history.location.state_id);
                     if history.prev.is_empty() {
@@ -1638,12 +1652,12 @@ impl<'a, F: FnMut(Lr0StateId)> StateSplitter<'a, F> {
 
     fn trace_paths(
         &self,
-        mut ambiguities: Vec<(VecDeque<Lr0StateId>, Terminal, ConflictedAction)>,
+        mut ambiguities: Vec<(VecDeque<Lr0StateId>, Terminal<'a>, ConflictedAction<'a>)>,
         component: ComponentId,
-        mut lookahead: HashMap<Terminal, HashSet<ConflictedAction>>,
+        mut lookahead: HashMap<Terminal<'a>, HashSet<ConflictedAction<'a>>>,
         path: &mut Vec<ComponentId>,
         splits: &mut Vec<(
-            Option<HashMap<Terminal, HashSet<ConflictedAction>>>,
+            Option<HashMap<Terminal<'a>, HashSet<ConflictedAction<'a>>>>,
             Vec<Vec<ComponentId>>,
         )>,
     ) {
