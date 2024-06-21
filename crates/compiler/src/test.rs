@@ -14,7 +14,11 @@ use crate::{
 
 #[instrument(skip_all)]
 #[salsa::tracked]
-pub fn run_test<'db>(db: &'db dyn Db, language: Language<'db>, test: Test<'db>) -> Option<Vec<ParseTree<'db>>> {
+pub fn run_test<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    test: Test<'db>,
+) -> Option<Vec<ParseTree<'db>>> {
     let parse_table = parse_table(db, language, test.goal(db).clone());
     let mut states = vec![StateId::START];
     let mut forest = vec![];

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 use color_eyre::Result;
 use entwistle::{
@@ -38,6 +41,21 @@ fn main() -> Result<()> {
     }
 
     println!("--------------");
+
+    let inner_item = *language
+        .definitions(&db)
+        .keys()
+        .find(|ident| ident.name(&db) == "InnerItem")
+        .unwrap();
+    let mut used_items = language.dependencies(&db, inner_item, Span { start: 0, end: 0 });
+    used_items.insert(inner_item);
+    for unused_item in language
+        .definitions(&db)
+        .keys()
+        .filter(|item| !used_items.contains(item))
+    {
+        println!("Unused item: {}", unused_item.display(&db));
+    }
 
     // let pattern = *language
     //     .definitions(&db)

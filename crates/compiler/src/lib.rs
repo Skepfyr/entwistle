@@ -29,7 +29,10 @@ pub struct Jar(
 );
 
 #[salsa::tracked]
-pub fn debug_new_non_terminal<'db>(db: &'db dyn Db, ident: language::Ident<'db>) -> lower::NonTerminal<'db> {
+pub fn debug_new_non_terminal<'db>(
+    db: &'db dyn Db,
+    ident: language::Ident<'db>,
+) -> lower::NonTerminal<'db> {
     lower::NonTerminal::new_named(
         db,
         lower::Name { ident, index: 0 },

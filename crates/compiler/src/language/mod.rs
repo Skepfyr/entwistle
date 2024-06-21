@@ -4,6 +4,7 @@ use std::{
 };
 
 use indenter::indented;
+use salsa::Update;
 
 use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
 
@@ -43,7 +44,12 @@ pub fn parse<'db>(db: &'db dyn Db, input: Source) -> Language<'db> {
 #[salsa::tracked]
 impl<'db> Language<'db> {
     #[salsa::tracked]
-    pub fn definition(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> Option<Definition<'db>> {
+    pub fn definition(
+        self,
+        db: &'db dyn Db,
+        ident: Ident<'db>,
+        span: Span,
+    ) -> Option<Definition<'db>> {
         match self.definitions(db).get(&ident).cloned() {
             Some(definition) => Some(definition),
             None => {
@@ -54,7 +60,12 @@ impl<'db> Language<'db> {
     }
 
     #[salsa::tracked]
-    pub fn dependencies(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> HashSet<Ident<'db>> {
+    pub fn dependencies(
+        self,
+        db: &'db dyn Db,
+        ident: Ident<'db>,
+        span: Span,
+    ) -> HashSet<Ident<'db>> {
         let mut dependencies = HashSet::new();
         let mut visited = HashSet::new();
         let mut next = vec![ident];
@@ -70,13 +81,18 @@ impl<'db> Language<'db> {
     }
 
     #[salsa::tracked]
-    pub fn direct_dependencies(self, db: &'db dyn Db, ident: Ident<'db>, span: Span) -> HashSet<Ident<'db>> {
+    pub fn direct_dependencies(
+        self,
+        db: &'db dyn Db,
+        ident: Ident<'db>,
+        span: Span,
+    ) -> HashSet<Ident<'db>> {
         fn production_deps<'db>(dependencies: &mut HashSet<Ident<'db>>, production: &Rule<'db>) {
             production
                 .alternatives
                 .iter()
                 .flat_map(|expression| expression.sequence.iter())
-                .for_each(|(term, _, _)| match term {
+                .for_each(|term| match &term.item {
                     Item::Ident { ident, .. } => {
                         dependencies.insert(*ident);
                     }
@@ -96,7 +112,7 @@ impl<'db> Language<'db> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Update)]
 pub struct Definition<'db> {
     pub silent: bool,
     pub atomic: bool,
@@ -106,7 +122,7 @@ pub struct Definition<'db> {
     pub rules: Vec<Rule<'db>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Update)]
 pub struct Rule<'db> {
     pub span: Span,
     pub alternatives: BTreeSet<Expression<'db>>,
@@ -124,25 +140,38 @@ impl<'db> DisplayWithDb for Rule<'db> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Update)]
 pub struct Expression<'db> {
     pub span: Span,
-    pub sequence: Vec<(Item<'db>, Quantifier, Span)>,
+    pub sequence: Vec<QuantifiedItem<'db>>,
 }
 
 impl<'db> DisplayWithDb for Expression<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, (item, quantifier, _)) in self.sequence.iter().enumerate() {
+        for (i, item) in self.sequence.iter().enumerate() {
             if i > 0 {
                 f.write_char(' ')?;
             }
-            write!(f, "{}{}", item.display(db), quantifier)?;
+            write!(f, "{}", item.display(db))?;
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Update)]
+pub struct QuantifiedItem<'db> {
+    pub item: Item<'db>,
+    pub quantifier: Quantifier,
+    pub span: Span,
+}
+
+impl<'db> DisplayWithDb for QuantifiedItem<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+        write!(f, "{}{}", self.item.display(db), self.quantifier)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Update)]
 pub enum Item<'db> {
     Ident {
         mark: Mark,
@@ -262,10 +291,16 @@ pub struct Test<'db> {
     pub parse_trees: Vec<ParseTree<'db>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Update)]
 pub enum ParseTree<'db> {
-    Leaf { ident: Option<Ident<'db>>, data: String },
-    Node { ident: Ident<'db>, nodes: Vec<ParseTree<'db>> },
+    Leaf {
+        ident: Option<Ident<'db>>,
+        data: String,
+    },
+    Node {
+        ident: Ident<'db>,
+        nodes: Vec<ParseTree<'db>>,
+    },
 }
 
 impl<'db> DisplayWithDb for ParseTree<'db> {

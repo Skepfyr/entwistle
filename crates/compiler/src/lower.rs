@@ -20,7 +20,7 @@ use tracing::instrument;
 
 use crate::{
     diagnostics::emit,
-    language::{Expression, Ident, Item, Language, Mark, Quantifier, Rule},
+    language::{Expression, Ident, Item, Language, Mark, QuantifiedItem, Quantifier, Rule},
     util::DisplayWithDb,
     Db, Span,
 };
@@ -97,8 +97,8 @@ pub fn production<'db>(
                 let mut contains_this = false;
                 let mut contains_sub = false;
                 for alternative in &rule.alternatives {
-                    for (item, _, _) in &alternative.sequence {
-                        match item {
+                    for item in &alternative.sequence {
+                        match &item.item {
                             Item::Ident {
                                 mark,
                                 ident,
@@ -228,7 +228,11 @@ fn lower_rule<'db>(
             .iter()
             .map(|expression| {
                 let (sequence, lookahead) = match expression.sequence.last() {
-                    Some((Item::Lookaround(lookaround_type, rule), quantifier, _)) => {
+                    Some(QuantifiedItem {
+                        item: Item::Lookaround(lookaround_type, rule),
+                        quantifier,
+                        span: _,
+                    }) => {
                         if *quantifier != Quantifier::Once {
                             emit(
                                 "Lookaround cannot have a quantifier",
@@ -259,14 +263,14 @@ fn lower_rule<'db>(
                 };
                 let terms = sequence
                     .iter()
-                    .map(|(term, quantifier, span)| {
+                    .map(|item| {
                         lower_term(
                             db,
                             language,
                             generics,
-                            term,
-                            *quantifier,
-                            *span,
+                            &item.item,
+                            item.quantifier,
+                            item.span,
                             current_name,
                         )
                     })
@@ -477,7 +481,12 @@ fn ident_nfa<'db>(
 }
 
 #[instrument(skip_all, fields(rule = %rule.display(db)))]
-fn rule_nfa<'db>(db: &'db dyn Db, language: Language<'db>, rule: &Rule<'db>, visited: &mut HashSet<Ident<'db>>) -> NFA {
+fn rule_nfa<'db>(
+    db: &'db dyn Db,
+    language: Language<'db>,
+    rule: &Rule<'db>,
+    visited: &mut HashSet<Ident<'db>>,
+) -> NFA {
     alternation(
         rule.alternatives
             .iter()
@@ -512,7 +521,13 @@ fn expression_nfa<'db>(
     builder.start_pattern().unwrap();
     let mat = builder.add_match().unwrap();
     let mut start = builder.add_capture_end(mat, 0).unwrap();
-    for (item, quantifier, span) in expression.sequence.iter().rev() {
+    for quantified_item in expression.sequence.iter().rev() {
+        let QuantifiedItem {
+            item,
+            quantifier,
+            span,
+        } = quantified_item;
+
         let item = match item {
             Item::Ident {
                 mark,
@@ -1183,7 +1198,7 @@ impl<'db> NonTerminal<'db> {
             rule.alternatives
                 .iter()
                 .flat_map(|expression| &expression.sequence)
-                .any(|(item, _, _)| match item {
+                .any(|item| match &item.item {
                     Item::Ident {
                         mark,
                         ident,

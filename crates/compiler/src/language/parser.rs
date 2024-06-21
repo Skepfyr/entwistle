@@ -9,8 +9,8 @@ use chumsky::{
 use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
 
 use super::{
-    Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, Quantifier,
-    Rule, Test,
+    Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, QuantifiedItem,
+    Quantifier, Rule, Test,
 };
 
 pub(super) fn parse_grammar<'db>(db: &'db dyn Db, input: &str) -> Language<'db> {
@@ -178,7 +178,11 @@ fn expression<'db>(
         just('(').then(lws()).then(just(')')).to(Vec::new()),
         term(db, rule)
             .then(quantifier())
-            .map_with_span(|(item, quantifier), span| (item, quantifier, span))
+            .map_with_span(|(item, quantifier), span| QuantifiedItem {
+                item,
+                quantifier,
+                span,
+            })
             .separated_by(lws())
             .at_least(1),
     ))
