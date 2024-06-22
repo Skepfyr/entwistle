@@ -37,7 +37,7 @@ pub struct Language<'db> {
 }
 
 #[salsa::tracked]
-pub fn parse<'db>(db: &'db dyn Db, input: Source) -> Language<'db> {
+pub fn parse(db: &dyn Db, input: Source) -> Language<'_> {
     parser::parse_grammar(db, input.text(db))
 }
 

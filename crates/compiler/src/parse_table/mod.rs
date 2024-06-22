@@ -319,11 +319,6 @@ impl<'db> DisplayWithDb for Lr0State<'db> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ItemSet<'db> {
-    items: Vec<(Item<'db>, BTreeSet<ItemIndex>)>,
-}
-
 #[salsa::tracked]
 #[instrument(skip_all, fields(goal = %goal.display(db)))]
 pub fn lr0_parse_table<'db>(
@@ -1597,6 +1592,7 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
             })
             .fold(Vec::new(), |mut acc, (history, terminal, action)| {
                 fn recurse<'db>(
+                    db: &dyn Db,
                     history: &Arc<History>,
                     terminal: &Terminal<'db>,
                     action: &ConflictedAction<'db>,
@@ -1605,23 +1601,37 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                 ) {
                     path.push_back(history.location.state_id);
                     if history.prev.is_empty() {
+                        trace!(
+                            path = %path.iter().format(","),
+                            terminal = %terminal.display(db),
+                            action = %action.display(db),
+                            "Found ambiguity"
+                        );
                         acc.push((path.clone(), terminal.clone(), action.clone()));
                     } else {
                         for prev in &history.prev {
-                            recurse(prev, terminal, action, path, acc);
+                            recurse(db, prev, terminal, action, path, acc);
                         }
                     }
                     path.pop_back();
                 }
-                recurse(history, terminal, action, &mut VecDeque::new(), &mut acc);
+                recurse(
+                    db,
+                    history,
+                    terminal,
+                    action,
+                    &mut VecDeque::new(),
+                    &mut acc,
+                );
                 acc
             });
         let mut splits = Vec::new();
+        let component = splitter.sccs.component(state);
         splitter.trace_paths(
             ambiguities,
-            splitter.sccs.component(state),
+            component,
             HashMap::new(),
-            &mut Vec::new(),
+            &mut vec![component],
             &mut splits,
         );
         if splits.len() <= 1 {
@@ -1661,8 +1671,6 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
             Vec<Vec<ComponentId>>,
         )>,
     ) {
-        path.push(component);
-
         ambiguities.retain_mut(|(history, terminal, action)| {
             while let Some(loc) = history.back() {
                 if self.sccs.component(*loc) != component {
@@ -1686,7 +1694,9 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                     })
                     .cloned()
                     .collect();
+                path.push(next_component);
                 self.trace_paths(ambiguities, next_component, lookahead.clone(), path, splits);
+                path.pop();
             }
         } else {
             // First check if there are any conflicts between lookahead tokens
@@ -1753,7 +1763,6 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                 }
             }
         }
-        path.pop();
     }
 
     fn split(

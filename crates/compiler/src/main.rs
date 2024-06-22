@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     let inner_item = *language
         .definitions(&db)
         .keys()
-        .find(|ident| ident.name(&db) == "InnerItem")
+        .find(|ident| ident.name(&db) == "Crate")
         .unwrap();
     let mut used_items = language.dependencies(&db, inner_item, Span { start: 0, end: 0 });
     used_items.insert(inner_item);

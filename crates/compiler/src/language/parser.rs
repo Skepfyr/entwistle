@@ -159,7 +159,7 @@ fn generic_params(db: &dyn Db) -> impl Parser<char, Vec<Ident>, Error = ParseErr
         .then_ignore(just('>'))
 }
 
-fn rule<'db>(db: &'db dyn Db) -> impl Parser<char, Rule<'db>, Error = ParseError> + Clone + 'db {
+fn rule(db: &dyn Db) -> impl Parser<char, Rule<'_>, Error = ParseError> + Clone + '_ {
     recursive(|rule| {
         expression(db, rule)
             .separated_by(just('|').padded_by(lws()))
