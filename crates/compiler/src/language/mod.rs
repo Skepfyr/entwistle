@@ -53,7 +53,10 @@ impl<'db> Language<'db> {
         match self.definitions(db).get(&ident).cloned() {
             Some(definition) => Some(definition),
             None => {
-                emit("Identifier is not defined.", vec![(span, None)]);
+                emit(
+                    format!("Identifier {} is not defined.", ident.display(db)),
+                    vec![(span, None)],
+                );
                 None
             }
         }

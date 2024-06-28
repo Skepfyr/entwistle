@@ -201,7 +201,7 @@ String: '"' NonDoubleQuoteStringChar* '"'
 RawStringContents<Hashes>: (RawStringChar | '#' | '"' (!>> Hashes))*
 RawString:
   'r' '"' RawStringContents<> '"'
-  'r' '"' RawStringContents<'#'> '"'
+  'r' '#' '"' RawStringContents<'#'> '"' '#'
   'r' '#' '#' '"' RawStringContents<'#' '#'> '"' '#' '#'
 
 

@@ -1167,6 +1167,7 @@ pub enum NonTerminalInner<'db> {
     },
 }
 
+#[salsa::tracked]
 impl<'db> NonTerminal<'db> {
     pub fn new_goal(db: &'db dyn Db, rule: Rule<'db>) -> Self {
         Self::new(db, NonTerminalInner::Goal { rule })
@@ -1247,6 +1248,23 @@ impl<'db> NonTerminal<'db> {
             NonTerminalInner::Quantified { .. } => Ident::new(db, "quantified".into()),
         }
     }
+
+    #[salsa::tracked(recovery_fn = is_infinite_recovery)]
+    pub fn is_infinite(self, db: &dyn Db, language: Language<'db>) -> bool {
+        production(db, language, self)
+            .alternatives(db)
+            .iter()
+            .flat_map(|alternative| alternative.terms(db))
+            .any(|term| match term.kind {
+                TermKind::Terminal(_) => false,
+                TermKind::NonTerminal(nt) if nt == self => true,
+                TermKind::NonTerminal(nt) => nt.is_infinite(db, language),
+            })
+    }
+}
+
+fn is_infinite_recovery(_: &dyn Db, _: &salsa::Cycle, _: NonTerminal, _: Language<'_>) -> bool {
+    true
 }
 
 impl<'db> DisplayWithDb for NonTerminal<'db> {

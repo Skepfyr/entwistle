@@ -213,7 +213,7 @@ fn term<'db>(
             .then_ignore(just(')'))
             .map(|(lookaround_type, rule)| Item::Lookaround(lookaround_type, rule)),
         just('(')
-            .ignore_then(rule)
+            .ignore_then(rule.padded_by(lws()))
             .then_ignore(just(')'))
             .map(Item::Group),
     ))

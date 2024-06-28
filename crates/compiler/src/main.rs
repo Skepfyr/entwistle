@@ -42,20 +42,23 @@ fn main() -> Result<()> {
 
     println!("--------------");
 
-    let inner_item = *language
-        .definitions(&db)
-        .keys()
-        .find(|ident| ident.name(&db) == "Crate")
-        .unwrap();
-    let mut used_items = language.dependencies(&db, inner_item, Span { start: 0, end: 0 });
-    used_items.insert(inner_item);
-    for unused_item in language
-        .definitions(&db)
-        .keys()
-        .filter(|item| !used_items.contains(item))
-    {
-        println!("Unused item: {}", unused_item.display(&db));
-    }
+    // let inner_item = *language
+    //     .definitions(&db)
+    //     .keys()
+    //     .find(|ident| ident.name(&db) == "ExpressionWithoutBlock")
+    //     .unwrap();
+    // let used_items = language.dependencies(&db, inner_item, Span { start: 0, end: 0 });
+    // let mut unused_items = language
+    //     .definitions(&db)
+    //     .keys()
+    //     .copied()
+    //     .filter(|item| *item != inner_item && !used_items.contains(item))
+    //     .map(|item| item.name(&db))
+    //     .collect::<Vec<_>>();
+    // unused_items.sort_unstable();
+    // for unused_item in unused_items {
+    //     println!("Unused item: {}", unused_item);
+    // }
 
     // let pattern = *language
     //     .definitions(&db)

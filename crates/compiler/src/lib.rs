@@ -20,6 +20,7 @@ pub struct Jar(
     lower::production,
     lower::terminal_nfa,
     lower::NonTerminal<'_>,
+    lower::NonTerminal_is_infinite,
     lower::Production<'_>,
     lower::Alternative<'_>,
     parse_table::lr0_parse_table,

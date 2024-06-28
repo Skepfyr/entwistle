@@ -9,7 +9,7 @@ use tracing::{instrument, trace};
 
 use crate::{
     language::Language,
-    lower::{Alternative, NonTerminal, Term, Terminal},
+    lower::{Alternative, NonTerminal, Terminal},
     util::DisplayWithDb,
     Db,
 };
@@ -18,8 +18,8 @@ use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
 
 #[derive(Debug, Clone)]
 pub struct TermString<'db> {
-    parse_table: Arc<Lr0ParseTable<'db>>,
-    locations: Vec<Location>,
+    pub(super) parse_table: Arc<Lr0ParseTable<'db>>,
+    pub(super) locations: Vec<Location>,
 }
 
 impl<'a, 'b> PartialEq<TermString<'b>> for TermString<'a> {
@@ -50,12 +50,8 @@ impl<'db> Hash for TermString<'db> {
 }
 
 impl<'db> TermString<'db> {
-    pub fn new(db: &'db dyn Db, language: Language<'db>, terms: Vec<Term<'db>>) -> Self {
-        let parse_table = lr0_parse_table(
-            db,
-            language,
-            NonTerminal::new_internal(db, Alternative::new(db, terms, None)),
-        );
+    pub fn new(db: &'db dyn Db, language: Language<'db>, alternative: Alternative<'db>) -> Self {
+        let parse_table = lr0_parse_table(db, language, NonTerminal::new_internal(db, alternative));
         TermString {
             parse_table,
             locations: vec![Location {
@@ -200,9 +196,9 @@ impl<'db> DisplayWithDb for TermString<'db> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Location {
-    tree: Tree,
-    state: Lr0StateId,
+pub(super) struct Location {
+    pub(super) tree: Tree,
+    pub(super) state: Lr0StateId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -225,6 +225,7 @@ dependencies = [
  "regex-automata 0.4.7",
  "regex-syntax 0.8.4",
  "salsa",
+ "scopeguard",
  "tracing",
  "tracing-error",
  "tracing-subscriber",
