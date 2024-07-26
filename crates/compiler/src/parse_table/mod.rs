@@ -1,8 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    cell::RefCell,
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{self, Write as _},
     hash::Hash,
     ops::{ControlFlow, Index, IndexMut},
+    rc::Rc,
     sync::Arc,
     vec,
 };
@@ -638,7 +640,7 @@ fn make_action<'db>(
         return Some(arbitrary_resolution);
     }
 
-    let next = ConflictDifferentiator::next_terminals(db, language, lr0_parse_table, conflicts);
+    let next = next_terminals(db, language, lr0_parse_table, conflicts);
 
     if StateSplitter::split_states(
         db,
@@ -728,184 +730,159 @@ fn make_action<'db>(
     })
 }
 
-struct ConflictDifferentiator<'a, 'db> {
+fn next_terminals<'db>(
     db: &'db dyn Db,
     language: Language<'db>,
-    lr0_parse_table: &'a Lr0ParseTable<'db>,
-    visited: HashSet<ItemIndex>,
-    next: HashMap<Terminal<'db>, HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>>,
-}
-
-impl<'a, 'db> ConflictDifferentiator<'a, 'db> {
-    fn next_terminals(
-        db: &'db dyn Db,
-        language: Language<'db>,
-        lr0_parse_table: &Lr0ParseTable<'db>,
-        conflicts: HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>,
-    ) -> HashMap<Terminal<'db>, HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>>
-    {
-        let mut differentiator = ConflictDifferentiator {
-            db,
-            language,
-            lr0_parse_table,
-            visited: HashSet::new(),
-            next: HashMap::new(),
-        };
-        for (action, ambiguities) in conflicts {
-            differentiator.visited.clear();
-            differentiator.extend_ambiguities(action, ambiguities);
-        }
-        differentiator.next
-    }
-
-    #[instrument(skip_all, fields(action = %action.display(self.db)))]
-    fn extend_ambiguities(
-        &mut self,
-        action: ConflictedAction<'db>,
-        ambiguities: HashMap<Ambiguity<'db>, History>,
-    ) {
+    lr0_parse_table: &Lr0ParseTable<'db>,
+    conflicts: HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>,
+) -> HashMap<Terminal<'db>, HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>> {
+    let mut next = HashMap::new();
+    for (action, ambiguities) in conflicts {
+        let mut visited = HashMap::new();
         for (ambiguity, history) in ambiguities {
-            trace!(ambiguity = %ambiguity.display(self.db), %history, "Investigating ambiguity");
-            let (can_be_empty, derivative) = ambiguity.term_string.next(self.db);
-            if can_be_empty {
-                self.item_lane_heads(
+            trace!(ambiguity = %ambiguity.display(db), %history, "Investigating ambiguity");
+
+            let mut add_lane_head = |history: History| {
+                trace!("Walking parse table");
+                let item = &lr0_parse_table[history.location].0;
+                let term_string = TermString::new(
+                    db,
+                    language,
+                    Alternative::new(
+                        db,
+                        item.alternative.terms(db)[item.index + 1..].to_vec(),
+                        item.alternative.negative_lookahead(db),
+                    ),
+                );
+                let (can_be_empty, derivative) = term_string.next(db);
+                add_derivative(
+                    db,
+                    derivative,
                     &action,
-                    &ambiguity.negative_lookahead,
-                    &history,
+                    ambiguity.negative_lookahead.clone(),
+                    history,
+                    &mut next,
+                );
+                if can_be_empty {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            };
+
+            let (can_be_empty, derivative) = ambiguity.term_string.next(db);
+            if can_be_empty {
+                item_lane_heads(
+                    db,
+                    lr0_parse_table,
+                    &mut add_lane_head,
+                    Rc::new(history.clone()),
+                    &mut visited,
                     &mut HashSet::new(),
                 );
             }
-            self.add_derivative(derivative, &action, ambiguity.negative_lookahead, history);
+            add_derivative(
+                db,
+                derivative,
+                &action,
+                ambiguity.negative_lookahead,
+                history,
+                &mut next,
+            );
         }
     }
+    next
+}
 
-    #[instrument(level = "trace", skip_all, fields(location = %history.last().location))]
-    fn item_lane_heads(
-        &mut self,
-        action: &ConflictedAction<'db>,
-        negative_lookahead: &[TermString<'db>],
-        history: &History,
-        mut visited: &mut HashSet<ItemIndex>,
-    ) {
-        trace!("Computing lane heads");
-        let (item, back_refs) = &self.lr0_parse_table[history.last().location];
+#[instrument(level = "trace", skip_all, fields(location = %history.location))]
+fn item_lane_heads<'db>(
+    db: &'db dyn Db,
+    lr0_parse_table: &Lr0ParseTable<'db>,
+    add_lane_head: &mut impl FnMut(History) -> ControlFlow<()>,
+    history: Rc<History>,
+    histories: &mut HashMap<(bool, ItemIndex), Rc<History>>,
+    mut visited: &mut HashSet<(bool, ItemIndex)>,
+) {
+    trace!("Computing lane heads");
+    let (item, back_refs) = &lr0_parse_table[history.location];
 
-        let is_lane_head = item.index == 0;
-        for &back_ref in back_refs {
-            if is_lane_head && !visited.insert(back_ref) {
+    let is_lane_head = item.index == 0;
+    for &back_ref in back_refs {
+        if !visited.insert((is_lane_head, back_ref)) {
+            continue;
+        }
+        let mut visited = scopeguard::guard(&mut visited, |visited| {
+            visited.remove(&(is_lane_head, back_ref));
+        });
+        let entry = match histories.entry((is_lane_head, back_ref)) {
+            Entry::Vacant(entry) => entry,
+            Entry::Occupied(entry) => {
+                entry
+                    .get()
+                    .merge_existing(history.clone().prepend_empty(back_ref));
                 continue;
             }
-            let mut visited = scopeguard::guard(&mut visited, |visited| {
-                if is_lane_head {
-                    visited.remove(&back_ref);
-                }
-            });
-            if !self.visited.insert(back_ref) {
-                let mut merged = false;
-                for actions in self.next.values_mut() {
-                    let Some(ambiguities) = actions.get_mut(action) else {
-                        continue;
-                    };
-                    for existing_history in ambiguities.values_mut() {
-                        merged |= existing_history.try_merge(back_ref, history, is_lane_head);
-                    }
-                }
-                if merged {
-                    continue;
-                }
-            }
-            let mut new_history = history.clone();
-            if is_lane_head {
-                new_history.prepend_lane_head(back_ref);
-            } else {
-                new_history.prepend_empty(back_ref);
-            }
-            if !is_lane_head
-                || self.add_lane_head(action, negative_lookahead.to_vec(), new_history.clone())
-                    == ControlFlow::Continue(())
-            {
-                self.item_lane_heads(action, negative_lookahead, &new_history, *visited);
-            }
-        }
-    }
-
-    #[instrument(
-        level = "trace",
-        skip_all,
-        fields(action = %action.display(self.db), history = %history)
-    )]
-    fn add_lane_head(
-        &mut self,
-        action: &ConflictedAction<'db>,
-        negative_lookahead: Vec<TermString<'db>>,
-        history: History,
-    ) -> ControlFlow<()> {
-        trace!("Walking parse table");
-        let item = &self.lr0_parse_table[history.last().location].0;
-        let term_string = TermString::new(
-            self.db,
-            self.language,
-            Alternative::new(
-                self.db,
-                item.alternative.terms(self.db)[item.index + 1..].to_vec(),
-                item.alternative.negative_lookahead(self.db),
-            ),
-        );
-        let (can_be_empty, derivative) = term_string.next(self.db);
-        self.add_derivative(derivative, action, negative_lookahead, history);
-        if can_be_empty {
-            ControlFlow::Continue(())
+        };
+        let new_history = if is_lane_head {
+            history.clone().prepend_lane_head(back_ref)
         } else {
-            ControlFlow::Break(())
+            history.clone().prepend_empty(back_ref)
+        };
+        if !is_lane_head || add_lane_head(new_history.clone()) == ControlFlow::Continue(()) {
+            let new_history = Rc::new(new_history);
+            entry.insert(new_history.clone());
+            item_lane_heads(
+                db,
+                lr0_parse_table,
+                add_lane_head,
+                new_history,
+                histories,
+                *visited,
+            );
         }
     }
-    #[instrument(
-        level = "trace",
-        skip_all,
-        fields(action = %action.display(self.db), history = %history)
-    )]
-    fn add_derivative(
-        &mut self,
-        derivative: HashMap<Terminal<'db>, HashSet<TermString<'db>>>,
-        action: &ConflictedAction<'db>,
-        negative_lookahead: Vec<TermString<'db>>,
-        mut history: History,
-    ) {
-        history.last_mut().terminals_yielded = history
-            .last()
-            .terminals_yielded
+}
+
+#[instrument(level = "trace", skip_all, fields(action = %action.display(db), history = %history))]
+fn add_derivative<'db>(
+    db: &'db dyn Db,
+    derivative: HashMap<Terminal<'db>, HashSet<TermString<'db>>>,
+    action: &ConflictedAction<'db>,
+    negative_lookahead: Vec<TermString<'db>>,
+    mut history: History,
+    next: &mut HashMap<
+        Terminal<'db>,
+        HashMap<ConflictedAction<'db>, HashMap<Ambiguity<'db>, History>>,
+    >,
+) {
+    history.terminals_yielded = history.terminals_yielded.iter().map(|i| *i + 1).collect();
+    for (terminal, term_strings) in derivative {
+        let negative_lookahead: Vec<_> = negative_lookahead
             .iter()
-            .map(|i| *i + 1)
+            .flat_map(|terms| terms.next(db).1.remove(&terminal))
+            .flatten()
             .collect();
-        for (terminal, term_strings) in derivative {
-            let negative_lookahead: Vec<_> = negative_lookahead
-                .iter()
-                .flat_map(|terms| terms.next(self.db).1.remove(&terminal))
-                .flatten()
-                .collect();
-            if negative_lookahead
-                .iter()
-                .any(|term_string| term_string.next(self.db).0)
-            {
-                trace!("Dropping ambiguity because negative lookahead matched");
-                continue;
-            }
-            let action_ambiguities = self
-                .next
-                .entry(terminal)
-                .or_default()
-                .entry(action.clone())
-                .or_default();
-            for term_string in term_strings {
-                action_ambiguities
-                    .entry(Ambiguity {
-                        location: history.last().location,
-                        term_string,
-                        negative_lookahead: negative_lookahead.clone(),
-                    })
-                    .and_modify(|old_history| old_history.merge(history.clone()))
-                    .or_insert_with(|| history.clone());
-            }
+        if negative_lookahead
+            .iter()
+            .any(|term_string| term_string.next(db).0)
+        {
+            trace!("Dropping ambiguity because negative lookahead matched");
+            continue;
+        }
+        let ambiguities = next
+            .entry(terminal)
+            .or_default()
+            .entry(action.clone())
+            .or_default();
+        for term_string in term_strings {
+            ambiguities
+                .entry(Ambiguity {
+                    location: history.location,
+                    term_string,
+                    negative_lookahead: negative_lookahead.clone(),
+                })
+                .and_modify(|old_history| old_history.merge_head(history.clone()))
+                .or_insert_with(|| history.clone());
         }
     }
 }
@@ -983,7 +960,7 @@ fn conflicts<'db>(
                     ),
                     negative_lookahead,
                 },
-                History::new(location),
+                History::new_lane_head(location),
             );
             Some((conflict, ambiguities))
         })
@@ -1047,180 +1024,95 @@ impl<'db> DisplayWithDb for Ambiguity<'db> {
 
 #[derive(Debug, Clone)]
 struct History {
-    /// Note this is in reverse order for easy push
-    linear: Vec<HistoryItem>,
-    prev: Vec<History>,
-}
-
-#[derive(Debug, Clone)]
-struct HistoryItem {
     location: ItemIndex,
     terminals_yielded: BTreeSet<u32>,
+    previous: RefCell<Vec<Rc<History>>>,
 }
 
 impl History {
-    fn new(location: ItemIndex) -> Self {
+    fn new_lane_head(location: ItemIndex) -> Self {
         let mut terminals_yielded = BTreeSet::new();
         terminals_yielded.insert(0);
-        let item = HistoryItem {
+        Self {
             location,
             terminals_yielded,
-        };
-        Self {
-            linear: vec![item],
-            prev: vec![],
+            previous: RefCell::new(Vec::new()),
         }
     }
 
-    fn last(&self) -> &HistoryItem {
-        self.linear.last().unwrap()
-    }
-
-    fn last_mut(&mut self) -> &mut HistoryItem {
-        self.linear.last_mut().unwrap()
-    }
-
-    fn prepend_empty(&mut self, location: ItemIndex) {
-        self.linear.push(HistoryItem {
+    fn prepend_empty(self: Rc<Self>, location: ItemIndex) -> History {
+        History {
             location,
             terminals_yielded: BTreeSet::new(),
-        });
+            previous: RefCell::new(vec![self]),
+        }
     }
 
-    fn prepend_lane_head(&mut self, location: ItemIndex) {
+    fn prepend_lane_head(self: Rc<Self>, location: ItemIndex) -> History {
         let mut terminals_yielded = BTreeSet::new();
         terminals_yielded.insert(0);
-        self.linear.push(HistoryItem {
+        History {
             location,
             terminals_yielded,
-        });
-    }
-
-    fn merge(&mut self, mut other: History) {
-        let mut current = self.linear.pop().unwrap();
-        let other_current = other.linear.pop().unwrap();
-        assert_eq!(current.location, other_current.location);
-        current
-            .terminals_yielded
-            .extend(other_current.terminals_yielded);
-        let this = std::mem::replace(
-            self,
-            History {
-                linear: Vec::new(),
-                prev: Vec::new(),
-            },
-        );
-        *self = History {
-            linear: vec![current],
-            prev: vec![this, other],
+            previous: RefCell::new(vec![self]),
         }
     }
 
-    fn try_merge(&mut self, location: ItemIndex, other: &History, is_lane_head: bool) -> bool {
-        for (i, item) in self
-            .linear
-            .iter_mut()
-            .enumerate()
-            .rev()
-            .skip(if is_lane_head { 0 } else { 1 })
-        {
-            match item.terminals_yielded.last() {
-                Some(&x) if x > 0 => {
-                    return false;
-                }
-                Some(_) => {}
-                None => continue,
-            }
-            if item.location != location {
-                continue;
-            }
-            let other = other.clone();
-            if i == 0 {
-                self.prev.push(other);
-            } else {
-                let mut old = std::mem::replace(
-                    self,
-                    History {
-                        linear: Vec::new(),
-                        prev: Vec::new(),
-                    },
-                );
-                let recent = old.linear.split_off(i);
-                *self = History {
-                    linear: recent,
-                    prev: vec![old, other],
-                };
-            }
-            return true;
-        }
-        for prev in &mut self.prev {
-            if prev.try_merge(location, other, false) {
-                return true;
-            }
-        }
+    fn merge_existing(&self, other: History) {
+        assert_eq!(self.location, other.location);
+        assert!(other.terminals_yielded.is_empty());
+        self.previous
+            .borrow_mut()
+            .extend(other.previous.into_inner());
+    }
 
-        false
+    fn merge_head(&mut self, other: History) {
+        assert_eq!(self.location, other.location);
+        self.terminals_yielded.extend(other.terminals_yielded);
+        self.previous.get_mut().extend(other.previous.into_inner());
     }
 
     fn loop_lengths(&self, mut action: impl FnMut(u32)) {
         fn loop_lengths(
+            this: &History,
             loc: ItemIndex,
             mut counts: BTreeSet<u32>,
-            linear: &[HistoryItem],
-            prev: &[History],
             action: &mut impl FnMut(u32),
         ) {
-            for item in linear.iter().rev() {
-                if !item.terminals_yielded.is_empty() {
-                    let prev_counts = std::mem::take(&mut counts);
-                    for &terminals_yielded in &item.terminals_yielded {
-                        counts.extend(prev_counts.iter().map(|x| x + terminals_yielded));
-                    }
-                }
-                for &count in &counts {
-                    if item.location == loc {
-                        action(count);
-                    }
+            if !this.terminals_yielded.is_empty() {
+                let prev_counts = std::mem::take(&mut counts);
+                for &terminals_yielded in &this.terminals_yielded {
+                    counts.extend(prev_counts.iter().map(|x| x + terminals_yielded));
                 }
             }
-            for prev in prev {
-                loop_lengths(loc, counts.clone(), &prev.linear, &prev.prev, action);
+            if this.location == loc {
+                for &count in &counts {
+                    action(count);
+                }
+            }
+            for prev in &**this.previous.borrow() {
+                loop_lengths(prev, loc, counts.clone(), action);
             }
         }
 
         // The loop length is from the start of the last time we saw this item to
         // the *start* of this item.
-        let loc = self.last().location;
+        let loc = self.location;
         let mut counts = BTreeSet::new();
         counts.insert(0);
-        loop_lengths(
-            loc,
-            counts,
-            &self.linear[..self.linear.len() - 1],
-            &self.prev,
-            &mut action,
-        )
+        for prev in &**self.previous.borrow() {
+            loop_lengths(prev, loc, counts.clone(), &mut action);
+        }
     }
 }
 
 impl fmt::Display for History {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.linear.iter().rev().format_with(", ", |item, f| {
-                f(&item.location)?;
-                if !item.terminals_yielded.is_empty() {
-                    f(&format_args!(
-                        "x{{{}}}",
-                        item.terminals_yielded.iter().format(",")
-                    ))?;
-                }
-                Ok(())
-            })
-        )?;
-
-        match self.prev.as_slice() {
+        write!(f, "{}", self.location)?;
+        if !self.terminals_yielded.is_empty() {
+            write!(f, "x{{{}}}", self.terminals_yielded.iter().format(","))?;
+        }
+        match self.previous.borrow().as_slice() {
             [] => {}
             [prev] => write!(f, " {}", prev)?,
             prev => write!(f, " [{}]", prev.iter().format(", "))?,
@@ -1769,7 +1661,7 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
             .flat_map(|(terminal, (action, ambiguities))| {
                 ambiguities
                     .values()
-                    .map(move |history| (history, history.last().location, terminal, action))
+                    .map(move |history| (history, history.location, terminal, action))
             })
             .fold(Vec::new(), |mut acc, (history, loc, terminal, action)| {
                 fn recurse<'db>(
@@ -1786,14 +1678,8 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                         ConflictedAction<'db>,
                     )>,
                 ) {
-                    path.extend(
-                        history
-                            .linear
-                            .iter()
-                            .rev()
-                            .map(|item| item.location.state_id),
-                    );
-                    if history.prev.is_empty() {
+                    path.push_back(history.location.state_id);
+                    if history.previous.borrow().is_empty() {
                         trace!(
                             path = %path.iter().format(","),
                             terminal = %terminal.display(db),
@@ -1802,7 +1688,7 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                         );
                         acc.push((path.clone(), loc, terminal.clone(), action.clone()));
                     } else {
-                        for prev in &history.prev {
+                        for prev in &**history.previous.borrow() {
                             recurse(db, prev, loc, terminal, action, path, acc);
                         }
                     }
