@@ -1624,6 +1624,8 @@ struct StateSplitter<'a, 'db, F> {
     lr0_parse_table: &'a mut Lr0ParseTable<'db>,
     sccs: &'a mut StronglyConnectedComponents,
     invalidate_state: &'a mut F,
+    terminals: HashMap<ItemIndex, HashSet<Terminal<'db>>>,
+    conflicting_items: RefCell<HashMap<(ItemIndex, ItemIndex), Result<(), Vec<Diagnostic>>>>,
     component_paths: HashMap<ComponentId, HashMap<Vec<ComponentId>, usize>>,
     components_splits: HashMap<ComponentId, Vec<ComponentId>>,
     old_to_new_state_map: HashMap<(ComponentId, Lr0StateId), Lr0StateId>,
@@ -1650,6 +1652,8 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
             lr0_parse_table,
             sccs,
             invalidate_state,
+            terminals: HashMap::new(),
+            conflicting_items: RefCell::new(HashMap::new()),
             component_paths: HashMap::new(),
             components_splits: HashMap::new(),
             old_to_new_state_map: HashMap::new(),
@@ -1671,12 +1675,7 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                     terminal: &Terminal<'db>,
                     action: &ConflictedAction<'db>,
                     path: &mut VecDeque<Lr0StateId>,
-                    acc: &mut Vec<(
-                        VecDeque<Lr0StateId>,
-                        ItemIndex,
-                        Terminal<'db>,
-                        ConflictedAction<'db>,
-                    )>,
+                    acc: &mut Vec<(VecDeque<Lr0StateId>, ItemIndex, ConflictedAction<'db>)>,
                 ) {
                     path.push_back(history.location.state_id);
                     if history.previous.borrow().is_empty() {
@@ -1686,7 +1685,7 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                             action = %action.display(db),
                             "Found ambiguity"
                         );
-                        acc.push((path.clone(), loc, terminal.clone(), action.clone()));
+                        acc.push((path.clone(), loc, action.clone()));
                     } else {
                         for prev in &**history.previous.borrow() {
                             recurse(db, prev, loc, terminal, action, path, acc);
@@ -1703,6 +1702,11 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                     &mut VecDeque::new(),
                     &mut acc,
                 );
+                splitter
+                    .terminals
+                    .entry(loc)
+                    .or_default()
+                    .insert(terminal.clone());
                 acc
             });
         let mut splits = Vec::new();
@@ -1742,40 +1746,31 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
 
     fn trace_paths(
         &self,
-        mut ambiguities: Vec<(
-            VecDeque<Lr0StateId>,
-            ItemIndex,
-            Terminal<'a>,
-            ConflictedAction<'a>,
-        )>,
+        mut ambiguities: Vec<(VecDeque<Lr0StateId>, ItemIndex, ConflictedAction<'a>)>,
         component: ComponentId,
-        mut lookahead: HashMap<Terminal<'a>, HashSet<ConflictedAction<'a>>>,
+        mut lookahead: HashMap<ItemIndex, HashSet<ConflictedAction<'a>>>,
         path: &mut Vec<ComponentId>,
         splits: &mut Vec<(
-            Option<HashMap<Terminal<'a>, HashSet<ConflictedAction<'a>>>>,
+            Option<HashMap<ItemIndex, HashSet<ConflictedAction<'a>>>>,
             Vec<Vec<ComponentId>>,
         )>,
     ) {
         let mut conflicted_locations: HashMap<ItemIndex, HashSet<ConflictedAction>> =
             HashMap::new();
-        ambiguities.retain_mut(|(history, loc, terminal, action)| {
+        ambiguities.retain_mut(|(history, loc, action)| {
             while let Some(loc) = history.back() {
                 if self.sccs.component(*loc) != component {
                     return true;
                 }
                 history.pop_back();
             }
-            lookahead
-                .entry(terminal.clone())
-                .or_default()
-                .insert(action.clone());
             conflicted_locations
                 .entry(*loc)
                 .or_default()
                 .insert(action.clone());
             false
         });
-        for (loc, actions) in conflicted_locations {
+        for (loc, actions) in &conflicted_locations {
             if actions.len() > 1 {
                 emit(
                     format!(
@@ -1790,12 +1785,13 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                 return;
             }
         }
+        lookahead.extend(conflicted_locations);
 
         if !ambiguities.is_empty() {
             for &next_component in self.sccs.back_refs(component) {
                 let ambiguities = ambiguities
                     .iter()
-                    .filter(|(history, _, _, _)| {
+                    .filter(|(history, _, _)| {
                         self.sccs.component(*history.back().unwrap()) == next_component
                     })
                     .cloned()
@@ -1807,18 +1803,12 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
         } else {
             // First check if there are any conflicts between lookahead tokens
             // that could never be resolved.
-            for terminal_a in lookahead.keys() {
-                for terminal_b in lookahead.keys() {
-                    if terminal_a == terminal_b {
+            for &item_a in lookahead.keys() {
+                for &item_b in lookahead.keys() {
+                    if item_a == item_b {
                         continue;
                     }
-                    if let Err(diagnostic) = terminals_conflict(
-                        self.db,
-                        self.language,
-                        terminal_a.clone(),
-                        terminal_b.clone(),
-                    ) {
-                        emit_diagnostic(diagnostic);
+                    if self.items_conflict(item_a, item_b, true) {
                         return;
                     }
                 }
@@ -1841,21 +1831,14 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                     };
                     // Check that none of the terminals conflict and that
                     // they don't introduce any action conflicts.
-                    for (terminal, action) in &lookahead {
-                        if let Some(split_action) = split_lookahead.get(terminal) {
+                    for (&item, action) in &lookahead {
+                        if let Some(split_action) = split_lookahead.get(&item) {
                             if action != split_action {
                                 return false;
                             }
                         } else {
-                            for split_terminal in split_lookahead.keys() {
-                                if terminals_conflict(
-                                    self.db,
-                                    self.language,
-                                    terminal.clone(),
-                                    split_terminal.clone(),
-                                )
-                                .is_err()
-                                {
+                            for &split_item in split_lookahead.keys() {
+                                if self.items_conflict(item, split_item, false) {
                                     return false;
                                 }
                             }
@@ -1869,6 +1852,74 @@ impl<'a, 'db, F: FnMut(Lr0StateId)> StateSplitter<'a, 'db, F> {
                 }
             }
         }
+    }
+
+    fn items_conflict(&self, item_a: ItemIndex, item_b: ItemIndex, emit: bool) -> bool {
+        let [item_a, item_b] = {
+            let mut items = [item_a, item_b];
+            items.sort();
+            items
+        };
+        if let Some(diags) = self
+            .conflicting_items
+            .borrow_mut()
+            .get_mut(&(item_a, item_b))
+        {
+            if emit {
+                if let Err(diags) = diags {
+                    for diag in std::mem::take(diags) {
+                        emit_diagnostic(diag);
+                    }
+                }
+            }
+            return diags.is_err();
+        }
+        let terminals_a = self
+            .terminals
+            .get(&item_a)
+            .expect("All items should have terminals");
+        let terminals_b = self
+            .terminals
+            .get(&item_b)
+            .expect("All items should have terminals");
+        #[allow(clippy::manual_try_fold)]
+        let conflicts = terminals_a
+            .iter()
+            .cartesian_product(terminals_b)
+            .filter(|(a, b)| a != b)
+            .fold(Ok(()), |acc, (terminal_a, terminal_b)| {
+                match (
+                    acc,
+                    terminals_conflict(
+                        self.db,
+                        self.language,
+                        terminal_a.clone(),
+                        terminal_b.clone(),
+                    ),
+                ) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Ok(()), Err(diag)) => Err(if emit {
+                        emit_diagnostic(diag);
+                        vec![]
+                    } else {
+                        vec![diag]
+                    }),
+                    (acc @ Err(_), Ok(())) => acc,
+                    (Err(mut diags), Err(diag)) => {
+                        if emit {
+                            emit_diagnostic(diag);
+                        } else {
+                            diags.push(diag);
+                        }
+                        Err(diags)
+                    }
+                }
+            });
+        let result = conflicts.is_err();
+        self.conflicting_items
+            .borrow_mut()
+            .insert((item_a, item_b), conflicts);
+        result
     }
 
     fn split(
