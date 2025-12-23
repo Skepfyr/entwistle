@@ -7,24 +7,26 @@ use std::{
 
 use tracing::{instrument, trace};
 
+use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
 use crate::{
     language::Language,
-    lower::{Alternative, NonTerminal, Terminal},
+    lower::{Alternative, NonTerminal, Term, TermKind, Terminal},
     util::DisplayWithDb,
     Db,
 };
 
-use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
-
 #[derive(Debug, Clone)]
 pub struct TermString<'db> {
-    pub(super) parse_table: Arc<Lr0ParseTable<'db>>,
-    pub(super) locations: Vec<Location>,
+    parse_table: Arc<Lr0ParseTable<'db>>,
+    locations: Vec<Location>,
+    negative_lookahead: Arc<[TermString<'db>]>,
 }
 
 impl<'a, 'b> PartialEq<TermString<'b>> for TermString<'a> {
     fn eq(&self, other: &TermString) -> bool {
-        Arc::ptr_eq(&self.parse_table, &other.parse_table) && self.locations == other.locations
+        Arc::ptr_eq(&self.parse_table, &other.parse_table)
+            && self.locations == other.locations
+            && self.negative_lookahead == other.negative_lookahead
     }
 }
 impl<'db> Eq for TermString<'db> {}
@@ -36,22 +38,44 @@ impl<'a, 'b> PartialOrd<TermString<'b>> for TermString<'a> {
 impl<'db> Ord for TermString<'db> {
     fn cmp(&self, other: &TermString) -> std::cmp::Ordering {
         Ord::cmp(
-            &(Arc::as_ptr(&self.parse_table) as usize),
-            &(Arc::as_ptr(&other.parse_table) as usize),
+            &Arc::as_ptr(&self.parse_table),
+            &Arc::as_ptr(&other.parse_table),
         )
         .then_with(|| self.locations.cmp(&other.locations))
+        .then_with(|| self.negative_lookahead.cmp(&other.negative_lookahead))
     }
 }
 impl<'db> Hash for TermString<'db> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (Arc::as_ptr(&self.parse_table) as usize).hash(state);
+        Arc::as_ptr(&self.parse_table).hash(state);
         self.locations.hash(state);
+        self.negative_lookahead.hash(state);
     }
 }
 
 impl<'db> TermString<'db> {
-    pub fn new(db: &'db dyn Db, language: Language<'db>, alternative: Alternative<'db>) -> Self {
+    pub fn new(
+        db: &'db dyn Db,
+        language: Language<'db>,
+        alternative: Alternative<'db>,
+        mut negative_lookahead: Vec<TermString<'db>>,
+    ) -> Self {
         let parse_table = lr0_parse_table(db, language, NonTerminal::new_internal(db, alternative));
+        negative_lookahead.extend(alternative.negative_lookahead(db).map(|nt| {
+            TermString::new(
+                db,
+                language,
+                Alternative::new(
+                    db,
+                    vec![Term {
+                        kind: TermKind::NonTerminal(nt),
+                        silent: true,
+                    }],
+                    None,
+                ),
+                vec![],
+            )
+        }));
         TermString {
             parse_table,
             locations: vec![Location {
@@ -61,7 +85,12 @@ impl<'db> TermString<'db> {
                 },
                 state: Lr0StateId(0),
             }],
+            negative_lookahead: negative_lookahead.into(),
         }
+    }
+
+    pub fn has_negative_lookahead(&self) -> bool {
+        !self.negative_lookahead.is_empty()
     }
 
     #[instrument(level = "debug", skip_all, fields(self = %self.display(db)))]
@@ -69,6 +98,27 @@ impl<'db> TermString<'db> {
         &self,
         db: &'db dyn Db,
     ) -> (bool, HashMap<Terminal<'db>, HashSet<TermString<'db>>>) {
+        let Some(negative_lookahead) = self.negative_lookahead.iter().fold(
+            Some(HashMap::<Terminal, HashSet<TermString<'db>>>::new()),
+            |acc, lookahead| {
+                let mut acc = acc?;
+                let (empty, next) = lookahead.next(db);
+                if empty {
+                    return None;
+                }
+                for (t, strings) in next {
+                    acc.entry(t).or_default().extend(strings)
+                }
+                Some(acc)
+            },
+        ) else {
+            return (false, HashMap::new());
+        };
+        let negative_lookahead: HashMap<_, Arc<[_]>> = negative_lookahead
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect::<Vec<_>>().into()))
+            .collect();
+
         let mut contains_empty = false;
         let mut derivative: HashMap<Terminal, HashSet<TermString>> = HashMap::new();
 
@@ -91,6 +141,10 @@ impl<'db> TermString<'db> {
                 let term_string = TermString {
                     parse_table: self.parse_table.clone(),
                     locations,
+                    negative_lookahead: negative_lookahead
+                        .get(terminal)
+                        .cloned()
+                        .unwrap_or_default(),
                 };
                 trace!(
                     terminal = %terminal.display(db),
@@ -187,6 +241,7 @@ impl<'db> DisplayWithDb for TermString<'db> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
         // TODO: Print out trees too?
         // TODO: How are you meant to know what the states are?
+        // TODO: Negative lookahead?
         write!(f, "{}: 0", self.parse_table.goal.display(db))?;
         for location in &self.locations[1..] {
             write!(f, " (#{}) {}", location.tree.terminals, location.state)?;

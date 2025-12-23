@@ -15,7 +15,6 @@ use regex_automata::{
     PatternID,
 };
 use regex_syntax::hir::Hir;
-use salsa::DebugWithDb;
 use tracing::instrument;
 
 use crate::{
@@ -423,8 +422,8 @@ fn lower_term<'db>(
 }
 
 #[instrument(skip_all, fields(terminal = %terminal.display(db)))]
-#[salsa::tracked(no_eq)]
-pub fn terminal_nfa<'db>(db: &dyn Db, language: Language<'db>, terminal: Terminal<'db>) -> NFA {
+#[salsa::tracked(no_eq, non_update_types)]
+pub fn terminal_nfa<'db>(db: &'db dyn Db, language: Language<'db>, terminal: Terminal<'db>) -> NFA {
     match terminal {
         Terminal::Named { ident, span } => {
             let nfa = ident_nfa(db, language, ident, span, &mut HashSet::new());
@@ -1139,8 +1138,9 @@ fn regex_nfa(regex: &str, span: Span) -> NFA {
 }
 
 #[salsa::interned]
+#[derive(Debug, PartialOrd, Ord)]
 pub struct NonTerminal<'db> {
-    #[return_ref]
+    #[returns(ref)]
     inner: NonTerminalInner<'db>,
 }
 
@@ -1457,8 +1457,9 @@ impl<'db> Hash for Terminal<'db> {
 }
 
 #[salsa::interned]
+#[derive(Debug, PartialOrd, Ord)]
 pub struct Production<'db> {
-    #[return_ref]
+    #[returns(deref)]
     pub alternatives: Vec<Alternative<'db>>,
 }
 
@@ -1475,8 +1476,9 @@ impl<'db> DisplayWithDb for Production<'db> {
 }
 
 #[salsa::interned]
+#[derive(Debug, PartialOrd, Ord)]
 pub struct Alternative<'db> {
-    #[return_ref]
+    #[returns(deref)]
     pub terms: Vec<Term<'db>>,
     pub negative_lookahead: Option<NonTerminal<'db>>,
 }

@@ -30,7 +30,7 @@ pub fn run_test<'db>(
             let mut action = &state.action;
             let mut lookahead = 0;
             loop {
-                let Action::Ambiguous {
+                let Action::Lookahead {
                     nfa,
                     terminals,
                     actions,
@@ -68,7 +68,7 @@ pub fn run_test<'db>(
             action
         };
         match action {
-            Action::Ambiguous { .. } => unreachable!(),
+            Action::Lookahead { .. } => unreachable!(),
             Action::Shift(terminal, new_state) => {
                 let regex = terminal_nfa(db, language, terminal.clone());
                 let pike_vm = PikeVM::new_from_nfa(regex).unwrap();
@@ -142,6 +142,19 @@ pub fn run_test<'db>(
                 forest.push(ParseTree::Node { ident, nodes });
                 let state = &parse_table[*states.last().unwrap()];
                 states.push(state.goto[non_terminal]);
+            }
+            Action::Ambiguous(_) => {
+                emit(
+                    "Ambiguous grammar",
+                    vec![(
+                        crate::Span {
+                            start: test.test_span(db).start + offset,
+                            end: test.test_span(db).start + offset,
+                        },
+                        None,
+                    )],
+                );
+                return None;
             }
         }
     };
