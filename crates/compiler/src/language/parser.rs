@@ -6,12 +6,11 @@ use chumsky::{
     Stream,
 };
 
-use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
-
 use super::{
     Definition, Expression, Ident, Item, Language, LookaroundType, Mark, ParseTree, QuantifiedItem,
     Quantifier, Rule, Test,
 };
+use crate::{diagnostics::emit, Db, Span};
 
 pub(super) fn parse_grammar<'db>(db: &'db dyn Db, input: &str) -> Language<'db> {
     let stream = Stream::from_iter(
@@ -95,10 +94,7 @@ fn file(db: &dyn Db) -> impl Parser<char, Language, Error = ParseError> + '_ {
                                 "Duplicate definition",
                                 vec![(
                                     rule.span,
-                                    Some(format!(
-                                        "Duplicate definition of {}",
-                                        rule.ident.display(db)
-                                    )),
+                                    Some(format!("Duplicate definition of {}", rule.ident)),
                                 )],
                             );
                         }
@@ -314,7 +310,7 @@ fn parse_trees(db: &dyn Db) -> impl Parser<char, Vec<ParseTree>, Error = ParseEr
         .repeated()
         .validate(|lines, span, emit| {
             let mut trees: Vec<(String, Ident, Vec<ParseTree>)> =
-                vec![("".into(), Ident::new(db, "".into()), Vec::new())];
+                vec![("".into(), Ident::new(db, ""), Vec::new())];
             for (indent, tree_info) in lines {
                 while trees
                     .last()

@@ -20,7 +20,6 @@ use tracing::instrument;
 use crate::{
     diagnostics::emit,
     language::{Expression, Ident, Item, Language, Mark, QuantifiedItem, Quantifier, Rule},
-    util::DisplayWithDb,
     Db, Span,
 };
 
@@ -422,7 +421,7 @@ fn lower_term<'db>(
 }
 
 #[instrument(skip_all, fields(terminal = %terminal.display(db)))]
-#[salsa::tracked(no_eq, non_update_types)]
+#[salsa::tracked(no_eq)]
 pub fn terminal_nfa<'db>(db: &'db dyn Db, language: Language<'db>, terminal: Terminal<'db>) -> NFA {
     match terminal {
         Terminal::Named { ident, span } => {
@@ -1237,15 +1236,15 @@ impl<'db> NonTerminal<'db> {
 
     pub fn ident(self, db: &'db dyn Db) -> Ident<'db> {
         match self.inner(db) {
-            NonTerminalInner::Goal { .. } => Ident::new(db, "goal".into()),
-            NonTerminalInner::Internal { .. } => Ident::new(db, "internal".into()),
+            NonTerminalInner::Goal { .. } => Ident::new(db, "goal"),
+            NonTerminalInner::Internal { .. } => Ident::new(db, "internal"),
             NonTerminalInner::Named {
                 name: Name { ident, .. },
                 generics: _,
                 span: _,
             } => *ident,
-            NonTerminalInner::Anonymous { .. } => Ident::new(db, "anon".into()),
-            NonTerminalInner::Quantified { .. } => Ident::new(db, "quantified".into()),
+            NonTerminalInner::Anonymous { .. } => Ident::new(db, "anon"),
+            NonTerminalInner::Quantified { .. } => Ident::new(db, "quantified"),
         }
     }
 
@@ -1267,40 +1266,42 @@ fn is_infinite_recovery(_: &dyn Db, _: &salsa::Cycle, _: NonTerminal, _: Languag
     true
 }
 
-impl<'db> DisplayWithDb for NonTerminal<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self.inner(db) {
-            NonTerminalInner::Goal { rule } => {
-                write!(f, "Goal({})", rule.display(db))?;
-            }
-            NonTerminalInner::Internal { alternative } => {
-                write!(f, "Internal({})", alternative.display(db))?;
-            }
-            NonTerminalInner::Named {
-                name,
-                generics,
-                span: _,
-            } => {
-                write!(f, "{}", name.display(db))?;
-                if !generics.is_empty() {
-                    f.write_str("<")?;
-                    for (i, generic) in generics.iter().enumerate() {
-                        if i != 0 {
-                            f.write_str(", ")?;
+impl<'db> fmt::Display for NonTerminal<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            match self.inner(db) {
+                NonTerminalInner::Goal { rule } => {
+                    write!(f, "Goal({})", rule)?;
+                }
+                NonTerminalInner::Internal { alternative } => {
+                    write!(f, "Internal({})", alternative)?;
+                }
+                NonTerminalInner::Named {
+                    name,
+                    generics,
+                    span: _,
+                } => {
+                    write!(f, "{}", name)?;
+                    if !generics.is_empty() {
+                        f.write_str("<")?;
+                        for (i, generic) in generics.iter().enumerate() {
+                            if i != 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}", generic)?;
                         }
-                        write!(f, "{}", generic.display(db))?;
+                        f.write_str(">")?;
                     }
-                    f.write_str(">")?;
+                }
+                NonTerminalInner::Anonymous { production } => {
+                    write!(f, "({})", production)?;
+                }
+                NonTerminalInner::Quantified { term, quantifier } => {
+                    write!(f, "{}{}", term, quantifier)?;
                 }
             }
-            NonTerminalInner::Anonymous { production } => {
-                write!(f, "({})", production.display(db))?;
-            }
-            NonTerminalInner::Quantified { term, quantifier } => {
-                write!(f, "{}{}", term.display(db), quantifier)?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1310,13 +1311,15 @@ pub struct Name<'db> {
     pub index: usize,
 }
 
-impl<'db> DisplayWithDb for Name<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        write!(f, "{}", self.ident.display(db))?;
-        if self.index > 0 {
-            write!(f, "#{}", self.index)?;
-        }
-        Ok(())
+impl<'db> fmt::Display for Name<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            write!(f, "{}", self.ident)?;
+            if self.index > 0 {
+                write!(f, "#{}", self.index)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1361,15 +1364,15 @@ impl<'db> fmt::Debug for Terminal<'db> {
     }
 }
 
-impl<'db> DisplayWithDb for Terminal<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
+impl<'db> fmt::Display for Terminal<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| match self {
             Self::Named { ident, .. } => {
-                write!(f, "@{}", ident.display(db))
+                write!(f, "@{}", ident)
             }
             Self::Anonymous { name, .. } => write!(f, "'{name}'"),
             Self::EndOfInput { .. } => write!(f, "$"),
-        }
+        })
     }
 }
 
@@ -1463,15 +1466,17 @@ pub struct Production<'db> {
     pub alternatives: Vec<Alternative<'db>>,
 }
 
-impl<'db> DisplayWithDb for Production<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, alternative) in self.alternatives(db).iter().enumerate() {
-            if i != 0 {
-                write!(f, " | ")?;
+impl<'db> fmt::Display for Production<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            for (i, alternative) in self.alternatives(db).iter().enumerate() {
+                if i != 0 {
+                    write!(f, " | ")?;
+                }
+                write!(f, "{}", alternative)?;
             }
-            write!(f, "{}", alternative.display(db))?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1483,18 +1488,20 @@ pub struct Alternative<'db> {
     pub negative_lookahead: Option<NonTerminal<'db>>,
 }
 
-impl<'db> DisplayWithDb for Alternative<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, term) in self.terms(db).iter().enumerate() {
-            if i != 0 {
-                write!(f, " ")?;
+impl<'db> fmt::Display for Alternative<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            for (i, term) in self.terms(db).iter().enumerate() {
+                if i != 0 {
+                    write!(f, " ")?;
+                }
+                write!(f, "{}", term)?;
             }
-            write!(f, "{}", term.display(db))?;
-        }
-        if let Some(non_terminal) = &self.negative_lookahead(db) {
-            write!(f, " (!>>{})", non_terminal.display(db))?;
-        }
-        Ok(())
+            if let Some(non_terminal) = &self.negative_lookahead(db) {
+                write!(f, " (!>>{})", non_terminal)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1504,13 +1511,15 @@ pub struct Term<'db> {
     pub silent: bool,
 }
 
-impl<'db> DisplayWithDb for Term<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        // Only show the silent marker if it's not obvious.
-        if self.silent && matches!(self.kind, TermKind::NonTerminal(nt) if nt.is_named(db)) {
-            f.write_char('-')?;
-        }
-        <TermKind as DisplayWithDb>::fmt(&self.kind, f, db)
+impl<'db> fmt::Display for Term<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            // Only show the silent marker if it's not obvious.
+            if self.silent && matches!(self.kind, TermKind::NonTerminal(nt) if nt.is_named(db)) {
+                f.write_char('-')?;
+            }
+            fmt::Display::fmt(&self.kind, f)
+        })
     }
 }
 
@@ -1520,11 +1529,11 @@ pub enum TermKind<'db> {
     NonTerminal(NonTerminal<'db>),
 }
 
-impl<'db> DisplayWithDb for TermKind<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            Self::Terminal(terminal) => write!(f, "{}", terminal.display(db)),
-            Self::NonTerminal(non_terminal) => write!(f, "{}", non_terminal.display(db)),
-        }
+impl<'db> fmt::Display for TermKind<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| match self {
+            Self::Terminal(terminal) => write!(f, "{}", terminal),
+            Self::NonTerminal(non_terminal) => write!(f, "{}", non_terminal),
+        })
     }
 }

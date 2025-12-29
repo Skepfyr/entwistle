@@ -28,7 +28,6 @@ use crate::{
     diagnostics::{emit, Diagnostic},
     language::{Language, Rule},
     lower::{production, terminal_nfa, Alternative, NonTerminal, Term, TermKind, Terminal},
-    util::DisplayWithDb,
     Db, Span,
 };
 
@@ -41,19 +40,21 @@ pub struct LrkParseTable<'db> {
     pub states: Vec<State<'db>>,
 }
 
-impl<'db> DisplayWithDb for LrkParseTable<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        writeln!(f, "Goal: {}", self.goal.display(db))?;
-        for (i, state) in self.states.iter().enumerate() {
-            writeln!(f, "State {i}:")?;
-            writeln!(f, "  Actions:")?;
-            write!(indented(f).with_str("    "), "{}", state.action.display(db))?;
-            writeln!(f, "  Goto:")?;
-            for (nt, state) in &state.goto {
-                writeln!(f, "    {} -> {}", nt.display(db), state)?;
+impl<'db> fmt::Display for LrkParseTable<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            writeln!(f, "Goal: {}", self.goal.display(db))?;
+            for (i, state) in self.states.iter().enumerate() {
+                writeln!(f, "State {i}:")?;
+                writeln!(f, "  Actions:")?;
+                write!(indented(f).with_str("    "), "{}", state.action.display(db))?;
+                writeln!(f, "  Goto:")?;
+                for (nt, state) in &state.goto {
+                    writeln!(f, "    {} -> {}", nt.display(db), state)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -96,8 +97,8 @@ pub enum Action<'db> {
     Ambiguous(Vec<Action<'db>>),
 }
 
-impl<'db> DisplayWithDb for Action<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
+impl<'db> fmt::Display for Action<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn display(
             action: &Action,
             f: &mut fmt::Formatter<'_>,
@@ -142,7 +143,7 @@ impl<'db> DisplayWithDb for Action<'db> {
                 }
             }
         }
-        display(self, f, db, &mut Vec::new())
+        salsa::with_attached_database(|db| display(self, f, db, &mut Vec::new()))
     }
 }
 
@@ -217,13 +218,15 @@ pub struct Lr0ParseTable<'db> {
     pub states: Vec<Lr0State<'db>>,
 }
 
-impl<'db> DisplayWithDb for Lr0ParseTable<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, state) in self.states.iter().enumerate() {
-            writeln!(f, "State {i}:")?;
-            writeln!(indented(f).with_str("  "), "{}", state.display(db))?;
-        }
-        Ok(())
+impl<'db> fmt::Display for Lr0ParseTable<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            for (i, state) in self.states.iter().enumerate() {
+                writeln!(f, "State {i}:")?;
+                writeln!(indented(f).with_str("  "), "{}", state.display(db))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -256,39 +259,41 @@ pub struct Lr0State<'db> {
     pub goto: BTreeMap<NonTerminal<'db>, Lr0StateId>,
 }
 
-impl<'db> DisplayWithDb for Lr0State<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        writeln!(f, "Items:")?;
-        for (i, (item, backlinks)) in self.item_set.iter().enumerate() {
-            write!(f, "  {:>2}: {} ->", i, item.non_terminal.display(db))?;
-            for term in &item.alternative.terms(db)[..item.index] {
-                write!(f, " {}", term.display(db))?;
-            }
-            write!(f, " .")?;
-            for term in &item.alternative.terms(db)[item.index..] {
-                write!(f, " {}", term.display(db))?;
-            }
-            if let Some(lookahead) = &item.alternative.negative_lookahead(db) {
-                write!(f, "(!>>{})", lookahead.display(db))?;
-            }
-            writeln!(f)?;
-            write!(f, "      Backlinks: {{")?;
-            for (i, item) in backlinks.iter().enumerate() {
-                if i != 0 {
-                    write!(f, ", ")?;
+impl<'db> fmt::Display for Lr0State<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            writeln!(f, "Items:")?;
+            for (i, (item, backlinks)) in self.item_set.iter().enumerate() {
+                write!(f, "  {:>2}: {} ->", i, item.non_terminal.display(db))?;
+                for term in &item.alternative.terms(db)[..item.index] {
+                    write!(f, " {}", term.display(db))?;
                 }
-                write!(f, "{}", item)?;
+                write!(f, " .")?;
+                for term in &item.alternative.terms(db)[item.index..] {
+                    write!(f, " {}", term.display(db))?;
+                }
+                if let Some(lookahead) = &item.alternative.negative_lookahead(db) {
+                    write!(f, "(!>>{})", lookahead.display(db))?;
+                }
+                writeln!(f)?;
+                write!(f, "      Backlinks: {{")?;
+                for (i, item) in backlinks.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                writeln!(f, "}}")?;
             }
-            writeln!(f, "}}")?;
-        }
-        writeln!(f, "Actions:")?;
-        for (t, state) in &self.actions {
-            writeln!(f, "  {} -> {}", t.display(db), state)?;
-        }
-        for (nt, state) in &self.goto {
-            writeln!(f, "  {} -> {}", nt.display(db), state)?;
-        }
-        Ok(())
+            writeln!(f, "Actions:")?;
+            for (t, state) in &self.actions {
+                writeln!(f, "  {} -> {}", t.display(db), state)?;
+            }
+            for (nt, state) in &self.goto {
+                writeln!(f, "  {} -> {}", nt.display(db), state)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -899,22 +904,24 @@ pub enum ConflictedAction<'db> {
     Reduce(NonTerminal<'db>, Alternative<'db>),
 }
 
-impl<'db> DisplayWithDb for ConflictedAction<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            ConflictedAction::Shift(terminal, id) => {
-                write!(f, "Shift({}) -> {}", terminal.display(db), id)?;
+impl<'db> fmt::Display for ConflictedAction<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            match self {
+                ConflictedAction::Shift(terminal, id) => {
+                    write!(f, "Shift({}) -> {}", terminal.display(db), id)?;
+                }
+                ConflictedAction::Reduce(non_terminal, alternative) => {
+                    write!(
+                        f,
+                        "Reduce({} -> {})",
+                        non_terminal.display(db),
+                        alternative.display(db)
+                    )?;
+                }
             }
-            ConflictedAction::Reduce(non_terminal, alternative) => {
-                write!(
-                    f,
-                    "Reduce({} -> {})",
-                    non_terminal.display(db),
-                    alternative.display(db)
-                )?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -934,8 +941,8 @@ struct Ambiguity<'db> {
     locations: HashMap<ItemIndex, (History, TermString<'db>)>,
 }
 
-impl<'db> DisplayWithDb for Ambiguity<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, _db: &dyn Db) -> fmt::Result {
+impl<'db> fmt::Display for Ambiguity<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Ambiguity for {{{}}}", self.locations.keys().format(","),)
     }
 }

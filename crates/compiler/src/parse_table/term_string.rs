@@ -11,7 +11,6 @@ use super::{lr0_parse_table, Lr0ParseTable, Lr0StateId};
 use crate::{
     language::Language,
     lower::{Alternative, NonTerminal, Term, TermKind, Terminal},
-    util::DisplayWithDb,
     Db,
 };
 
@@ -237,16 +236,18 @@ impl<'db> TermString<'db> {
     }
 }
 
-impl<'db> DisplayWithDb for TermString<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        // TODO: Print out trees too?
-        // TODO: How are you meant to know what the states are?
-        // TODO: Negative lookahead?
-        write!(f, "{}: 0", self.parse_table.goal.display(db))?;
-        for location in &self.locations[1..] {
-            write!(f, " (#{}) {}", location.tree.terminals, location.state)?;
-        }
-        Ok(())
+impl<'db> fmt::Display for TermString<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            // TODO: Print out trees too?
+            // TODO: How are you meant to know what the states are?
+            // TODO: Negative lookahead?
+            write!(f, "{}: 0", self.parse_table.goal.display(db))?;
+            for location in &self.locations[1..] {
+                write!(f, " (#{}) {}", location.tree.terminals, location.state)?;
+            }
+            Ok(())
+        })
     }
 }
 

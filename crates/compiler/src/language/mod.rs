@@ -6,33 +6,33 @@ use std::{
 use indenter::indented;
 use salsa::Update;
 
-use crate::{diagnostics::emit, util::DisplayWithDb, Db, Span};
+use crate::{diagnostics::emit, Db, Span};
 
 mod parser;
 
-#[salsa::interned]
+#[salsa::interned(debug)]
 pub struct Ident<'db> {
-    #[return_ref]
+    #[returns(deref)]
     pub name: String,
 }
 
-impl<'db> DisplayWithDb for Ident<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        f.write_str(self.name(db))
+impl<'db> fmt::Display for Ident<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| f.write_str(self.name(db)))
     }
 }
 
 #[salsa::input]
 pub struct Source {
-    #[return_ref]
+    #[returns(deref)]
     pub text: String,
 }
 
 #[salsa::tracked]
 pub struct Language<'db> {
-    #[return_ref]
+    #[returns(ref)]
     pub definitions: HashMap<Ident<'db>, Definition<'db>>,
-    #[return_ref]
+    #[returns(deref)]
     pub tests: Vec<Test<'db>>,
 }
 
@@ -54,7 +54,7 @@ impl<'db> Language<'db> {
             Some(definition) => Some(definition),
             None => {
                 emit(
-                    format!("Identifier {} is not defined.", ident.display(db)),
+                    format!("Identifier {} is not defined.", ident),
                     vec![(span, None)],
                 );
                 None
@@ -131,15 +131,17 @@ pub struct Rule<'db> {
     pub alternatives: BTreeSet<Expression<'db>>,
 }
 
-impl<'db> DisplayWithDb for Rule<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, expression) in self.alternatives.iter().enumerate() {
-            if i > 0 {
-                f.write_str(" | ")?;
+impl<'db> fmt::Display for Rule<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            for (i, expression) in self.alternatives.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" | ")?;
+                }
+                write!(f, "{}", expression)?;
             }
-            write!(f, "{}", expression.display(db))?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -149,15 +151,17 @@ pub struct Expression<'db> {
     pub sequence: Vec<QuantifiedItem<'db>>,
 }
 
-impl<'db> DisplayWithDb for Expression<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        for (i, item) in self.sequence.iter().enumerate() {
-            if i > 0 {
-                f.write_char(' ')?;
+impl<'db> fmt::Display for Expression<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            for (i, item) in self.sequence.iter().enumerate() {
+                if i > 0 {
+                    f.write_char(' ')?;
+                }
+                write!(f, "{}", item)?;
             }
-            write!(f, "{}", item.display(db))?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -168,9 +172,9 @@ pub struct QuantifiedItem<'db> {
     pub span: Span,
 }
 
-impl<'db> DisplayWithDb for QuantifiedItem<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        write!(f, "{}{}", self.item.display(db), self.quantifier)
+impl<'db> fmt::Display for QuantifiedItem<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| write!(f, "{}{}", self.item, self.quantifier))
     }
 }
 
@@ -187,40 +191,42 @@ pub enum Item<'db> {
     Lookaround(LookaroundType, Rule<'db>),
 }
 
-impl<'db> DisplayWithDb for Item<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            Item::Ident {
-                mark,
-                ident,
-                generics,
-            } => {
-                write!(f, "{}{}", mark, ident.display(db))?;
-                if !generics.is_empty() {
-                    write!(f, "<")?;
-                    for (i, generic) in generics.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
+impl<'db> fmt::Display for Item<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            match self {
+                Item::Ident {
+                    mark,
+                    ident,
+                    generics,
+                } => {
+                    write!(f, "{}{}", mark, ident)?;
+                    if !generics.is_empty() {
+                        write!(f, "<")?;
+                        for (i, generic) in generics.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", generic)?;
                         }
-                        write!(f, "{}", generic.display(db))?;
+                        write!(f, ">")?;
                     }
-                    write!(f, ">")?;
+                }
+                Item::String(string) => {
+                    write!(f, "{string:?}")?;
+                }
+                Item::Regex(regex) => {
+                    write!(f, "/{regex}/")?;
+                }
+                Item::Group(rule) => {
+                    write!(f, "({})", rule)?;
+                }
+                Item::Lookaround(lookaround_type, rule) => {
+                    write!(f, "({} {})", lookaround_type, rule)?;
                 }
             }
-            Item::String(string) => {
-                write!(f, "{string:?}")?;
-            }
-            Item::Regex(regex) => {
-                write!(f, "/{regex}/")?;
-            }
-            Item::Group(rule) => {
-                write!(f, "({})", rule.display(db))?;
-            }
-            Item::Lookaround(lookaround_type, rule) => {
-                write!(f, "({} {})", lookaround_type, rule.display(db))?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -285,12 +291,13 @@ impl fmt::Display for Mark {
 
 #[salsa::tracked]
 pub struct Test<'db> {
-    #[return_ref]
+    #[returns(ref)]
     pub goal: Rule<'db>,
-    #[return_ref]
+    #[returns(deref)]
     pub test: String,
+    #[returns(copy)]
     pub test_span: Span,
-    #[return_ref]
+    #[returns(deref)]
     pub parse_trees: Vec<ParseTree<'db>>,
 }
 
@@ -306,24 +313,26 @@ pub enum ParseTree<'db> {
     },
 }
 
-impl<'db> DisplayWithDb for ParseTree<'db> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>, db: &dyn Db) -> fmt::Result {
-        match self {
-            ParseTree::Leaf { ident, data } => {
-                if let Some(ident) = ident {
-                    write!(f, "{}: ", ident.display(db))?;
+impl<'db> fmt::Display for ParseTree<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        salsa::with_attached_database(|db| {
+            match self {
+                ParseTree::Leaf { ident, data } => {
+                    if let Some(ident) = ident {
+                        write!(f, "{}: ", ident)?;
+                    }
+                    writeln!(f, "{data:?}")?;
                 }
-                writeln!(f, "{data:?}")?;
-            }
-            ParseTree::Node { ident, nodes } => {
-                writeln!(f, "{}:", ident.display(db))?;
-                let mut indented = indented(f).with_str("  ");
-                for node in nodes {
-                    write!(indented, "{}", node.display(db))?;
+                ParseTree::Node { ident, nodes } => {
+                    writeln!(f, "{}:", ident)?;
+                    let mut indented = indented(f).with_str("  ");
+                    for node in nodes {
+                        write!(indented, "{}", node)?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

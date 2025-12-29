@@ -1,33 +1,12 @@
 use std::fmt;
 
+pub(crate) use salsa::Database as Db;
+
 pub mod diagnostics;
 pub mod language;
 pub mod lower;
 pub mod parse_table;
 pub mod test;
-pub mod util;
-
-#[salsa::jar(db = Db)]
-pub struct Jar(
-    language::Ident<'_>,
-    language::Source,
-    language::parse,
-    language::Language<'_>,
-    language::Language_definition,
-    language::Language_dependencies,
-    language::Language_direct_dependencies,
-    language::Test<'_>,
-    lower::production,
-    lower::terminal_nfa,
-    lower::NonTerminal<'_>,
-    lower::NonTerminal_is_infinite,
-    lower::Production<'_>,
-    lower::Alternative<'_>,
-    parse_table::lr0_parse_table,
-    parse_table::terminals_conflict,
-    test::run_test,
-    debug_new_non_terminal,
-);
 
 #[salsa::tracked]
 pub fn debug_new_non_terminal<'db>(
@@ -42,16 +21,13 @@ pub fn debug_new_non_terminal<'db>(
     )
 }
 
-pub trait Db: salsa::DbWithJar<Jar> {}
-
-impl<DB> Db for DB where DB: salsa::DbWithJar<Jar> {}
-
-#[derive(Default)]
-#[salsa::db(crate::Jar)]
+#[salsa::db]
+#[derive(Default, Clone)]
 pub struct Database {
     storage: salsa::Storage<Self>,
 }
 
+#[salsa::db]
 impl salsa::Database for Database {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

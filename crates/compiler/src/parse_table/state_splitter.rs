@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use itertools::Itertools;
 use tracing::instrument;
@@ -14,7 +11,6 @@ use crate::{
     diagnostics::{emit, emit_diagnostic, Diagnostic},
     language::Language,
     lower::Terminal,
-    util::DisplayWithDb,
     Db, Span,
 };
 

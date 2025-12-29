@@ -8,7 +8,6 @@ use crate::{
     language::{Language, ParseTree, Test},
     lower::{terminal_nfa, Term},
     parse_table::{parse_table, Action, StateId},
-    util::DisplayWithDb,
     Db,
 };
 
